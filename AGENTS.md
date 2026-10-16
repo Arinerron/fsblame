@@ -61,6 +61,7 @@ flowchart LR
 | Program | Attach | Reports | If unavailable |
 |---------|--------|---------|----------------|
 | `on_create`, `on_mkdir`, `on_mknod`, `on_symlink`, `on_link`, `on_unlink`, `on_rmdir` | `fentry/security_inode_<op>` | that op | op skipped with a warning |
+| `on_file_post_open` | `fentry/security_file_post_open` (Linux ≥ 6.9) | create by an `open(O_CREAT)` whose name was not in the dentry cache: `may_o_create` calls `security_inode_create` before the lookup (the dentry is still `d_in_lookup`), so `on_create` leaves it to this hook, which reports it only if the open set `FMODE_CREATED`; `creating` carries the dentry per thread (matched by dentry, since an overlay's create runs its own upper-layer create in between) | such an open of an existing file is reported as a create |
 | `on_rename` | `fentry/security_inode_rename` | rename (old + new path); bumps `dir_epoch` on directory moves | always loaded, even without `--op rename` (then only the epoch bump survives dead-code elimination) |
 | `on_setattr` | `fentry/security_inode_setattr` | chmod, chown, truncate, utimes, setattr (by `ia_valid`) | ops skipped |
 | `on_rw_verify_area` | `fentry/rw_verify_area` | stashes the write's byte count per CPU | writes still reported, without byte counts |
@@ -75,7 +76,11 @@ and `btf_trace_sched_process_{fork,exec,exit}` exist; `fsblame doctor` re-checks
 `Tracer::load` attaches the sched tracepoints first (lineage complete before the first file
 event), then each wanted fentry hook. A hook that fails for an `Unsupported` cause (missing
 function, verifier limit, verifier rejection) is skipped and listed; a privilege failure aborts.
-If no selected op is reportable the load fails.
+If no selected op is reportable the load fails. The file hooks report nothing until the loader
+sets the `armed` global (`.data.armed`) after the last attach: each hook is loaded, verified and
+attached in turn, so without the gate the first hooks reported for hundreds of milliseconds
+while later ones (`on_rename`) were not attached yet. Every op starts at the same instant,
+before the `watching` line and `--ready-fd`; changes made before it are not reported.
 
 ### Wire records (`fsblame-abi`)
 
@@ -94,16 +99,22 @@ Every record starts with `RecHeader { kind, op, flags, ts_ns }`.
   every root), or `ROOT_NONE`. `aux`/`aux2` are op-specific (see the table on `FsRec`).
 
 Maps: `events` (ringbuf), `roots` (`(dev, ino)` → id/flags), `verdicts` (LRU, dentry → scope),
-`writes` (LRU, `(tgid, file)` → totals), `stash` (per-CPU byte count), `fs_buf`/`exec_buf`
-(per-CPU scratch; each fentry program owns its `fs_buf` slot), `stats` (ring drops). `.rodata`:
+`writes` (LRU, `(tgid, file)` → totals), `creating` (LRU, tid → dentry of an open-create that
+`on_file_post_open` confirms), `stash` (per-CPU byte count), `fs_buf`/`exec_buf` (per-CPU
+scratch; each fentry program owns its `fs_buf` slot), `stats` (ring drops). `.rodata`:
 `self_tgid`, `op_mask`, `dev_filter` — the verifier treats them as constants, so deselected ops
-compile away.
+compile away. `.bss`: `dir_epoch`, `creates_confirmed` (set by `on_file_post_open` when it first
+runs); `.data.armed`: `armed`, a map of its own so the loader sets it without writing `dir_epoch`.
 
 ### Watched-path matching
 
 Userspace (`Roots::resolve`) canonicalizes each watch/exclude path and pins it by
 `(superblock dev, inode)`; every mount below a watch root becomes an extra ("nested") root
-because the kernel walk does not cross mounts. In the kernel, `scope_of(dentry)`:
+because the kernel walk does not cross mounts. A path through a `/proc/<pid>/root` (or `cwd`)
+link into another mount namespace is refused (`roots::canonical`): canonicalizing yields the
+path there, which names another file here (a container's `/etc` becomes the host's); the error
+names where this namespace sees the same file, such as a container's merged directory or the
+host side of a volume. In the kernel, `scope_of(dentry)`:
 
 1. `dev_filter`: one compare per watched superblock; other filesystems cost nothing more.
 2. `verdicts` LRU keyed by dentry pointer, valid while the dentry's parent, inode number and
@@ -111,6 +122,19 @@ because the kernel walk does not cross mounts. In the kernel, `scope_of(dentry)`
    watched filesystem, invalidating every cached verdict.
 3. Otherwise a `bpf_loop(WALK_MAX = 64)` `d_parent` walk looking each ancestor's inode up in
    `roots`; the first root or exclude wins. The verdict records the root id and the depth.
+
+Overlays (module docs of `roots.rs`): a change made through an overlay's merged view reaches the
+hooks twice in the same process, as the overlay's operation and as overlayfs's operations on the
+upper layer (plus the copy-up or whiteout steps in its work directory). fsblame reports only the
+overlay's, at the merged path: `Roots::resolve` excludes the `upperdir=`/`workdir=` of every
+overlay it watches, watches a path inside an upper layer through its merged counterpart, and
+brings an overlay's merged view into scope when its upper layer lies in a watched tree. Relative
+layer options (Docker and Podman use them for long layer lists) are resolved below the ancestors
+of the mount point, confirmed by the `work` subdirectory overlayfs keeps. On this host
+`stat` inode numbers of merged-view files equal the kernel's `i_ino` with xino on, off and on a
+single filesystem (checked through `/proc/locks`); with layers on several filesystems and xino
+off, directory numbers are reassigned on every inode load and can equal a file's, so roots below
+such an overlay's root are held open and `fsblame.watchfs` warns.
 
 ### Path reconstruction
 
@@ -194,7 +218,10 @@ namespaces, seccomp, cgroup2, hidepid, ring buffer, memcg) plus:
   form), `missing-hook` (not in BTF / not ftrace-attachable), `permission` (EPERM/EACCES before
   verification: caps or lockdown), `verifier-rejected`, `error`. `--json` adds
   `ops: [{name, status, reason, program, insns, detail}]`.
-- `fsblame.watchfs`: warns for overlay, network and FUSE filesystems.
+- `fsblame.watchfs`: INFO for paths in an overlay's merged view, in an upper layer, or holding
+  upper layers (how they are reported); WARN for an overlay with repeating inode numbers (layers
+  on several filesystems, xino off), an overlay whose `upperdir=` is not found here, and network
+  and FUSE filesystems.
 
 `watch` runs the fast preflight subset before attaching and prints one line per unusable hook
 with the same cause wording.
@@ -219,13 +246,18 @@ runs its workload, sends SIGINT (sudo relays it) and asserts on the NDJSON:
 | i | copy to `~/.cache/fsblame-e2e/bin`, `setcap`, run as the user → write reported; caps removed after |
 | j | `doctor --json` → all 14 ops `available`, `probe.ops` pass, rename/link insns < 1,000,000 |
 | k | `--duration 2s` → exits 0 about 2 s after attaching |
+| l | overlay mounted in the work dir, the whole tree watched (merged view, upper layer, work dir): append to a cold lower file, chmod, rm, create + write, mkdir → each exactly once at its merged path, no create for the appended file, nothing under `upper/` or `work/` |
 
 ## Known limitations (MVP)
 
 - cwd comes from `/proc/<pid>/cwd` when the event is handled; a process that exits within that
   window (a quick `mv`) shows no cwd, unless it inherited one from a parent fsblame knows.
-- Local, non-stacked filesystems only: overlay, network and FUSE paths are flagged by
-  `fsblame.watchfs` (identity and paths can mislead there).
+- Network and FUSE paths are flagged by `fsblame.watchfs`: other clients' changes are never
+  seen, and a FUSE daemon's writes to its backing store are attributed to the daemon. Overlays
+  are watched through their merged view, but an overlay mounted in another mount namespace
+  (rootless Podman) is not visible, so its upper layer is reported as a plain directory, and
+  writes through a shared mapping of an overlay file made writable by `mprotect(2)` are not
+  seen (the hook gets the upper layer's file).
 - A path longer than `PATH_CAP` (1024 bytes) or `WALK_MAX` (64) components below its root is
   cut at the top and marked truncated.
 - An environment longer than 8 KiB loses its middle; variables set there (rare: tools append)

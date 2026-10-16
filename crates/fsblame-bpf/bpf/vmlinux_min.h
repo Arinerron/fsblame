@@ -53,7 +53,12 @@ enum {
 	BPF_EXIST = 2,
 };
 
-struct mnt_idmap;
+/* Relocated by CO-RE (bpf_core_enum_value): the kernel's value wins. Before Linux 6.15 the
+ * d_flags bits were macros, absent from BTF. */
+enum dentry_flags {
+	DCACHE_PAR_LOOKUP = 1 << 24,
+};
+
 struct pid_namespace;
 struct pt_regs;
 
@@ -86,6 +91,7 @@ struct inode {
 };
 
 struct dentry {
+	unsigned int d_flags;
 	struct dentry *d_parent;
 	struct qstr d_name;
 	struct inode *d_inode;

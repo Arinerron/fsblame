@@ -1,19 +1,16 @@
-//! Output: the human tree view and NDJSON.
+//! Output sinks for [`Line`]s: the human tree view and NDJSON.
 
 use std::{
-    ffi::OsStr,
     io::{self, Write},
     path::{Path, PathBuf},
 };
 
-use procctx::{Confidence, OriginKind, ProcInfo};
-use serde::Serialize;
-
 use crate::{
-    clock::Clock,
-    engine::{Change, Lineage, RENAME_EXCHANGE, RENAME_NOREPLACE, Sink, Touch},
     ops::Op,
-    roots::dev_string,
+    report::{
+        ChangeReport, Group, GroupReport, Line, LossReason, LostReport, Perms, ProcReport, Sink,
+        SummaryReport,
+    },
 };
 
 const S_IFMT: u32 = 0o170_000;
@@ -21,6 +18,10 @@ const S_IFMT: u32 = 0o170_000;
 const MAX_COMMAND: usize = 60;
 /// Column cap for aligning the process details.
 const MAX_COLUMN: usize = 56;
+/// Widest group label in the summary table.
+const MAX_GROUP: usize = 40;
+/// Widest list of first paths in the summary table.
+const MAX_FIRST_PATHS: usize = 100;
 
 /// Programs that run a script named by their first argument.
 fn is_interpreter(name: &str) -> bool {
@@ -87,25 +88,21 @@ fn tilde(path: &str, home: Option<&Path>) -> String {
 
 /// A process as a short command line: the program's basename and its arguments, with
 /// `interpreter /abs/path/to/tool args` collapsed to `tool args`.
-pub fn command_line(argv: &[Box<OsStr>], comm: &str, home: Option<&Path>) -> String {
-    let cmd_parts: Vec<String> = argv
-        .iter()
-        .map(|a| a.to_string_lossy().into_owned())
-        .collect();
-    let Some(first) = cmd_parts.first() else {
+pub fn command_line<S: AsRef<str>>(argv: &[S], comm: &str, home: Option<&Path>) -> String {
+    let Some(first) = argv.first() else {
         return comm.to_owned();
     };
-    let program = basename(first);
-    let (head, rest) = match cmd_parts.get(1) {
+    let program = basename(first.as_ref());
+    let (head, rest) = match argv.get(1).map(AsRef::as_ref) {
         Some(script) if is_interpreter(program) && script.starts_with('/') => {
-            (script_name(script), &cmd_parts[2..])
+            (script_name(script), &argv[2..])
         }
-        _ => (program, &cmd_parts[1..]),
+        _ => (program, &argv[1..]),
     };
     let mut line = head.to_owned();
     for arg in rest {
         line.push(' ');
-        line.push_str(&quote(&tilde(arg, home)));
+        line.push_str(&quote(&tilde(arg.as_ref(), home)));
     }
     ellipsize(line, MAX_COMMAND)
 }
@@ -126,8 +123,9 @@ pub fn format_bytes(bytes: u64) -> String {
     format!("{value:.1} {}", UNITS[unit])
 }
 
-fn perms(mode: u32) -> String {
-    format!("{:04o}", mode & 0o7777)
+/// `1 change`, `2 changes`.
+fn counted(n: u64, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
 }
 
 fn file_type(mode: u32) -> &'static str {
@@ -142,201 +140,243 @@ fn file_type(mode: u32) -> &'static str {
     }
 }
 
-fn kind_label(kind: OriginKind) -> &'static str {
+/// Display name of a build step kind, by its JSON id.
+fn kind_label(kind: &str) -> &str {
     match kind {
-        OriginKind::NpmLifecycle => "npm lifecycle",
-        OriginKind::PnpmLifecycle => "pnpm lifecycle",
-        OriginKind::YarnLifecycle => "yarn lifecycle",
-        OriginKind::BunLifecycle => "bun lifecycle",
-        OriginKind::CargoBuildScript => "cargo build script",
-        OriginKind::PipBuild => "pip build",
-        OriginKind::Make => "make",
+        "npm-lifecycle" => "npm lifecycle",
+        "pnpm-lifecycle" => "pnpm lifecycle",
+        "yarn-lifecycle" => "yarn lifecycle",
+        "bun-lifecycle" => "bun lifecycle",
+        "cargo-build-script" => "cargo build script",
+        "pip-build" => "pip build",
+        "make" => "make",
         // procctx may learn new kinds; label them generically until fsblame names them.
         _ => "build step",
     }
 }
 
-fn kind_id(kind: OriginKind) -> &'static str {
-    match kind {
-        OriginKind::NpmLifecycle => "npm-lifecycle",
-        OriginKind::PnpmLifecycle => "pnpm-lifecycle",
-        OriginKind::YarnLifecycle => "yarn-lifecycle",
-        OriginKind::BunLifecycle => "bun-lifecycle",
-        OriginKind::CargoBuildScript => "cargo-build-script",
-        OriginKind::PipBuild => "pip-build",
-        OriginKind::Make => "make",
-        _ => "other",
+/// `npm lifecycle: postinstall demo@1.0.0`.
+fn origin_label(
+    kind: &str,
+    phase: Option<&str>,
+    package: Option<&str>,
+    version: Option<&str>,
+) -> String {
+    let mut label = kind_label(kind).to_owned();
+    let mut what = Vec::new();
+    if let Some(phase) = phase {
+        what.push(phase.to_owned());
+    }
+    match (package, version) {
+        (Some(p), Some(v)) => what.push(format!("{p}@{v}")),
+        (Some(p), None) => what.push(p.to_owned()),
+        _ => {}
+    }
+    if !what.is_empty() {
+        label.push_str(": ");
+        label.push_str(&what.join(" "));
+    }
+    label
+}
+
+/// ANSI SGR sequences of the human view, all empty when color is off.
+#[derive(Clone, Copy, Debug)]
+struct Palette {
+    on: bool,
+}
+
+impl Palette {
+    const fn sgr(self, code: &'static str) -> &'static str {
+        if self.on { code } else { "" }
+    }
+
+    const fn bold(self) -> &'static str {
+        self.sgr("\x1b[1m")
+    }
+
+    const fn dim(self) -> &'static str {
+        self.sgr("\x1b[2m")
+    }
+
+    const fn reset(self) -> &'static str {
+        self.sgr("\x1b[0m")
+    }
+
+    /// The color of an op's class: creations green, removals red, writes yellow, renames
+    /// cyan, attribute changes magenta.
+    const fn op(self, op: Op) -> &'static str {
+        self.sgr(match op {
+            Op::Create | Op::Mkdir | Op::Link | Op::Symlink | Op::Mknod => "\x1b[32m",
+            Op::Unlink | Op::Rmdir => "\x1b[31m",
+            Op::Write => "\x1b[33m",
+            Op::Rename => "\x1b[36m",
+            Op::Chmod | Op::Chown | Op::Truncate | Op::Utimes | Op::Setattr => "\x1b[35m",
+        })
     }
 }
 
-fn confidence_id(confidence: Confidence) -> &'static str {
-    match confidence {
-        Confidence::High => "high",
-        Confidence::Medium => "medium",
-        Confidence::Low => "low",
-        _ => "unknown",
-    }
-}
-
-/// The aligned tree view.
+/// The aligned tree view. Changes and the summary go to `out`; losses are warnings on
+/// stderr.
 #[derive(Debug)]
 pub struct Human<W> {
     out: W,
-    clock: Clock,
     home: Option<PathBuf>,
     depth: usize,
+    palette: Palette,
 }
 
 impl<W: Write> Human<W> {
-    /// Writes to `out`, shortening paths below `home` and showing `depth` ancestors.
-    pub fn new(out: W, clock: Clock, home: Option<PathBuf>, depth: usize) -> Self {
+    /// Writes to `out`, shortening paths below `home`, showing `depth` ancestors, with ANSI
+    /// colors if `color`.
+    pub fn new(out: W, home: Option<PathBuf>, depth: usize, color: bool) -> Self {
         Self {
             out,
-            clock,
             home,
             depth,
+            palette: Palette { on: color },
         }
     }
 
-    fn path(&self, path: &Path) -> String {
-        tilde(&path.to_string_lossy(), self.home.as_deref())
+    fn path(&self, path: &str) -> String {
+        tilde(path, self.home.as_deref())
     }
 
-    fn detail(&self, touch: &Touch) -> Option<String> {
-        Some(match touch.change {
-            Change::Write { bytes, calls } => {
-                let plural = if calls == 1 { "" } else { "s" };
-                format!("(+{}, {calls} write{plural})", format_bytes(bytes))
-            }
-            Change::Mapped { via } => format!("(mapped shared-writable via {})", via.name()),
-            Change::Mode(mode) => format!("({} → {})", perms(touch.mode), perms(mode)),
-            Change::Owner { uid, gid } => {
-                let parts: Vec<String> = [
-                    uid.map(|u| format!("uid {u}")),
-                    gid.map(|g| format!("gid {g}")),
-                ]
-                .into_iter()
-                .flatten()
-                .collect();
-                format!("(→ {})", parts.join(", "))
-            }
-            Change::Size(size) => format!("(→ {})", format_bytes(size)),
-            Change::Rename { flags, replaced } => {
-                if flags & RENAME_EXCHANGE != 0 {
-                    "(exchanged)".to_owned()
-                } else if replaced {
-                    "(replaced existing)".to_owned()
-                } else {
-                    return None;
-                }
-            }
-            Change::Node(rdev) => format!("({} {})", file_type(touch.mode), dev_string(rdev)),
-            Change::None => match touch.op {
-                Op::Create | Op::Mkdir => format!("({})", perms(touch.mode)),
-                Op::Symlink => format!("(→ {})", touch.target.as_deref()?.display()),
-                Op::Link => format!("(= {})", self.path(touch.target.as_deref()?)),
-                _ => return None,
-            },
-        })
+    fn detail(&self, c: &ChangeReport<'_>) -> Option<String> {
+        if let (Some(bytes), Some(calls)) = (c.bytes, c.calls) {
+            let plural = if calls == 1 { "" } else { "s" };
+            return Some(format!("(+{}, {calls} write{plural})", format_bytes(bytes)));
+        }
+        let d = c.change.unwrap_or_default();
+        if let Some(via) = d.mapped {
+            return Some(format!("(shared writable mapping, {})", via.name()));
+        }
+        if let Some(mode) = d.mode {
+            let old = d.old_mode.unwrap_or(Perms(c.file.mode.0));
+            return Some(format!("({old} → {mode})"));
+        }
+        if d.uid.is_some() || d.gid.is_some() {
+            let parts: Vec<String> = [
+                d.uid.map(|u| format!("uid {u}")),
+                d.gid.map(|g| format!("gid {g}")),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            return Some(format!("(→ {})", parts.join(", ")));
+        }
+        if let Some(size) = d.size {
+            return Some(format!("(→ {})", format_bytes(size)));
+        }
+        if let Some(rdev) = d.rdev {
+            return Some(format!("({} {rdev})", file_type(c.file.mode.0)));
+        }
+        if d.exchange == Some(true) {
+            return Some("(exchanged)".to_owned());
+        }
+        if d.replaced == Some(true) {
+            return Some("(replaced existing)".to_owned());
+        }
+        match c.op {
+            Op::Create | Op::Mkdir => Some(format!("({})", Perms(c.file.mode.0))),
+            Op::Symlink => Some(format!("(→ {})", c.target.as_deref()?)),
+            Op::Link => Some(format!("(= {})", self.path(c.target.as_deref()?))),
+            _ => None,
+        }
     }
 
-    fn proc_line(&self, info: &ProcInfo, cwd_shown: Option<&Path>) -> (String, String) {
+    fn proc_line(
+        &self,
+        info: &ProcReport<'_>,
+        ns_pid: Option<u32>,
+        cwd_shown: Option<&str>,
+    ) -> (String, String) {
         let command = command_line(&info.argv, &info.comm, self.home.as_deref());
-        let mut facts = vec![format!("pid {}", info.key.pid)];
-        if let Some(exit) = info.exit {
-            if exit.ts_ns > 0 {
-                facts.push(format!("exited {}", self.clock.local_hms(exit.ts_ns)));
-            } else {
-                facts.push("exited".to_owned());
-            }
+        let mut facts = vec![format!("pid {}", info.pid)];
+        if let Some(ns_pid) = ns_pid {
+            facts.push(format!("ns pid {ns_pid}"));
+        }
+        if info.exited == Some(true) {
+            facts.push(info.exit_ts.map_or_else(
+                || "exited".to_owned(),
+                |ts| format!("exited {}", ts.local_hms()),
+            ));
         }
         if let Some(cwd) = info.cwd.as_deref().filter(|cwd| Some(*cwd) != cwd_shown) {
             facts.push(format!("cwd {}", self.path(cwd)));
         }
         (command, format!("({})", facts.join(", ")))
     }
-}
 
-impl<W: Write> Sink for Human<W> {
-    // One linear renderer: path header plus the indented ancestry tree and origin tag.
+    /// The path header plus the indented ancestry tree and its tags.
+    // One linear renderer: splitting it would scatter the row state without clarifying it.
     #[allow(clippy::too_many_lines)]
-    fn touch(&mut self, touch: &Touch, lineage: &Lineage) -> io::Result<()> {
-        let path = match &touch.old_path {
-            Some(old) => format!("{} → {}", self.path(old), self.path(&touch.path)),
-            None => self.path(&touch.path),
+    fn touch(&mut self, c: &ChangeReport<'_>) -> io::Result<()> {
+        let p = self.palette;
+        let path = match &c.old_path {
+            Some(old) => format!("{} → {}", self.path(old), self.path(&c.path)),
+            None => self.path(&c.path),
         };
         write!(
             self.out,
-            "{path}  {}  {}",
-            touch.op.verb(),
-            self.clock.local_hms(touch.ts_ns)
+            "{}{path}{}  {}{}{}  {}{}{}",
+            p.bold(),
+            p.reset(),
+            p.op(c.op),
+            c.op.verb(),
+            p.reset(),
+            p.dim(),
+            c.ts.local_hms(),
+            p.reset()
         )?;
-        if let Some(detail) = self.detail(touch) {
+        if let Some(detail) = self.detail(c) {
             write!(self.out, "  {detail}")?;
         }
         writeln!(self.out)?;
 
         // (left column, details, annotations) per displayed process, leaf first.
         let mut rows: Vec<(String, String, Vec<String>)> = Vec::new();
-        let chain = &lineage.chain;
-        if chain.is_empty() {
-            rows.push((
-                touch.actor.comm.clone(),
-                format!("(pid {}, not tracked)", touch.actor.tgid),
-                Vec::new(),
-            ));
-        } else {
-            let via = lineage.origin.as_ref().map(|o| o.via);
-            let via_at = via.and_then(|via| chain.iter().position(|info| info.key == via));
-            let shown = chain
-                .len()
+        if c.proc.tracked() {
+            let via_at = c
+                .origin
+                .as_ref()
+                .and_then(|o| c.chain().position(|info| info.pid == o.via_pid));
+            let shown = (1 + c.ancestry.len())
                 .min(self.depth + 1)
                 .max(via_at.map_or(0, |at| at + 1));
-            let mut cwd_below: Option<&Path> = None;
-            for (level, info) in chain[..shown].iter().enumerate() {
-                let (command, facts) = self.proc_line(info, cwd_below);
+            let mut cwd_below: Option<&str> = None;
+            for (level, info) in c.chain().take(shown).enumerate() {
+                let ns_pid = if level == 0 { c.ns_pid } else { None };
+                let (command, facts) = self.proc_line(info, ns_pid, cwd_below);
                 cwd_below = info.cwd.as_deref();
                 let mut notes = Vec::new();
                 if level == 0 {
-                    let ctx = &lineage.context;
+                    let ctx = &c.context;
                     let mut parts = Vec::new();
                     if let Some(tmux) = &ctx.tmux {
-                        parts.push(format!("tmux {}", tmux.pane));
+                        parts.push(format!("tmux {tmux}"));
                     }
                     if let Some(unit) = &ctx.unit {
-                        parts.push(format!("unit {}", unit.name));
+                        parts.push(format!("unit {unit}"));
                     }
                     if let Some(container) = &ctx.container {
-                        parts.push(format!(
-                            "{} {}",
-                            container.runtime.as_str(),
-                            container.short_id()
-                        ));
+                        parts.push(format!("{} {}", container.runtime, container.short_id()));
                     }
                     if !parts.is_empty() {
                         notes.push(format!("[{}]", parts.join(" · ")));
                     }
                 }
-                if let Some(origin) = lineage.origin.as_ref().filter(|o| o.via == info.key) {
-                    let mut label = kind_label(origin.kind).to_owned();
-                    let mut what = Vec::new();
-                    if let Some(phase) = &origin.phase {
-                        what.push(phase.to_string());
-                    }
-                    match (&origin.package, &origin.version) {
-                        (Some(p), Some(v)) => what.push(format!("{p}@{v}")),
-                        (Some(p), None) => what.push(p.to_string()),
-                        _ => {}
-                    }
-                    if !what.is_empty() {
-                        label.push_str(": ");
-                        label.push_str(&what.join(" "));
-                    }
-                    notes.push(format!("[{label} · {}]", confidence_id(origin.confidence)));
+                if let Some(origin) = c.origin.as_ref().filter(|_| via_at == Some(level)) {
+                    let label = origin_label(
+                        &origin.kind,
+                        origin.phase.as_deref(),
+                        origin.package.as_deref(),
+                        origin.version.as_deref(),
+                    );
+                    notes.push(format!("[{label} · {}]", origin.confidence));
                 }
                 rows.push((command, facts, notes));
             }
-            let hidden = chain.len() - shown;
+            let hidden = 1 + c.ancestry.len() - shown;
             if hidden > 0 {
                 let plural = if hidden == 1 { "" } else { "s" };
                 rows.push((
@@ -345,6 +385,16 @@ impl<W: Write> Sink for Human<W> {
                     Vec::new(),
                 ));
             }
+        } else {
+            let ns = c
+                .ns_pid
+                .map(|n| format!(", ns pid {n}"))
+                .unwrap_or_default();
+            rows.push((
+                c.proc.comm.to_string(),
+                format!("(pid {}{ns}, not tracked)", c.proc.pid),
+                Vec::new(),
+            ));
         }
         let lefts: Vec<String> = rows
             .iter()
@@ -358,20 +408,158 @@ impl<W: Write> Sink for Human<W> {
             .unwrap_or(0)
             .min(MAX_COLUMN)
             + 2;
-        for (left, (_, facts, notes)) in lefts.iter().zip(&rows) {
-            let mut line = left.clone();
+        for (level, (left, (_, facts, notes))) in lefts.iter().zip(&rows).enumerate() {
+            // Ancestor lines are dim as a whole; on the actor's line only its facts are.
+            let (line_dim, facts_dim) = if level == 0 {
+                ("", p.dim())
+            } else {
+                (p.dim(), "")
+            };
+            let mut line = format!("{line_dim}{left}");
             if !facts.is_empty() {
                 let pad = column.saturating_sub(left.chars().count()).max(2);
                 line.push_str(&" ".repeat(pad));
+                line.push_str(facts_dim);
                 line.push_str(facts);
+                if level == 0 {
+                    line.push_str(p.reset());
+                }
             }
             for note in notes {
                 line.push_str("   ");
                 line.push_str(note);
             }
+            if level > 0 {
+                line.push_str(p.reset());
+            }
             writeln!(self.out, "{line}")?;
         }
         Ok(())
+    }
+
+    /// A loss, as a warning on stderr.
+    fn lost(&mut self, lost: &LostReport) -> io::Result<()> {
+        // What was printed before the loss stays before the warning on a shared terminal.
+        self.out.flush()?;
+        let what = match lost.reason {
+            LossReason::RingFull => format!(
+                "{} lost (ring buffer full; a larger --ring-size helps)",
+                counted(lost.count, "kernel record", "kernel records")
+            ),
+            LossReason::WriteEvicted => format!(
+                "latest byte counts of {} lost (kernel write table full)",
+                counted(lost.count, "open file", "open files")
+            ),
+        };
+        writeln!(
+            io::stderr().lock(),
+            "fsblame: warning: {what} at {}",
+            lost.ts.local_hms()
+        )
+    }
+
+    /// One row of the summary table: group, changes, paths, ops, first paths.
+    fn group_row(&self, g: &GroupReport<'_>) -> [String; 5] {
+        let label = match &g.group {
+            Group::Origin(k) => origin_label(
+                &k.kind,
+                k.phase.as_deref(),
+                k.package.as_deref(),
+                k.version.as_deref(),
+            ),
+            Group::Comm(comm) => comm.to_string(),
+            Group::Other => "(other)".to_owned(),
+        };
+        let paths = if g.paths_untracked > 0 {
+            format!("{}+", g.paths)
+        } else {
+            g.paths.to_string()
+        };
+        let ops: Vec<String> = g
+            .ops
+            .iter()
+            .map(|(op, n)| format!("{} {n}", op.name()))
+            .collect();
+        let mut first: Vec<String> = g.first_paths.iter().map(|p| self.path(p)).collect();
+        if g.paths_untracked > 0 || g.paths > first.len() as u64 {
+            first.push("…".to_owned());
+        }
+        [
+            ellipsize(label, MAX_GROUP),
+            g.changes.to_string(),
+            paths,
+            ops.join(", "),
+            ellipsize(first.join(", "), MAX_FIRST_PATHS),
+        ]
+    }
+
+    /// The summary as an aligned table.
+    fn summary(&mut self, s: &SummaryReport<'_>) -> io::Result<()> {
+        let p = self.palette;
+        writeln!(
+            self.out,
+            "\n{}summary{}: {}",
+            p.bold(),
+            p.reset(),
+            counted(s.changes, "change", "changes")
+        )?;
+        let header = ["GROUP", "CHANGES", "PATHS", "OPS", "FIRST PATHS"].map(str::to_owned);
+        let rows: Vec<[String; 5]> = s.groups.iter().map(|g| self.group_row(g)).collect();
+        let mut widths = [0; 5];
+        for row in std::iter::once(&header).chain(&rows) {
+            for (width, cell) in widths.iter_mut().zip(row) {
+                *width = (*width).max(cell.chars().count());
+            }
+        }
+        if !rows.is_empty() {
+            for (at, row) in std::iter::once(&header).chain(&rows).enumerate() {
+                let line = format!(
+                    "  {:<w0$}  {:>w1$}  {:>w2$}  {:<w3$}  {}",
+                    row[0],
+                    row[1],
+                    row[2],
+                    row[3],
+                    row[4],
+                    w0 = widths[0],
+                    w1 = widths[1],
+                    w2 = widths[2],
+                    w3 = widths[3],
+                );
+                let (on, off) = if at == 0 {
+                    (p.dim(), p.reset())
+                } else {
+                    ("", "")
+                };
+                writeln!(self.out, "{on}{}{off}", line.trim_end())?;
+            }
+        }
+        if !s.lost.is_empty() {
+            let mut parts = Vec::new();
+            if s.lost.ring_full > 0 {
+                parts.push(format!(
+                    "{} (ring buffer full)",
+                    counted(s.lost.ring_full, "kernel record", "kernel records")
+                ));
+            }
+            if s.lost.write_evicted > 0 {
+                parts.push(format!(
+                    "latest byte counts of {} (kernel write table full)",
+                    counted(s.lost.write_evicted, "open file", "open files")
+                ));
+            }
+            writeln!(self.out, "  lost: {}", parts.join(", "))?;
+        }
+        Ok(())
+    }
+}
+
+impl<W: Write> Sink for Human<W> {
+    fn line(&mut self, line: &Line<'_>) -> io::Result<()> {
+        match line {
+            Line::Touch(change) => self.touch(change),
+            Line::Lost(lost) => self.lost(lost),
+            Line::Summary(summary) => self.summary(summary),
+        }
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -379,223 +567,23 @@ impl<W: Write> Sink for Human<W> {
     }
 }
 
-#[derive(Serialize)]
-struct FileJson {
-    dev: String,
-    ino: u64,
-    mode: String,
-}
-
-#[derive(Serialize)]
-struct ProcJson {
-    pid: u32,
-    comm: String,
-    exe: Option<String>,
-    argv: Vec<String>,
-    argv_truncated: bool,
-    cwd: Option<String>,
-    uid: Option<u32>,
-    exited: Option<bool>,
-    exit_ts: Option<String>,
-}
-
-#[derive(Serialize, Default)]
-struct ChangeJson {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    mode: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    old_mode: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    uid: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    gid: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    size: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    rdev: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    exchange: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    noreplace: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    replaced: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    mapped: Option<&'static str>,
-}
-
-#[derive(Serialize)]
-struct ContextJson {
-    unit: Option<String>,
-    container: Option<String>,
-    tmux: Option<String>,
-    cgroup: Option<String>,
-}
-
-#[derive(Serialize)]
-struct OriginJson {
-    kind: &'static str,
-    package: Option<String>,
-    version: Option<String>,
-    phase: Option<String>,
-    confidence: &'static str,
-    via_pid: u32,
-    evidence: Vec<String>,
-}
-
-#[derive(Serialize)]
-struct TouchJson<'a> {
-    #[serde(rename = "type")]
-    kind: &'static str,
-    ts: String,
-    op: &'static str,
-    path: String,
-    old_path: Option<String>,
-    target: Option<String>,
-    truncated: bool,
-    bytes: Option<u64>,
-    calls: Option<u64>,
-    file: FileJson,
-    change: Option<ChangeJson>,
-    tid: u32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    ns_pid: Option<u32>,
-    proc: ProcJson,
-    ancestry: &'a [ProcJson],
-    ancestry_complete: bool,
-    context: ContextJson,
-    origin: Option<OriginJson>,
-}
-
-/// NDJSON: one `{"type":"touch",...}` object per line.
+/// NDJSON: one JSON object per line.
 #[derive(Debug)]
 pub struct Json<W> {
     out: W,
-    clock: Clock,
 }
 
 impl<W: Write> Json<W> {
     /// Writes to `out`.
-    pub fn new(out: W, clock: Clock) -> Self {
-        Self { out, clock }
+    pub fn new(out: W) -> Self {
+        Self { out }
     }
-
-    fn proc(&self, info: &ProcInfo) -> ProcJson {
-        let text = |p: &Path| p.to_string_lossy().into_owned();
-        ProcJson {
-            pid: info.key.pid,
-            comm: info.comm.to_string(),
-            exe: info.exe.as_deref().map(text),
-            argv: info
-                .argv
-                .iter()
-                .map(|a| a.to_string_lossy().into_owned())
-                .collect(),
-            argv_truncated: info.argv_truncated,
-            cwd: info.cwd.as_deref().map(text),
-            uid: info.uid,
-            exited: Some(info.exit.is_some()),
-            exit_ts: info
-                .exit
-                .filter(|exit| exit.ts_ns > 0)
-                .map(|exit| self.clock.rfc3339(exit.ts_ns)),
-        }
-    }
-}
-
-fn change_json(touch: &Touch) -> Option<ChangeJson> {
-    let mut c = ChangeJson::default();
-    match touch.change {
-        Change::None | Change::Write { .. } => return None,
-        Change::Mode(mode) => {
-            c.mode = Some(perms(mode));
-            c.old_mode = Some(perms(touch.mode));
-        }
-        Change::Owner { uid, gid } => {
-            c.uid = uid;
-            c.gid = gid;
-        }
-        Change::Size(size) => c.size = Some(size),
-        Change::Rename { flags, replaced } => {
-            c.exchange = Some(flags & RENAME_EXCHANGE != 0);
-            c.noreplace = Some(flags & RENAME_NOREPLACE != 0);
-            c.replaced = Some(replaced);
-        }
-        Change::Node(rdev) => c.rdev = Some(dev_string(rdev)),
-        Change::Mapped { via } => c.mapped = Some(via.name()),
-    }
-    Some(c)
 }
 
 impl<W: Write> Sink for Json<W> {
-    fn touch(&mut self, touch: &Touch, lineage: &Lineage) -> io::Result<()> {
-        let text = |p: &Path| p.to_string_lossy().into_owned();
-        let (bytes, calls) = match touch.change {
-            Change::Write { bytes, calls } => (Some(bytes), Some(calls)),
-            _ => (None, None),
-        };
-        let proc = lineage.chain.first().map_or_else(
-            || ProcJson {
-                pid: touch.actor.tgid,
-                comm: touch.actor.comm.clone(),
-                exe: None,
-                argv: Vec::new(),
-                argv_truncated: false,
-                cwd: None,
-                uid: Some(touch.actor.uid),
-                exited: None,
-                exit_ts: None,
-            },
-            |info| self.proc(info),
-        );
-        let ancestry: Vec<ProcJson> = lineage
-            .chain
-            .iter()
-            .skip(1)
-            .map(|info| self.proc(info))
-            .collect();
-        let ctx = &lineage.context;
-        let record = TouchJson {
-            kind: "touch",
-            ts: self.clock.rfc3339(touch.ts_ns),
-            op: touch.op.name(),
-            path: text(&touch.path),
-            old_path: touch.old_path.as_deref().map(text),
-            target: touch.target.as_deref().map(text),
-            truncated: touch.truncated,
-            bytes,
-            calls,
-            file: FileJson {
-                dev: dev_string(touch.file.dev),
-                ino: touch.file.ino,
-                mode: format!("{:o}", touch.mode),
-            },
-            change: change_json(touch),
-            tid: touch.actor.tid,
-            ns_pid: touch.actor.ns_tgid,
-            proc,
-            ancestry: &ancestry,
-            ancestry_complete: lineage.complete,
-            context: ContextJson {
-                unit: ctx.unit.as_ref().map(|u| u.name.to_string()),
-                container: ctx
-                    .container
-                    .as_ref()
-                    .map(|c| format!("{}:{}", c.runtime.as_str(), c.id)),
-                tmux: ctx.tmux.as_ref().map(|t| t.pane.to_string()),
-                cgroup: ctx.cgroup.as_ref().map(|c| c.path.to_string()),
-            },
-            origin: lineage.origin.as_ref().map(|o| OriginJson {
-                kind: kind_id(o.kind),
-                package: o.package.as_deref().map(str::to_owned),
-                version: o.version.as_deref().map(str::to_owned),
-                phase: o.phase.as_deref().map(str::to_owned),
-                confidence: confidence_id(o.confidence),
-                via_pid: o.via.pid,
-                evidence: o.evidence.iter().map(ToString::to_string).collect(),
-            }),
-        };
-        serde_json::to_writer(&mut self.out, &record)?;
-        writeln!(self.out)
+    fn line(&mut self, line: &Line<'_>) -> io::Result<()> {
+        serde_json::to_writer(&mut self.out, line)?;
+        self.out.write_all(b"\n")
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -605,27 +593,29 @@ impl<W: Write> Sink for Json<W> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::borrow::Cow;
 
-    fn argv(args: &[&str]) -> Vec<Box<OsStr>> {
-        args.iter().map(|a| Box::from(OsStr::new(a))).collect()
-    }
+    use super::*;
+    use crate::{
+        engine::MapVia,
+        report::{ChangeDetail, tests::chmod},
+    };
 
     #[test]
     fn interpreter_running_an_installed_tool_collapses_to_the_tool() {
         let home = Some(Path::new("/home/u"));
         assert_eq!(
-            command_line(&argv(&["node", "/usr/bin/npm", "install"]), "node", home),
+            command_line(&["node", "/usr/bin/npm", "install"], "node", home),
             "npm install"
         );
         assert_eq!(
             command_line(
-                &argv(&[
+                &[
                     "/usr/bin/node",
                     "/usr/lib/node_modules/npm/bin/npm-cli.js",
                     "run",
                     "build"
-                ]),
+                ],
                 "node",
                 home
             ),
@@ -633,7 +623,7 @@ mod tests {
         );
         assert_eq!(
             command_line(
-                &argv(&["python3.12", "/usr/bin/pip", "install", "x"]),
+                &["python3.12", "/usr/bin/pip", "install", "x"],
                 "python3",
                 home
             ),
@@ -641,11 +631,11 @@ mod tests {
         );
         // A relative script is the program the user named: keep it.
         assert_eq!(
-            command_line(&argv(&["node", "install.js"]), "node", home),
+            command_line(&["node", "install.js"], "node", home),
             "node install.js"
         );
         assert_eq!(
-            command_line(&argv(&["/usr/bin/make", "-j8"]), "make", home),
+            command_line(&["/usr/bin/make", "-j8"], "make", home),
             "make -j8"
         );
     }
@@ -654,23 +644,24 @@ mod tests {
     fn arguments_are_quoted_and_home_shortened() {
         let home = Some(Path::new("/home/u"));
         assert_eq!(
-            command_line(&argv(&["sh", "-c", "echo hi > /home/u/x"]), "sh", home),
+            command_line(&["sh", "-c", "echo hi > /home/u/x"], "sh", home),
             "sh -c 'echo hi > /home/u/x'"
         );
         assert_eq!(
-            command_line(&argv(&["cp", "/home/u/a", "/tmp/b"]), "cp", home),
+            command_line(&["cp", "/home/u/a", "/tmp/b"], "cp", home),
             "cp ~/a /tmp/b"
         );
         assert_eq!(
-            command_line(&argv(&["echo", "it's", ""]), "echo", home),
+            command_line(&["echo", "it's", ""], "echo", home),
             r"echo 'it'\''s' ''"
         );
-        assert_eq!(command_line(&[], "kworker/0:1", home), "kworker/0:1");
+        assert_eq!(
+            command_line::<&str>(&[], "kworker/0:1", home),
+            "kworker/0:1"
+        );
         let long = "x".repeat(100);
         assert_eq!(
-            command_line(&argv(&["echo", &long]), "echo", home)
-                .chars()
-                .count(),
+            command_line(&["echo", &long], "echo", home).chars().count(),
             MAX_COMMAND
         );
     }
@@ -690,5 +681,127 @@ mod tests {
         assert_eq!(tilde("/home/u/x", home), "~/x");
         assert_eq!(tilde("/home/user2/x", home), "/home/user2/x");
         assert_eq!(tilde("/home/u/x", Some(Path::new("/"))), "/home/u/x");
+    }
+
+    fn human(line: &Line<'_>, color: bool) -> String {
+        let mut out = Vec::new();
+        Human::new(&mut out, Some(PathBuf::from("/home/u")), 4, color)
+            .line(line)
+            .unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    /// `text` without ANSI SGR sequences.
+    fn plain(text: &str) -> String {
+        let mut out = String::new();
+        let mut rest = text;
+        while let Some(at) = rest.find('\x1b') {
+            out.push_str(&rest[..at]);
+            rest = &rest[at + rest[at..].find('m').unwrap() + 1..];
+        }
+        out.push_str(rest);
+        out
+    }
+
+    #[test]
+    fn replayed_json_renders_the_same_tree() {
+        let mut mapped = chmod();
+        mapped.op = Op::Write;
+        mapped.change = Some(ChangeDetail {
+            mapped: Some(MapVia::Mmap),
+            ..ChangeDetail::default()
+        });
+        for change in [chmod(), mapped] {
+            let line = Line::Touch(change);
+            let mut json = Vec::new();
+            Json::new(&mut json).line(&line).unwrap();
+            let replayed = Line::parse(std::str::from_utf8(&json).unwrap()).unwrap();
+            assert_eq!(human(&replayed, false), human(&line, false));
+        }
+    }
+
+    #[test]
+    fn tree_shows_kernel_facts_and_tags() {
+        let text = human(&Line::Touch(chmod()), false);
+        let mut lines = text.lines();
+        let header = lines.next().unwrap();
+        assert!(header.starts_with("~/proj/run.sh  chmod  "), "{header}");
+        assert!(header.ends_with("  (0644 → 0755)"), "{header}");
+        let actor = lines.next().unwrap();
+        assert!(actor.starts_with("  └─ chmod +x run.sh"), "{actor}");
+        assert!(actor.contains("(pid 4242, ns pid 7, exited "), "{actor}");
+        assert!(
+            actor.contains("[tmux %3 · unit session-2.scope · docker 3f4e5d6c7b8a]"),
+            "{actor}"
+        );
+        let parent = lines.next().unwrap();
+        assert!(parent.starts_with("     └─ npm install"), "{parent}");
+        // The parent's cwd is the child's: shown once, on the child.
+        assert!(actor.contains(", cwd ~/proj)"), "{actor}");
+        assert!(parent.contains("(pid 4000)"), "{parent}");
+        assert!(
+            parent.ends_with("[npm lifecycle: postinstall demo@1.0.0 · high]"),
+            "{parent}"
+        );
+
+        let mut mapped = chmod();
+        mapped.op = Op::Write;
+        mapped.change = Some(ChangeDetail {
+            mapped: Some(MapVia::Mprotect),
+            ..ChangeDetail::default()
+        });
+        mapped.proc.exited = None;
+        mapped.ancestry.clear();
+        let text = human(&Line::Touch(mapped), false);
+        let mut lines = text.lines();
+        let header = lines.next().unwrap();
+        assert!(
+            header.ends_with("  (shared writable mapping, mprotect)"),
+            "{header}"
+        );
+        assert!(header.contains("  modified  "), "{header}");
+        let actor = lines.next().unwrap();
+        assert!(
+            actor.ends_with("(pid 4242, ns pid 7, not tracked)"),
+            "{actor}"
+        );
+    }
+
+    #[test]
+    fn color_only_adds_sgr_sequences() {
+        let line = Line::Touch(chmod());
+        let colored = human(&line, true);
+        assert!(colored.contains("\x1b[35mchmod\x1b[0m"), "{colored:?}");
+        assert_eq!(plain(&colored), human(&line, false));
+    }
+
+    #[test]
+    fn summary_table_aligns_groups() {
+        let mut summary = crate::report::Summary::new();
+        let mut vim = chmod();
+        vim.origin = None;
+        vim.proc.comm = Cow::Borrowed("vim");
+        summary.add(&vim);
+        summary.add(&chmod());
+        summary.add(&chmod());
+        let report = summary.report(
+            crate::report::Timestamp::from_unix_ns(0),
+            crate::report::LossTotals {
+                ring_full: 3,
+                write_evicted: 0,
+            },
+        );
+        let text = human(&Line::Summary(report), false);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[1], "summary: 3 changes");
+        assert!(lines[2].starts_with("  GROUP "), "{text}");
+        assert!(
+            lines[3].starts_with(
+                "  npm lifecycle: postinstall demo@1.0.0        2      1  chmod 2  ~/proj/run.sh"
+            ),
+            "{text}"
+        );
+        assert!(lines[4].starts_with("  vim "), "{text}");
+        assert_eq!(lines[5], "  lost: 3 kernel records (ring buffer full)");
     }
 }

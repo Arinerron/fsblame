@@ -14,6 +14,11 @@
  * mapping that becomes writable (security_mmap_file, security_file_mprotect) is reported once
  * per binding (`mapped`): stores through it never pass a write hook.
  *
+ * Creates: open(O_CREAT) of a name missing from the dentry cache runs the create check before
+ * the lookup that tells whether the file exists. on_create leaves such a create (its dentry is
+ * still in lookup) to on_file_post_open, which reports it if the open did create the file;
+ * `creating` carries it from one to the other per thread.
+ *
  * cwd: on_exec_cwd walks the new image's working directory into `cwd_buf` and on_exec, which
  * runs right after it on the same tracepoint and CPU, copies it into the exec record.
  *
@@ -48,14 +53,17 @@ char LICENSE[] SEC("license") = "Dual MIT/GPL";
 #define MAP_SHARED_VALIDATE 0x03
 #define MAP_TYPE 0x0f
 #define FMODE_WRITE 0x2
+#define FMODE_CREATED (1U << 20)
 #define VM_WRITE 0x2
 #define VM_SHARED 0x8
 #define MAX_PID_NS_LEVEL 32
 
-/* fs_buf slots: the op programs use their op, the mapping programs the slots after them. */
+/* fs_buf slots: the op programs use their op, the mapping and open programs the slots after
+ * them. */
 #define SLOT_MMAP OP_COUNT
 #define SLOT_MPROTECT (OP_COUNT + 1)
-#define FS_SLOTS (OP_COUNT + 2)
+#define SLOT_POST_OPEN (OP_COUNT + 2)
+#define FS_SLOTS (OP_COUNT + 3)
 
 /* Payload offsets are masked or clamped to a constant before every write so the verifier can
  * bound them; the logical offsets never reach the mask (two paths of PATH_CAP + NAME_CAP, or
@@ -138,6 +146,15 @@ const volatile struct dev_filter dev_filter = {};
 /* Bumped on every directory rename on a watched filesystem: invalidates all verdicts. */
 u64 dir_epoch = 0;
 
+/* Set by the loader once every program is attached, so file events are reported from one
+ * instant on for every op, not from whenever each hook happened to attach. Its own section
+ * (map), so the loader writes it without touching dir_epoch. */
+u32 armed SEC(".data.armed") = 0;
+
+/* Set by on_file_post_open when it first runs: from then on it reports the creates that
+ * on_create leaves to it. Written only here. */
+u32 creates_confirmed = 0;
+
 struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
 	__uint(max_entries, RINGBUF_BYTES);
@@ -170,6 +187,15 @@ struct {
 	__type(key, struct write_key);
 	__type(value, struct mapping);
 } mapped SEC(".maps");
+
+/* The dentry, still in lookup, of each thread's open(O_CREAT) on a watched filesystem that
+ * passed the create check before its lookup (see on_create). */
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 4096);
+	__type(key, u32);   /* tid */
+	__type(value, u64); /* struct dentry * */
+} creating SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
@@ -459,7 +485,7 @@ static __always_inline int report(u32 slot, u16 op, struct dentry *d, struct den
 	u32 dev, trunc = 0, trunc2 = 0, end, end2;
 	long n;
 
-	if (!(op_mask & (1U << op)) || current_tgid() == self_tgid)
+	if (!(op_mask & (1U << op)) || !armed || current_tgid() == self_tgid)
 		return 0;
 	dev = d->d_sb->s_dev;
 	sc = scope_of(d, dev);
@@ -498,10 +524,64 @@ static __always_inline int report(u32 slot, u16 op, struct dentry *d, struct den
 	return 0;
 }
 
+/* Whether `d` is still being looked up (d_in_lookup). The flag became `enum dentry_flags`, and
+ * moved, in Linux 6.15. */
+static __always_inline bool in_lookup(struct dentry *d)
+{
+	u32 bit = 0x10000000;
+
+	if (bpf_core_enum_value_exists(enum dentry_flags, DCACHE_PAR_LOOKUP))
+		bit = bpf_core_enum_value(enum dentry_flags, DCACHE_PAR_LOOKUP);
+	return d->d_flags & bit;
+}
+
+/*
+ * open(O_CREAT) of a name missing from the dentry cache calls this hook (may_o_create) with a
+ * dentry that is still in lookup: the file may exist, and then the open creates nothing. Such a
+ * create is left to on_file_post_open once that program runs (it needs Linux 6.9). The entry is
+ * matched by dentry, not just by thread: the create may run creates of its own in between (an
+ * overlay creates the file on its upper layer). A create of the pending dentry decided here (its
+ * open failed after the check, and a later one found the name cached) clears the entry so that
+ * the open is not reported again.
+ */
 SEC("fentry/security_inode_create")
 int BPF_PROG(on_create, struct inode *dir, struct dentry *dentry, umode_t mode)
 {
+	u32 tid = (u32)bpf_get_current_pid_tgid();
+	u64 d = (u64)dentry, *pending;
+
+	if (creates_confirmed && dev_watched(dentry->d_sb->s_dev)) {
+		if (in_lookup(dentry)) {
+			bpf_map_update_elem(&creating, &tid, &d, BPF_ANY);
+			return 0;
+		}
+		pending = bpf_map_lookup_elem(&creating, &tid);
+		if (pending && *pending == d)
+			bpf_map_delete_elem(&creating, &tid);
+	}
 	return report(OP_CREATE, OP_CREATE, dentry, NULL, NULL, NULL, mode | S_IFREG, 0, 0);
+}
+
+/* Reports the create of an open that on_create left to it. Runs after every successful open:
+ * one that created nothing costs a flag test. */
+SEC("fentry/security_file_post_open")
+int BPF_PROG(on_file_post_open, struct file *file, int mask)
+{
+	struct dentry *dentry;
+	u64 *pending;
+	u32 tid;
+
+	if (!creates_confirmed)
+		creates_confirmed = 1;
+	if (!(file->f_mode & FMODE_CREATED))
+		return 0;
+	tid = (u32)bpf_get_current_pid_tgid();
+	pending = bpf_map_lookup_elem(&creating, &tid);
+	dentry = file->f_path.dentry;
+	if (!pending || *pending != (u64)dentry)
+		return 0;
+	bpf_map_delete_elem(&creating, &tid);
+	return report(SLOT_POST_OPEN, OP_CREATE, dentry, NULL, NULL, NULL, 0, 0, 0);
 }
 
 SEC("fentry/security_inode_mkdir")
@@ -556,12 +636,35 @@ int BPF_PROG(on_rename, struct inode *old_dir, struct dentry *old_dentry, struct
 		      dst ? dst->i_ino : 0);
 }
 
+/* security_inode_setattr is (dentry, attr) upstream before 6.0 and (idmap, dentry, attr) since,
+ * and distributions backport the change (EL9's 5.14 has three). The loader sets this from the
+ * running kernel's BTF prototype; the verifier sees it as a constant. */
+const volatile u32 setattr_idmap = 1;
+
+/*
+ * Takes the arguments by hand rather than through BPF_PROG: the verifier refuses a ctx read
+ * past the prototype's last argument, so only the branch for this kernel's arity may load
+ * them, and the other one is dead code to the verifier. The loads are asm so clang cannot
+ * merge the branches into one load at a computed ctx offset, which the verifier refuses too.
+ */
 SEC("fentry/security_inode_setattr")
-int BPF_PROG(on_setattr, struct mnt_idmap *idmap, struct dentry *dentry, struct iattr *attr)
+int on_setattr(u64 *ctx)
 {
-	unsigned int valid = attr->ia_valid;
+	struct dentry *dentry;
+	struct iattr *attr;
+	unsigned int valid;
 	u64 value = 0;
 	u16 op;
+
+	if (setattr_idmap)
+		asm volatile("%0 = *(u64 *)(%2 + 8)\n\t%1 = *(u64 *)(%2 + 16)"
+			     : "=&r"(dentry), "=&r"(attr)
+			     : "r"(ctx));
+	else
+		asm volatile("%0 = *(u64 *)(%2 + 0)\n\t%1 = *(u64 *)(%2 + 8)"
+			     : "=&r"(dentry), "=&r"(attr)
+			     : "r"(ctx));
+	valid = attr->ia_valid;
 
 	if (valid & ATTR_SIZE) {
 		op = OP_TRUNCATE;
@@ -610,7 +713,7 @@ int BPF_PROG(on_file_permission, struct file *file, int mask)
 	u32 zero = 0, slot = OP_WRITE, dev, tgid, trunc = 0, end;
 	u64 id, bytes = 0, now, ino;
 
-	if (!(mask & MAY_WRITE))
+	if (!(mask & MAY_WRITE) || !armed)
 		return 0;
 	inode = file->f_inode;
 	if (!inode || (inode->i_mode & S_IFMT) != S_IFREG)
@@ -700,7 +803,7 @@ static __always_inline int report_mapped(u32 slot, struct file *file, u64 via)
 	u32 dev, tgid, trunc = 0, end;
 	u64 ino, start;
 
-	if (!(op_mask & (1U << OP_WRITE)))
+	if (!(op_mask & (1U << OP_WRITE)) || !armed)
 		return 0;
 	inode = file->f_inode;
 	if (!inode || (inode->i_mode & S_IFMT) != S_IFREG)

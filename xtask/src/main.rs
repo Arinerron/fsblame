@@ -16,6 +16,10 @@
 #[path = "../../crates/fsblame/src/cli.rs"]
 #[allow(dead_code)]
 mod cli;
+/// The glob patterns `cli` takes for `--include`.
+#[path = "../../crates/fsblame/src/glob.rs"]
+#[allow(dead_code)]
+mod glob;
 /// The operations `cli` takes for `--op`.
 #[path = "../../crates/fsblame/src/ops.rs"]
 #[allow(dead_code)]
@@ -143,6 +147,11 @@ const SCENARIOS: &[Scenario] = &[
         id: "k",
         name: "--duration stops the watcher on time",
         run: duration,
+    },
+    Scenario {
+        id: "l",
+        name: "overlay: each change once, at its merged path, with the upper layer watched too",
+        run: overlay,
     },
 ];
 
@@ -902,4 +911,98 @@ fn duration(ctx: &Ctx) -> Result<String> {
         "exited {:.2}s after attaching",
         elapsed.as_secs_f64()
     ))
+}
+
+/// Unmounts the overlay of scenario l in `base` and removes `base` (overlayfs leaves root's
+/// `work/work` behind).
+fn remove_overlay(base: &Path) {
+    let _ = Command::new("sudo")
+        .arg("-n")
+        .arg("umount")
+        .arg(base.join("merged"))
+        .stderr(Stdio::null())
+        .status();
+    let _ = Command::new("sudo")
+        .arg("-n")
+        .args(["rm", "-rf"])
+        .arg(base)
+        .status();
+}
+
+/// Removes the overlay of scenario l, whatever happens.
+struct OverlayMount<'a>(&'a Path);
+
+impl Drop for OverlayMount<'_> {
+    fn drop(&mut self) {
+        remove_overlay(self.0);
+    }
+}
+
+fn overlay(ctx: &Ctx) -> Result<String> {
+    // A run killed halfway leaves the overlay mounted.
+    remove_overlay(&ctx.work.join("l-overlay"));
+    let base = ctx.dir("l-overlay")?;
+    let [lower, upper, work, merged] = ["lower", "upper", "work", "merged"].map(|d| base.join(d));
+    for dir in [&lower, &upper, &work, &merged] {
+        fs::create_dir_all(dir)?;
+    }
+    for name in ["append.txt", "mode.txt", "gone.txt"] {
+        fs::write(lower.join(name), "lower\n")?;
+    }
+    let status = Command::new("sudo")
+        .arg("-n")
+        .args(["mount", "-t", "overlay", "overlay", "-o"])
+        .arg(format!(
+            "lowerdir={},upperdir={},workdir={}",
+            lower.display(),
+            upper.display(),
+            work.display()
+        ))
+        .arg(&merged)
+        .status()?;
+    ensure!(status.success(), "mounting the overlay failed: {status}");
+    let _mounted = OverlayMount(&base);
+
+    // The watched tree holds the merged view, the upper layer and the work directory. The
+    // lower files were never looked up through the overlay: the append copies one up from a
+    // cold dentry cache, which must not show as a create.
+    let watcher = ctx.watch(&[&base])?;
+    sh(
+        &merged,
+        "echo more >> append.txt && chmod 600 mode.txt && rm gone.txt && echo new > new.txt \
+         && mkdir newdir",
+    )?;
+    let touches: Vec<Value> = watcher
+        .stop()?
+        .touches()?
+        .into_iter()
+        .filter(|t| t["type"] == "touch")
+        .collect();
+    let expected = [
+        ("write", "append.txt"),
+        ("chmod", "mode.txt"),
+        ("unlink", "gone.txt"),
+        ("create", "new.txt"),
+        ("write", "new.txt"),
+        ("mkdir", "newdir"),
+    ];
+    for (op, name) in expected {
+        let path = text(&merged.join(name));
+        let count = touches
+            .iter()
+            .filter(|t| t["op"] == op && t["path"] == path.as_str())
+            .count();
+        ensure!(
+            count == 1,
+            "{count} {op} touches for {path}, expected 1; {}",
+            summary(&touches)
+        );
+    }
+    ensure!(
+        touches.len() == expected.len(),
+        "only the {} changes made through the overlay were expected; {}",
+        expected.len(),
+        summary(&touches)
+    );
+    Ok("each change once, at its merged path; no copy-up or upper-layer touches".to_owned())
 }

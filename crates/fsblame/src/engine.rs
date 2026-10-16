@@ -1,5 +1,5 @@
-//! Event processing: feeds process events to procctx, coalesces writes, and emits touches
-//! with their lineage.
+//! Event processing: feeds process events to procctx, coalesces writes, selects changes and
+//! emits them, with their lineage, as report lines.
 
 use std::{collections::HashMap, io, path::PathBuf, sync::Arc};
 
@@ -9,11 +9,14 @@ use procctx::{
     Config, Context, ExecEvent, ExitEvent, ForkEvent, Origin, ProcFs, ProcInfo, ProcKey, ProcTable,
     StartClock, Stop, classify_origin,
 };
+use serde::{Deserialize, Serialize};
 
 use crate::{
-    clock,
+    clock::{self, Clock},
+    filter::{Candidate, Filter},
     ops::Op,
     record::{self, Exec, Fs, Record},
+    report::{ChangeReport, Line, Sink},
     roots::Roots,
 };
 
@@ -82,8 +85,9 @@ pub struct FileId {
     pub ino: u64,
 }
 
-/// How a shared mapping of a file became writable.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// How a shared mapping of a file became writable; in JSON, the system call's name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum MapVia {
     /// `mmap(MAP_SHARED)` with `PROT_WRITE`.
     Mmap,
@@ -175,6 +179,24 @@ pub struct Touch {
     pub actor: Actor,
 }
 
+impl Touch {
+    /// What a [`Filter`] needs to know about this change; `unit` is the actor's systemd
+    /// unit, if resolved.
+    pub fn candidate<'a>(&'a self, unit: Option<&'a str>) -> Candidate<'a> {
+        Candidate {
+            paths: [
+                Some(self.path.as_path()),
+                self.old_path.as_deref(),
+                self.target.as_deref(),
+            ],
+            comm: &self.actor.comm,
+            uid: self.actor.uid,
+            tgid: self.actor.tgid,
+            unit,
+        }
+    }
+}
+
 /// Process lineage of an actor at the time a touch is reported.
 #[derive(Clone, Debug, Default)]
 pub struct Lineage {
@@ -186,14 +208,6 @@ pub struct Lineage {
     pub context: Context,
     /// Build step the actor runs under.
     pub origin: Option<Origin>,
-}
-
-/// Where touches go.
-pub trait Sink {
-    /// Writes one touch.
-    fn touch(&mut self, touch: &Touch, lineage: &Lineage) -> io::Result<()>;
-    /// Flushes buffered output.
-    fn flush(&mut self) -> io::Result<()>;
 }
 
 /// One open file of one process, being coalesced.
@@ -240,10 +254,13 @@ impl Binding {
 /// Counters for the end-of-run summary.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Counts {
-    /// Touches written.
+    /// Changes reported (after filtering).
     pub touches: u64,
     /// Records that did not decode.
     pub malformed: u64,
+    /// Write bindings the kernel's `writes` LRU evicted before their latest totals were
+    /// read: the bytes and calls since the previous poll are missing from the reports.
+    pub evicted: u64,
 }
 
 /// The event processor.
@@ -251,7 +268,9 @@ pub struct Counts {
 pub struct Engine<S> {
     procs: ProcTable<ProcFs>,
     start_clock: StartClock,
+    clock: Clock,
     roots: Roots,
+    filter: Filter,
     sink: S,
     /// Keyed by (tgid, `struct file` address), as the kernel's `writes` map.
     bindings: HashMap<(u32, u64), Binding>,
@@ -274,8 +293,9 @@ fn flag(flags: u32, bit: u32) -> bool {
 }
 
 impl<S: Sink> Engine<S> {
-    /// An engine resolving paths through `roots` and writing to `sink`.
-    pub fn new(roots: Roots, sink: S) -> Self {
+    /// An engine resolving paths through `roots`, stamping times with `clock`, and writing
+    /// the changes `filter` admits to `sink`.
+    pub fn new(roots: Roots, clock: Clock, filter: Filter, sink: S) -> Self {
         let start_clock = StartClock::BootNs {
             ticks_per_sec: clock::clock_ticks_per_sec(),
         };
@@ -286,7 +306,9 @@ impl<S: Sink> Engine<S> {
         Self {
             procs: ProcTable::new(ProcFs::new(), cfg),
             start_clock,
+            clock,
             roots,
+            filter,
             sink,
             bindings: HashMap::new(),
             cwd: Vec::new(),
@@ -298,6 +320,11 @@ impl<S: Sink> Engine<S> {
     /// Run counters.
     pub fn counts(&self) -> Counts {
         self.counts
+    }
+
+    /// The sink, for lines that do not come from records (losses, the summary).
+    pub fn sink_mut(&mut self) -> &mut S {
+        &mut self.sink
     }
 
     /// Handles one ring buffer item.
@@ -434,9 +461,14 @@ impl<S: Sink> Engine<S> {
         if op == Op::Write && mapped.is_none() {
             let key = (r.tgid, r.file);
             if let Some(mut old) = self.bindings.remove(&key) {
-                // The kernel replaced this binding: report what the old one had left.
                 if flag(r.hdr.flags, abi::F_REPLACED) {
+                    // The struct file was reused: the kernel handed over the old binding's
+                    // final totals with the new one.
                     old.seen = old.seen.max((r.aux, r.aux2));
+                } else {
+                    // The kernel had no binding left to replace: the LRU evicted it, taking
+                    // the totals since the last poll along.
+                    self.counts.evicted += 1;
                 }
                 self.report_binding(&mut old)?;
             }
@@ -594,8 +626,14 @@ impl<S: Sink> Engine<S> {
                 }
                 false
             }
-            // Evicted from the LRU, or superseded by a newer binding for a reused struct file.
-            _ => true,
+            // Superseded by a newer binding for a reused struct file (its record follows):
+            // report what was seen of this one.
+            Some(_) => true,
+            // Evicted from the LRU: the writes since the last poll are lost.
+            None => {
+                self.counts.evicted += 1;
+                true
+            }
         };
         let quiet = now.saturating_sub(binding.last_ns) >= QUIET_NS;
         let held = now.saturating_sub(binding.window_ns) >= HOLD_NS;
@@ -619,10 +657,27 @@ impl<S: Sink> Engine<S> {
         Ok(())
     }
 
+    /// Reports `touch` if the filter admits it. The lineage is resolved only for admitted
+    /// changes, unless a `unit` criterion needs it to decide.
     fn emit(&mut self, touch: &Touch) -> io::Result<()> {
-        let lineage = self.lineage(&touch.actor);
+        let lineage = if self.filter.is_empty() {
+            self.lineage(&touch.actor)
+        } else if self.filter.needs_unit() {
+            let lineage = self.lineage(&touch.actor);
+            let unit = lineage.context.unit.as_ref().map(|u| &*u.name);
+            if !self.filter.matches(&touch.candidate(unit)) {
+                return Ok(());
+            }
+            lineage
+        } else {
+            if !self.filter.matches(&touch.candidate(None)) {
+                return Ok(());
+            }
+            self.lineage(&touch.actor)
+        };
         self.counts.touches += 1;
-        self.sink.touch(touch, &lineage)
+        let report = ChangeReport::new(touch, &lineage, self.clock);
+        self.sink.line(&Line::Touch(report))
     }
 
     /// The actor's ancestry, if the table's record for its pid is the same process.

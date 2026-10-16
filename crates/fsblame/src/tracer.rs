@@ -4,7 +4,7 @@ use std::fmt;
 
 use aya::{
     Btf, BtfError, Ebpf, EbpfLoader, VerifierLogLevel,
-    maps::{HashMap, MapData, PerCpuArray, RingBuf},
+    maps::{Array, HashMap, MapData, PerCpuArray, RingBuf},
     programs::{BtfTracePoint, FEntry, Program, ProgramError},
 };
 use fsblame_abi::{self as abi, DevFilter, RootKey, RootVal, WriteKey, WriteVal};
@@ -17,6 +17,9 @@ use crate::{
 
 /// Kernel-internal "operation not supported", which leaks from some attach paths.
 const ENOTSUPP: i32 = 524;
+
+/// The map of the tracer's `armed` flag (its own data section).
+const ARMED: &str = ".data.armed";
 
 /// How a load failure should be reported.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -317,17 +320,33 @@ fn log_level() -> VerifierLogLevel {
     }
 }
 
-/// The tracer object for `ops`, with its maps created and no program loaded yet.
-fn open(btf: &Btf, ops: OpSet, dev_filter: &DevFilter, root_slots: u32) -> Result<Ebpf, LoadError> {
+/// The tracer object for `ops`, with its maps created (the `events` ring buffer of
+/// `ring_bytes`) and no program loaded yet.
+fn open(
+    btf: &Btf,
+    ops: OpSet,
+    dev_filter: &DevFilter,
+    root_slots: u32,
+    ring_bytes: u32,
+) -> Result<Ebpf, LoadError> {
     let self_tgid = std::process::id();
     let op_mask = ops.mask();
+    // security_inode_setattr gained a leading idmap in 6.0 and distributions backport it, so
+    // its arity comes from the prototype, not the kernel version.
+    let setattr_idmap = u32::from(
+        crate::btf::kernel_func_params("security_inode_setattr")
+            .map_err(|e| LoadError::new("reading kernel BTF", e))?
+            != Some(2),
+    );
     EbpfLoader::new()
         .btf(Some(btf))
         .verifier_log_level(log_level())
         .override_global("self_tgid", &self_tgid, true)
         .override_global("op_mask", &op_mask, true)
         .override_global("dev_filter", dev_filter, true)
+        .override_global("setattr_idmap", &setattr_idmap, true)
         .map_max_entries("roots", root_slots)
+        .map_max_entries("events", ring_bytes)
         .load(fsblame_bpf::OBJECT)
         .map_err(|e| LoadError::new("loading the BPF object", e))
 }
@@ -388,7 +407,7 @@ fn attach_tp(
 /// The programs detach when this returns.
 pub fn probe_hooks(dev_filter: &DevFilter) -> Result<Vec<HookOutcome>, LoadError> {
     let btf = Btf::from_sys_fs().map_err(|e| LoadError::new("reading kernel BTF", e))?;
-    let mut ebpf = open(&btf, OpSet::new(&[]), dev_filter, 1)?;
+    let mut ebpf = open(&btf, OpSet::new(&[]), dev_filter, 1, abi::RINGBUF_BYTES)?;
     let mut outcomes: Vec<HookOutcome> = FS_HOOKS
         .iter()
         .map(|hook| HookOutcome {
@@ -409,14 +428,15 @@ pub fn probe_hooks(dev_filter: &DevFilter) -> Result<Vec<HookOutcome>, LoadError
 }
 
 impl Tracer {
-    /// Loads the tracer for `roots`, reporting `ops`. The sched tracepoints are required;
+    /// Loads the tracer for `roots`, reporting `ops` through a ring buffer of `ring_bytes`
+    /// (a power of two and a multiple of the page size). The sched tracepoints are required;
     /// an optional program (fentry hook, cwd capture) whose kernel function is missing or
     /// unattachable is skipped and listed in [`missing`](Self::missing), unless no file hook
     /// attaches at all.
-    pub fn load(roots: &Roots, ops: OpSet) -> Result<Self, LoadError> {
+    pub fn load(roots: &Roots, ops: OpSet, ring_bytes: u32) -> Result<Self, LoadError> {
         let btf = Btf::from_sys_fs().map_err(|e| LoadError::new("reading kernel BTF", e))?;
         let root_slots = u32::try_from(roots.len()).unwrap_or(u32::MAX).max(1);
-        let mut ebpf = open(&btf, ops, &roots.dev_filter(), root_slots)?;
+        let mut ebpf = open(&btf, ops, &roots.dev_filter(), root_slots, ring_bytes)?;
 
         {
             let map = ebpf.map_mut("roots").ok_or_else(|| {
@@ -488,6 +508,17 @@ impl Tracer {
             let Missing { error, .. } = missing.swap_remove(first);
             return Err(error);
         }
+
+        // Every hook is attached: report file events from now on, for all of them at once.
+        let armed = ebpf.map_mut(ARMED).ok_or_else(|| {
+            LoadError::new(
+                format!("finding map {ARMED}"),
+                std::io::Error::other("not in the BPF object"),
+            )
+        })?;
+        Array::<_, u32>::try_from(armed)
+            .and_then(|mut armed| armed.set(0, 1, 0))
+            .map_err(|e| LoadError::new("arming the file hooks", e))?;
 
         let mut take = |name: &str| {
             ebpf.take_map(name).ok_or_else(|| {

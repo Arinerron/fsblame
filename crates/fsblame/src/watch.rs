@@ -1,9 +1,13 @@
-//! `fsblame watch`: attach, then stream touches until a signal or `--duration`.
+//! The watch loop: attach, then stream report lines until a signal or a time limit.
+//!
+//! [`run`] is shared by the subcommands that watch: it attaches the tracer, writes every
+//! reported change, every loss and (optionally) the summary to a [`Sink`], and returns the
+//! run's totals. [`command`] is `fsblame watch` on top of it.
 
 use std::{
     ffi::{CStr, OsStr},
     fs::File,
-    io::{self, BufWriter, Write as _},
+    io::{self, BufWriter, IsTerminal as _, Write as _},
     mem::MaybeUninit,
     os::{
         fd::{AsRawFd as _, FromRawFd as _, OwnedFd},
@@ -17,13 +21,15 @@ use anyhow::{Context as _, anyhow};
 use bpfdoctor::RealEnv;
 
 use crate::{
-    cli::WatchArgs,
+    cli::{ColorMode, WatchArgs},
     clock::{self, Clock},
     doctor,
-    engine::{Engine, Sink},
+    engine::Engine,
     fail::Failure,
-    ops::OpSet,
+    filter::{Filter, FilterSpec},
+    ops::{Op, OpSet},
     render::{Human, Json},
+    report::{Line, LossReason, LossTotals, LostReport, Sink, Summary, Timestamp, Version},
     roots::Roots,
     tracer::{Class, Tracer},
 };
@@ -32,6 +38,67 @@ use crate::{
 const TICK_MS: u64 = 100;
 /// Longest final drain once stopping, so records already in the ring are still reported.
 const STOP_DRAIN_MS: u64 = 1000;
+/// Least time between two `lost` lines of the same reason.
+const LOSS_EVERY: Duration = Duration::from_secs(1);
+
+/// What [`run`] watches and how.
+#[derive(Clone, Debug)]
+pub struct WatchOptions {
+    /// Files or directories to watch; a directory includes its whole subtree.
+    pub paths: Vec<PathBuf>,
+    /// Subtrees to ignore.
+    pub exclude: Vec<PathBuf>,
+    /// Operations to report; empty for all.
+    pub ops: Vec<Op>,
+    /// Which changes to report.
+    pub filter: Filter,
+    /// Size of the kernel ring buffer in bytes: a power of two and a multiple of the page
+    /// size.
+    pub ring_bytes: u32,
+    /// Stop after this long; otherwise at SIGINT, SIGTERM or SIGHUP.
+    pub duration: Option<Duration>,
+    /// Write `ready\n` to this file descriptor once attached, then close it.
+    pub ready_fd: Option<i32>,
+    /// Print only warnings and errors on stderr.
+    pub quiet: bool,
+    /// End the output with a summary line.
+    pub summary: bool,
+}
+
+impl WatchOptions {
+    /// The options `fsblame watch` was given.
+    pub fn from_args(args: &WatchArgs) -> Self {
+        Self {
+            paths: args.paths.clone(),
+            exclude: args.exclude.clone(),
+            ops: args.op.clone(),
+            filter: Filter::new(FilterSpec {
+                include: args.include.clone(),
+                comm: args.comm.clone(),
+                ignore_comm: args.ignore_comm.clone(),
+                uid: args.uid.clone(),
+                unit: args.unit.clone(),
+                pid: args.pid.clone(),
+            }),
+            ring_bytes: args.ring_size,
+            duration: args.duration,
+            ready_fd: args.ready_fd,
+            quiet: args.quiet,
+            summary: args.summary,
+        }
+    }
+}
+
+/// The totals of a finished run.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Outcome {
+    /// Changes reported (after filtering).
+    pub changes: u64,
+    /// What the kernel side lost.
+    pub lost: LossTotals,
+    /// Records that did not decode.
+    pub malformed: u64,
+}
 
 fn os_error(what: &str) -> anyhow::Error {
     anyhow::Error::new(io::Error::last_os_error()).context(what.to_owned())
@@ -205,16 +272,45 @@ fn home_dir() -> Option<PathBuf> {
         .or_else(|| passwd_home(unsafe { libc::getuid() }))
 }
 
-/// `fsblame watch`.
-pub fn run(args: &WatchArgs) -> Result<(), Failure> {
-    if let Some(fd) = args.ready_fd {
+/// Whether human output gets colors: `auto` means stdout is a terminal and `NO_COLOR` is
+/// unset or empty.
+fn use_color(mode: ColorMode) -> bool {
+    match mode {
+        ColorMode::Always => true,
+        ColorMode::Never => false,
+        ColorMode::Auto => {
+            io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty())
+        }
+    }
+}
+
+/// `fsblame watch`: the tree view or NDJSON on stdout.
+pub fn command(args: &WatchArgs) -> Result<(), Failure> {
+    let opts = WatchOptions::from_args(args);
+    let color = !args.json && use_color(args.color);
+    let out = BufWriter::new(io::stdout().lock());
+    if args.json {
+        run(&opts, &mut Json::new(out))?;
+    } else {
+        run(&opts, &mut Human::new(out, home_dir(), args.depth, color))?;
+    }
+    Ok(())
+}
+
+/// Attaches to the paths of `opts` and writes what changes there to `sink` until a signal
+/// or `opts.duration` stops it: every admitted change, a `lost` line whenever the kernel
+/// side loses data (at most one per reason per second), and the summary if asked for. The
+/// start banner, warnings and the final count go to stderr. A closed output (broken pipe)
+/// ends the run early without an error.
+pub fn run(opts: &WatchOptions, sink: &mut dyn Sink) -> Result<Outcome, Failure> {
+    if let Some(fd) = opts.ready_fd {
         check_fd(fd)?;
     }
-    let ops = OpSet::new(&args.op);
-    let roots = Roots::resolve(&args.paths, &args.exclude).map_err(Failure::Usage)?;
+    let selected = OpSet::new(&opts.ops);
+    let roots = Roots::resolve(&opts.paths, &opts.exclude).map_err(Failure::Usage)?;
 
     let tool = doctor::tool();
-    let report = doctor::preflight(args.paths.clone()).run(&RealEnv, &tool);
+    let report = doctor::preflight(opts.paths.clone()).run(&RealEnv, &tool);
     if report.has_fail() {
         report
             .render_human(&mut io::stderr(), false)
@@ -228,9 +324,9 @@ pub fn run(args: &WatchArgs) -> Result<(), Failure> {
 
     raise_memlock();
     let signals = Signals::new()?;
-    let mut tracer = Tracer::load(&roots, ops).map_err(|error| {
+    let mut tracer = Tracer::load(&roots, selected, opts.ring_bytes).map_err(|error| {
         // Diagnostics are best effort; the load error itself is what gets reported.
-        let _ = doctor::explain_load_failure(&error, &args.paths);
+        let _ = doctor::explain_load_failure(&error, &opts.paths);
         let message = anyhow!("{error}");
         match error.class() {
             Class::Privileges => Failure::Privileges(message),
@@ -252,41 +348,37 @@ pub fn run(args: &WatchArgs) -> Result<(), Failure> {
         );
     }
 
-    let watched: Vec<String> = roots
-        .iter()
-        .filter(|(_, r)| !r.exclude && !r.nested)
-        .map(|(_, r)| r.path.display().to_string())
-        .collect();
-    let nested = roots.iter().filter(|(_, r)| r.nested).count();
-    let op_names: Vec<&str> = ops.iter().map(super::ops::Op::name).collect();
-    eprintln!(
-        "fsblame: watching {}{} for {}; Ctrl-C to stop",
-        watched.join(", "),
-        if nested > 0 {
-            format!(" (+{nested} mounts below)")
-        } else {
-            String::new()
-        },
-        if args.op.is_empty() {
-            "all ops".to_owned()
-        } else {
-            op_names.join(",")
-        },
-    );
+    if !opts.quiet {
+        let watched: Vec<String> = roots
+            .iter()
+            .filter(|(_, r)| !r.exclude && !r.nested)
+            .map(|(_, r)| r.path.display().to_string())
+            .collect();
+        let nested = roots.iter().filter(|(_, r)| r.nested).count();
+        let op_names: Vec<&str> = selected.iter().map(Op::name).collect();
+        eprintln!(
+            "fsblame: watching {}{} for {}; Ctrl-C to stop",
+            watched.join(", "),
+            if nested > 0 {
+                format!(" (+{nested} mounts below)")
+            } else {
+                String::new()
+            },
+            if opts.ops.is_empty() {
+                "all ops".to_owned()
+            } else {
+                op_names.join(",")
+            },
+        );
+    }
 
     let clock = Clock::new();
-    let out = BufWriter::new(io::stdout().lock());
-    if args.json {
-        stream(
-            Engine::new(roots, Json::new(out, clock)),
-            &mut tracer,
-            &signals,
-            args,
-        )
-    } else {
-        let human = Human::new(out, clock, home_dir(), args.depth);
-        stream(Engine::new(roots, human), &mut tracer, &signals, args)
-    }
+    let output = Output {
+        sink,
+        summary: opts.summary.then(Summary::new),
+    };
+    let engine = Engine::new(roots, clock, opts.filter.clone(), output);
+    stream(engine, &mut tracer, &signals, opts, clock)
 }
 
 /// An output error ends the run; a closed pipe ends it cleanly.
@@ -300,17 +392,117 @@ fn output_result(result: io::Result<()>) -> Result<bool, Failure> {
     }
 }
 
-fn stream<S: Sink>(
-    mut engine: Engine<S>,
+/// The caller's sink, tallying changes for the summary when one was asked for.
+struct Output<'s> {
+    sink: &'s mut dyn Sink,
+    summary: Option<Summary>,
+}
+
+impl Sink for Output<'_> {
+    fn line(&mut self, line: &Line<'_>) -> io::Result<()> {
+        if let (Some(summary), Line::Touch(change)) = (&mut self.summary, line) {
+            summary.add(change);
+        }
+        self.sink.line(line)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.sink.flush()
+    }
+}
+
+/// Turns a growing loss counter into `lost` lines with the growth since the previous one,
+/// at most one per [`LOSS_EVERY`] so a sustained overflow does not flood the output.
+#[derive(Debug)]
+struct LossMeter {
+    reason: LossReason,
+    /// The counter as of the last line.
+    reported: u64,
+    /// When the last line was written.
+    last: Option<Instant>,
+}
+
+impl LossMeter {
+    const fn new(reason: LossReason) -> Self {
+        Self {
+            reason,
+            reported: 0,
+            last: None,
+        }
+    }
+
+    /// The losses to report now that the counter is at `total`: none if it has not grown,
+    /// or if the previous line is recent, unless `all` (the end of the run).
+    fn due(&mut self, total: u64, now: Instant, all: bool) -> Option<u64> {
+        let recent = self
+            .last
+            .is_some_and(|at| now.duration_since(at) < LOSS_EVERY);
+        if total <= self.reported || (recent && !all) {
+            return None;
+        }
+        let count = total - self.reported;
+        self.reported = total;
+        self.last = Some(now);
+        Some(count)
+    }
+}
+
+/// Writes the `lost` lines due for `totals`; `all` writes every unreported loss.
+fn report_losses(
+    engine: &mut Engine<Output<'_>>,
+    meters: &mut [LossMeter; 2],
+    totals: LossTotals,
+    clock: Clock,
+    all: bool,
+) -> io::Result<()> {
+    let now = Instant::now();
+    for (meter, total) in meters
+        .iter_mut()
+        .zip([totals.ring_full, totals.write_evicted])
+    {
+        if let Some(count) = meter.due(total, now, all) {
+            engine.sink_mut().line(&Line::Lost(LostReport {
+                v: Version,
+                ts: Timestamp::from_boot(clock, clock::boot_now_ns()),
+                reason: meter.reason,
+                count,
+            }))?;
+        }
+    }
+    Ok(())
+}
+
+/// The totals so far.
+fn outcome(engine: &Engine<Output<'_>>, tracer: &Tracer) -> Outcome {
+    let counts = engine.counts();
+    Outcome {
+        changes: counts.touches,
+        lost: LossTotals {
+            ring_full: tracer.ring_drops(),
+            write_evicted: counts.evicted,
+        },
+        malformed: counts.malformed,
+    }
+}
+
+// One linear loop: wait, drain, poll, report losses; then the end-of-run output.
+#[allow(clippy::too_many_lines)]
+fn stream(
+    mut engine: Engine<Output<'_>>,
     tracer: &mut Tracer,
     signals: &Signals,
-    args: &WatchArgs,
-) -> Result<(), Failure> {
+    opts: &WatchOptions,
+    clock: Clock,
+) -> Result<Outcome, Failure> {
+    let mut meters = [
+        LossMeter::new(LossReason::RingFull),
+        LossMeter::new(LossReason::WriteEvicted),
+    ];
     let epoll = Epoll::new(&[tracer.ring.as_raw_fd(), signals.fd.as_raw_fd()])?;
-    if let Some(fd) = args.ready_fd {
+    if let Some(fd) = opts.ready_fd {
         signal_ready(fd).with_context(|| format!("writing to --ready-fd {fd}"))?;
     }
-    let deadline = args.duration.map(|d| Instant::now() + d);
+    let deadline = opts.duration.map(|d| Instant::now() + d);
     let mut open = true;
     while open {
         let left = deadline.map_or(TICK_MS, |d| {
@@ -330,33 +522,70 @@ fn stream<S: Sink>(
         // above must still run.
         let budget =
             Instant::now() + Duration::from_millis(if open { TICK_MS } else { STOP_DRAIN_MS });
+        let mut closed = false;
         while let Some(item) = tracer.ring.next() {
             if !output_result(engine.handle(&item, &mut tracer.writes))? {
-                return Ok(());
+                closed = true;
+                break;
             }
             if Instant::now() >= budget {
                 break;
             }
         }
-        if !output_result(engine.poll(clock::boot_now_ns(), &mut tracer.writes))? {
-            return Ok(());
+        let totals = outcome(&engine, tracer).lost;
+        if closed
+            || !output_result(report_losses(
+                &mut engine,
+                &mut meters,
+                totals,
+                clock,
+                false,
+            ))?
+            || !output_result(engine.poll(clock::boot_now_ns(), &mut tracer.writes))?
+        {
+            return Ok(outcome(&engine, tracer));
         }
     }
-    output_result(engine.finish(&mut tracer.writes))?;
+    if !output_result(engine.finish(&mut tracer.writes))? {
+        return Ok(outcome(&engine, tracer));
+    }
+    let result = outcome(&engine, tracer);
+    let ended = report_losses(&mut engine, &mut meters, result.lost, clock, true).and_then(|()| {
+        let output = engine.sink_mut();
+        if let Some(summary) = output.summary.take() {
+            let ts = Timestamp::from_boot(clock, clock::boot_now_ns());
+            output
+                .sink
+                .line(&Line::Summary(summary.report(ts, result.lost)))?;
+        }
+        output.flush()
+    });
+    if !output_result(ended)? {
+        return Ok(result);
+    }
 
-    let drops = tracer.ring_drops();
-    if drops > 0 {
+    if result.lost.ring_full > 0 {
         eprintln!(
-            "fsblame: warning: {drops} kernel records were lost because the ring buffer was full"
+            "fsblame: warning: {} kernel records were lost because the ring buffer was full; \
+             a larger --ring-size helps",
+            result.lost.ring_full
         );
     }
-    let counts = engine.counts();
-    if counts.malformed > 0 {
+    if result.lost.write_evicted > 0 {
+        eprintln!(
+            "fsblame: warning: the latest byte counts of {} open files were lost because the \
+             kernel write table was full",
+            result.lost.write_evicted
+        );
+    }
+    if result.malformed > 0 {
         eprintln!(
             "fsblame: warning: {} malformed records were ignored",
-            counts.malformed
+            result.malformed
         );
     }
-    eprintln!("fsblame: {} changes reported", counts.touches);
-    Ok(())
+    if !opts.quiet {
+        eprintln!("fsblame: {} changes reported", result.changes);
+    }
+    Ok(result)
 }

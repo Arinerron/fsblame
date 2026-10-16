@@ -1,9 +1,8 @@
 //! `fsblame doctor`: bpfdoctor's shared checks plus fsblame's own probes.
 
 use std::{
-    fs,
     io::{self, IsTerminal},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, OnceLock},
 };
 
@@ -23,7 +22,7 @@ use crate::{
     cli::DoctorArgs,
     fail::{Failure, errno_of},
     ops::{FS_HOOKS, Hook, Op, Role, SCHED_HOOKS},
-    roots::{self, Roots},
+    roots::{self, Mount, Overlay, Roots},
     tracer::{self, Cause, Class, HookOutcome, LoadError},
 };
 
@@ -481,24 +480,28 @@ fn ops_diagnostic(
     d.with_explain(explain.join(". "))
 }
 
-/// `fsblame.watchfs`: watch paths on filesystems where dentry identity or paths mislead.
+/// `fsblame.watchfs`: how the filesystems of the watch paths shape what is reported.
+/// Overlays are watched through their merged view (see [`roots`]); network and FUSE
+/// filesystems hide or misattribute changes.
 #[derive(Debug)]
 pub struct WatchFs {
     /// Paths to inspect.
     pub paths: Vec<PathBuf>,
 }
 
-/// Filesystems on which dentry identity or paths mislead.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// What limits reporting on a watch path's filesystem.
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Concern {
-    Overlay,
+    /// The overlay (named) involved has repeating inode numbers (see [`roots`]).
+    OverlayInodes(String),
+    /// The overlay's upper layer, `upperdir=` as given, is not found in this mount namespace.
+    OverlayUpper(PathBuf),
     Network,
     Fuse,
 }
 
 fn fs_concern(fstype: &str) -> Option<Concern> {
     match fstype {
-        "overlay" => Some(Concern::Overlay),
         "nfs" | "nfs4" | "cifs" | "smb3" | "9p" | "ceph" | "glusterfs" | "afs" => {
             Some(Concern::Network)
         }
@@ -509,79 +512,236 @@ fn fs_concern(fstype: &str) -> Option<Concern> {
     }
 }
 
+/// What `fsblame.watchfs` finds for one watch path.
+struct Finding {
+    /// Its part of the observed text.
+    note: String,
+    /// Whether the overlay rules of [`roots`] apply to it.
+    overlay: bool,
+    /// What limits reporting there.
+    concern: Option<Concern>,
+}
+
+/// How an overlay is named in diagnostics.
+fn overlay_name(overlay: &Overlay) -> String {
+    overlay.point.as_ref().map_or_else(
+        || format!("the overlay on device {}", roots::dev_string(overlay.dev)),
+        |point| format!("the overlay at {}", point.display()),
+    )
+}
+
+/// The upper layer of `overlay`, when found.
+fn upper_layer(overlay: &Overlay) -> Option<&Path> {
+    overlay.writable.as_ref().map(|w| w.upper.path.as_path())
+}
+
+/// Inspects the canonical watch path `path`, held by `mount`.
+fn inspect(path: &Path, mount: &Mount, overlays: &[Overlay], mounts: &[Mount]) -> Finding {
+    let shown = path.display();
+    let inodes = |overlay: &Overlay| {
+        (!overlay.unique_inodes(mounts)).then(|| Concern::OverlayInodes(overlay_name(overlay)))
+    };
+    if let Some(overlay) = overlays.iter().find(|o| o.dev == mount.dev) {
+        let note = match (&overlay.writable, &overlay.upperdir) {
+            (Some(writable), _) => format!(
+                "{shown} is in the merged view of an overlay: each change made through it is \
+                 reported once, at its path there; copy-ups and whiteouts in the upper layer {} \
+                 are not reported",
+                writable.upper.path.display()
+            ),
+            (None, Some(_)) => format!(
+                "{shown} is in the merged view of an overlay: each change made through it is \
+                 reported once, at its path there"
+            ),
+            (None, None) => format!("{shown} is in the merged view of a read-only overlay"),
+        };
+        let lost = overlay
+            .upperdir
+            .clone()
+            .filter(|_| overlay.writable.is_none())
+            .map(Concern::OverlayUpper);
+        return Finding {
+            note,
+            overlay: true,
+            concern: inodes(overlay).or(lost),
+        };
+    }
+    if let Some(overlay) = overlays
+        .iter()
+        .find(|o| upper_layer(o).is_some_and(|u| path.starts_with(u)))
+    {
+        return Finding {
+            note: format!(
+                "{shown} is in the upper layer of {}: it is watched through the merged view, \
+                 where each change made through the overlay is reported once",
+                overlay_name(overlay)
+            ),
+            overlay: true,
+            concern: inodes(overlay),
+        };
+    }
+    let held: Vec<&Overlay> = overlays
+        .iter()
+        .filter(|o| upper_layer(o).is_some_and(|u| u.starts_with(path)))
+        .collect();
+    let concern = fs_concern(&mount.fstype);
+    let Some(first) = held.first() else {
+        return Finding {
+            note: format!("{shown} on {}", mount.fstype),
+            overlay: false,
+            concern,
+        };
+    };
+    let layers = if held.len() == 1 {
+        format!("the upper layer of {}", overlay_name(first))
+    } else {
+        format!(
+            "the upper layers of {} overlays, such as {}",
+            held.len(),
+            overlay_name(first)
+        )
+    };
+    Finding {
+        note: format!(
+            "{shown} on {} holds {layers}: each change made through an overlay is reported \
+             once, at its merged path",
+            mount.fstype
+        ),
+        overlay: true,
+        concern: concern.or_else(|| held.iter().find_map(|&o| inodes(o))),
+    }
+}
+
+/// Id of the [`WatchFs`] check.
+const WATCHFS: &str = "fsblame.watchfs";
+
+/// The [`WatchFs`] diagnostic.
+fn watchfs(status: Status, observed: String) -> Diagnostic {
+    Diagnostic::new(WATCHFS, "Watch path filesystems", false, status, observed)
+}
+
+/// How fsblame watches an overlay.
+const OVERLAY_EXPLAIN: &str = "overlayfs repeats every change made through the merged view on \
+     its upper layer, in the same process, and first copies a lower file up into that layer; \
+     fsblame reports the overlay's own operation and leaves out the upper layer and work \
+     directory, so a change shows once, at its merged path. On an overlay, writes through a \
+     shared mapping that mprotect(2) makes writable are not seen: the kernel names the upper \
+     layer's file to that hook, not the overlay's";
+
+/// Why network and FUSE filesystems are flagged.
+const LOCAL_ONLY: &str = "fsblame sees the operations made through this kernel's VFS and \
+     attributes each to the process that made it, so it is exact only on local filesystems";
+
+/// The warning for the first `concern`, found at the canonical watch path `path` on `mount`.
+fn concern_diagnostic(concern: &Concern, path: &Path, mount: &Mount, tool: &Tool) -> Diagnostic {
+    let at = format!("{} is on {}", path.display(), mount.fstype);
+    match concern {
+        Concern::OverlayInodes(overlay) => watchfs(
+            Status::Warn,
+            format!(
+                "{} involves {overlay}, whose layers are on different filesystems with xino \
+                 off, so its inode numbers repeat",
+                path.display()
+            ),
+        )
+        .with_impact(
+            "a file whose inode number equals a watched or excluded directory's on that overlay \
+             is reported as that directory; watched directories below its root are kept open \
+             while fsblame runs, which keeps the overlay busy",
+        )
+        .with_fix(Fix::new(
+            "mount -t overlay overlay -o xino=on,lowerdir=...,upperdir=...,workdir=... <merged>",
+            "xino=on gives every file of the overlay its own number; so do layers on one \
+             filesystem",
+        ))
+        .with_explain(
+            "fsblame matches watch roots by (superblock device, inode number); with layers on \
+             several filesystems and xino off, overlayfs numbers each directory inode from a \
+             counter whenever it loads it, while a file keeps the number it has on its layer",
+        ),
+        Concern::OverlayUpper(upperdir) => watchfs(
+            Status::Warn,
+            format!(
+                "{at}, whose upper layer (upperdir={}) is not found in this mount namespace",
+                upperdir.display()
+            ),
+        )
+        .with_impact(
+            "if another watch path contains that layer, overlayfs's copy-ups, whiteouts and \
+             repeated changes there are reported as well",
+        )
+        .with_fix(Fix::new(
+            format!("{} watch {}", tool.name, path.display()),
+            "watch only the merged view",
+        ))
+        .with_explain(OVERLAY_EXPLAIN),
+        Concern::Network => watchfs(Status::Warn, format!("{at}, a network filesystem"))
+            .with_impact("changes made by other clients or by the server are never seen")
+            .with_fix(Fix::new(
+                format!("{} watch <export path>  # on the server", tool.name),
+                "only operations made through this kernel are visible",
+            ))
+            .with_explain(LOCAL_ONLY),
+        Concern::Fuse => watchfs(Status::Warn, format!("{at}, a FUSE filesystem"))
+            .with_impact(
+                "the FUSE daemon's writes to its backing store are attributed to the daemon, \
+                 not the client",
+            )
+            .with_fix(Fix::new(
+                format!("{} watch <backing directory>", tool.name),
+                "if the daemon has one, watch it as well",
+            ))
+            .with_explain(LOCAL_ONLY),
+    }
+}
+
 impl Check for WatchFs {
     fn id(&self) -> &'static str {
-        "fsblame.watchfs"
+        WATCHFS
     }
 
     fn run(&self, _env: &dyn Env, tool: &Tool) -> Diagnostic {
-        let diag = |status, observed: String| {
-            Diagnostic::new(self.id(), "Watch path filesystems", false, status, observed)
-        };
         let mounts = match roots::mounts() {
             Ok(mounts) => mounts,
             Err(e) => {
-                return diag(
+                return watchfs(
                     Status::Skip,
                     format!("cannot read /proc/self/mountinfo: {e}"),
                 );
             }
         };
-        let mut fine = Vec::new();
+        let overlays = roots::overlays(&mounts);
+        let mut notes = Vec::new();
+        let mut overlaid = false;
         let mut warned = None;
         for path in &self.paths {
-            let located = fs::canonicalize(path).and_then(|p| {
+            let located = roots::canonical(path, &mounts).and_then(|p| {
                 let (mount, _) = roots::locate(&p, &mounts)?;
-                Ok((p, mount.clone()))
+                Ok((p, mount))
             });
             let (canonical, mount) = match located {
                 Ok(found) => found,
                 Err(e) => {
-                    return diag(
+                    return watchfs(
                         Status::Warn,
-                        format!("cannot inspect {}: {e}", path.display()),
+                        format!("cannot inspect {}: {e:#}", path.display()),
                     );
                 }
             };
-            match fs_concern(&mount.fstype) {
-                None => fine.push(format!("{} on {}", canonical.display(), mount.fstype)),
-                Some(concern) => {
-                    warned.get_or_insert((canonical, mount, concern));
-                }
+            let finding = inspect(&canonical, mount, &overlays, &mounts);
+            overlaid |= finding.overlay;
+            if let Some(concern) = finding.concern {
+                warned.get_or_insert((canonical, mount, concern));
             }
+            notes.push(finding.note);
         }
-        let Some((path, mount, concern)) = warned else {
-            return diag(Status::Pass, fine.join(", "));
-        };
-        let at = format!("{} is on {}", path.display(), mount.fstype);
-        let d = match concern {
-            Concern::Overlay => {
-                let upper = mount
-                    .super_opts
-                    .split(',')
-                    .find_map(|opt| opt.strip_prefix("upperdir="))
-                    .unwrap_or("<upperdir>");
-                diag(Status::Warn, format!("{at}: one file has a merged and an upper-layer identity"))
-                    .with_impact("changes may be reported twice, or under the upper-layer path; copy-up shows as a create")
-                    .with_fix(Fix::new(format!("{} watch {upper}", tool.name), "watch the writable layer directly"))
+        match warned {
+            Some((path, mount, concern)) => concern_diagnostic(&concern, &path, mount, tool),
+            None if overlaid => {
+                watchfs(Status::Info, notes.join("; ")).with_explain(OVERLAY_EXPLAIN)
             }
-            Concern::Network => diag(Status::Warn, format!("{at}, a network filesystem"))
-                .with_impact("changes made by other clients or by the server are never seen")
-                .with_fix(Fix::new(
-                    format!("{} watch <export path>  # on the server", tool.name),
-                    "only operations made through this kernel are visible",
-                )),
-            Concern::Fuse => diag(Status::Warn, format!("{at}, a FUSE filesystem"))
-                .with_impact("the FUSE daemon's writes to its backing store are attributed to the daemon, not the client")
-                .with_fix(Fix::new(
-                    format!("{} watch <backing directory>", tool.name),
-                    "if the daemon has one, watch it as well",
-                )),
-        };
-        d.with_explain(
-            "fsblame matches watch roots by (superblock device, inode) and rebuilds paths from the \
-             kernel's dentries, so it is exact only on local, non-stacked filesystems",
-        )
+            None => watchfs(Status::Pass, notes.join(", ")),
+        }
     }
 }
 

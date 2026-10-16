@@ -65,5 +65,6 @@ See [AGENTS.md](AGENTS.md) for the architecture, the BPF verifier constraints an
 
 ## Status
 
-MVP. Local filesystems only (overlay, network and FUSE filesystems are flagged by `doctor`);
+MVP. Local filesystems, including overlays (container root filesystems: each change is reported
+once, at its merged path); network and FUSE filesystems are flagged by `doctor`;
 the cwd of a process that exits before its event is handled may be missing.

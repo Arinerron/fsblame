@@ -6,6 +6,7 @@
 //!
 //! Exit codes: 0 clean stop, 2 usage, 4 privileges, 5 kernel unsupported, 6 runtime error.
 
+pub mod btf;
 pub mod cli;
 pub mod clock;
 pub mod doctor;
@@ -16,6 +17,7 @@ pub mod glob;
 pub mod ops;
 pub mod record;
 pub mod render;
+pub mod report;
 pub mod roots;
 pub mod tracer;
 pub mod watch;
@@ -104,9 +106,9 @@ pub fn main() -> ExitCode {
     let cli = parse_args();
     let result = match &cli.command {
         Some(Command::Doctor(args)) => doctor::run(args),
-        Some(Command::Watch(args)) => watch::run(args),
+        Some(Command::Watch(args)) => watch::command(args),
         Some(Command::Completions { shell }) => completions(*shell),
-        None => watch::run(&cli.watch),
+        None => watch::command(&cli.watch),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

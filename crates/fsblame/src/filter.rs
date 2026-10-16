@@ -85,6 +85,12 @@ impl Filter {
             && self.pid.is_empty()
     }
 
+    /// Whether [`matches`](Self::matches) needs [`Candidate::unit`]: without a `unit`
+    /// criterion, callers may skip resolving it.
+    pub fn needs_unit(&self) -> bool {
+        !self.unit.is_empty()
+    }
+
     /// Whether the change described by `c` should be reported.
     ///
     /// `comm` criteria compare the first 15 bytes of both names, since the kernel keeps no

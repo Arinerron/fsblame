@@ -180,7 +180,7 @@ impl Hook {
 }
 
 /// The fentry hooks, in attach order.
-pub const FS_HOOKS: [Hook; 13] = [
+pub const FS_HOOKS: [Hook; 14] = [
     Hook {
         program: "on_rw_verify_area",
         function: "rw_verify_area",
@@ -217,6 +217,16 @@ pub const FS_HOOKS: [Hook; 13] = [
         ops: &[Op::Create],
         always: false,
         role: Role::Reports,
+    },
+    Hook {
+        program: "on_file_post_open",
+        function: "security_file_post_open",
+        ops: &[Op::Create],
+        always: false,
+        role: Role::Supplements(
+            "an open(O_CREAT) of an existing file not yet in the dentry cache is reported as a \
+             create",
+        ),
     },
     Hook {
         program: "on_mkdir",
