@@ -26,8 +26,19 @@ const MAX_COLUMN: usize = 56;
 fn is_interpreter(name: &str) -> bool {
     matches!(
         name,
-        "node" | "nodejs" | "python" | "python2" | "python3" | "perl" | "ruby" | "bun" | "deno" | "php"
-    ) || name.strip_prefix("python3.").is_some_and(|minor| minor.bytes().all(|b| b.is_ascii_digit()))
+        "node"
+            | "nodejs"
+            | "python"
+            | "python2"
+            | "python3"
+            | "perl"
+            | "ruby"
+            | "bun"
+            | "deno"
+            | "php"
+    ) || name
+        .strip_prefix("python3.")
+        .is_some_and(|minor| minor.bytes().all(|b| b.is_ascii_digit()))
 }
 
 fn basename(path: &str) -> &str {
@@ -77,14 +88,19 @@ fn tilde(path: &str, home: Option<&Path>) -> String {
 /// A process as a short command line: the program's basename and its arguments, with
 /// `interpreter /abs/path/to/tool args` collapsed to `tool args`.
 pub fn command_line(argv: &[Box<OsStr>], comm: &str, home: Option<&Path>) -> String {
-    let args: Vec<String> = argv.iter().map(|a| a.to_string_lossy().into_owned()).collect();
-    let Some(first) = args.first() else {
+    let cmd_parts: Vec<String> = argv
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    let Some(first) = cmd_parts.first() else {
         return comm.to_owned();
     };
     let program = basename(first);
-    let (head, rest) = match args.get(1) {
-        Some(script) if is_interpreter(program) && script.starts_with('/') => (script_name(script), &args[2..]),
-        _ => (program, &args[1..]),
+    let (head, rest) = match cmd_parts.get(1) {
+        Some(script) if is_interpreter(program) && script.starts_with('/') => {
+            (script_name(script), &cmd_parts[2..])
+        }
+        _ => (program, &cmd_parts[1..]),
     };
     let mut line = head.to_owned();
     for arg in rest {
@@ -190,10 +206,13 @@ impl<W: Write> Human<W> {
             }
             Change::Mode(mode) => format!("({} → {})", perms(touch.mode), perms(mode)),
             Change::Owner { uid, gid } => {
-                let parts: Vec<String> = [uid.map(|u| format!("uid {u}")), gid.map(|g| format!("gid {g}"))]
-                    .into_iter()
-                    .flatten()
-                    .collect();
+                let parts: Vec<String> = [
+                    uid.map(|u| format!("uid {u}")),
+                    gid.map(|g| format!("gid {g}")),
+                ]
+                .into_iter()
+                .flatten()
+                .collect();
                 format!("(→ {})", parts.join(", "))
             }
             Change::Size(size) => format!("(→ {})", format_bytes(size)),
@@ -262,7 +281,10 @@ impl<W: Write> Sink for Human<W> {
         } else {
             let via = lineage.origin.as_ref().map(|o| o.via);
             let via_at = via.and_then(|via| chain.iter().position(|info| info.key == via));
-            let shown = chain.len().min(self.depth + 1).max(via_at.map_or(0, |at| at + 1));
+            let shown = chain
+                .len()
+                .min(self.depth + 1)
+                .max(via_at.map_or(0, |at| at + 1));
             let mut cwd_below: Option<&Path> = None;
             for (level, info) in chain[..shown].iter().enumerate() {
                 let (command, facts) = self.proc_line(info, cwd_below);
@@ -278,7 +300,11 @@ impl<W: Write> Sink for Human<W> {
                         parts.push(format!("unit {}", unit.name));
                     }
                     if let Some(container) = &ctx.container {
-                        parts.push(format!("{} {}", container.runtime.as_str(), container.short_id()));
+                        parts.push(format!(
+                            "{} {}",
+                            container.runtime.as_str(),
+                            container.short_id()
+                        ));
                     }
                     if !parts.is_empty() {
                         notes.push(format!("[{}]", parts.join(" · ")));
@@ -306,7 +332,11 @@ impl<W: Write> Sink for Human<W> {
             let hidden = chain.len() - shown;
             if hidden > 0 {
                 let plural = if hidden == 1 { "" } else { "s" };
-                rows.push((format!("… {hidden} more ancestor{plural}"), String::new(), Vec::new()));
+                rows.push((
+                    format!("… {hidden} more ancestor{plural}"),
+                    String::new(),
+                    Vec::new(),
+                ));
             }
         }
         let lefts: Vec<String> = rows
@@ -314,7 +344,13 @@ impl<W: Write> Sink for Human<W> {
             .enumerate()
             .map(|(level, (command, _, _))| format!("{}└─ {command}", " ".repeat(2 + 3 * level)))
             .collect();
-        let column = lefts.iter().map(|l| l.chars().count()).max().unwrap_or(0).min(MAX_COLUMN) + 2;
+        let column = lefts
+            .iter()
+            .map(|l| l.chars().count())
+            .max()
+            .unwrap_or(0)
+            .min(MAX_COLUMN)
+            + 2;
         for (left, (_, facts, notes)) in lefts.iter().zip(&rows) {
             let mut line = left.clone();
             if !facts.is_empty() {
@@ -438,7 +474,11 @@ impl<W: Write> Json<W> {
             pid: info.key.pid,
             comm: info.comm.to_string(),
             exe: info.exe.as_deref().map(text),
-            argv: info.argv.iter().map(|a| a.to_string_lossy().into_owned()).collect(),
+            argv: info
+                .argv
+                .iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect(),
             argv_truncated: info.argv_truncated,
             cwd: info.cwd.as_deref().map(text),
             uid: info.uid,
@@ -495,7 +535,12 @@ impl<W: Write> Sink for Json<W> {
             },
             |info| self.proc(info),
         );
-        let ancestry: Vec<ProcJson> = lineage.chain.iter().skip(1).map(|info| self.proc(info)).collect();
+        let ancestry: Vec<ProcJson> = lineage
+            .chain
+            .iter()
+            .skip(1)
+            .map(|info| self.proc(info))
+            .collect();
         let ctx = &lineage.context;
         let record = TouchJson {
             kind: "touch",
@@ -556,19 +601,40 @@ mod tests {
     #[test]
     fn interpreter_running_an_installed_tool_collapses_to_the_tool() {
         let home = Some(Path::new("/home/u"));
-        assert_eq!(command_line(&argv(&["node", "/usr/bin/npm", "install"]), "node", home), "npm install");
+        assert_eq!(
+            command_line(&argv(&["node", "/usr/bin/npm", "install"]), "node", home),
+            "npm install"
+        );
         assert_eq!(
             command_line(
-                &argv(&["/usr/bin/node", "/usr/lib/node_modules/npm/bin/npm-cli.js", "run", "build"]),
+                &argv(&[
+                    "/usr/bin/node",
+                    "/usr/lib/node_modules/npm/bin/npm-cli.js",
+                    "run",
+                    "build"
+                ]),
                 "node",
                 home
             ),
             "npm run build"
         );
-        assert_eq!(command_line(&argv(&["python3.12", "/usr/bin/pip", "install", "x"]), "python3", home), "pip install x");
+        assert_eq!(
+            command_line(
+                &argv(&["python3.12", "/usr/bin/pip", "install", "x"]),
+                "python3",
+                home
+            ),
+            "pip install x"
+        );
         // A relative script is the program the user named: keep it.
-        assert_eq!(command_line(&argv(&["node", "install.js"]), "node", home), "node install.js");
-        assert_eq!(command_line(&argv(&["/usr/bin/make", "-j8"]), "make", home), "make -j8");
+        assert_eq!(
+            command_line(&argv(&["node", "install.js"]), "node", home),
+            "node install.js"
+        );
+        assert_eq!(
+            command_line(&argv(&["/usr/bin/make", "-j8"]), "make", home),
+            "make -j8"
+        );
     }
 
     #[test]
@@ -578,11 +644,22 @@ mod tests {
             command_line(&argv(&["sh", "-c", "echo hi > /home/u/x"]), "sh", home),
             "sh -c 'echo hi > /home/u/x'"
         );
-        assert_eq!(command_line(&argv(&["cp", "/home/u/a", "/tmp/b"]), "cp", home), "cp ~/a /tmp/b");
-        assert_eq!(command_line(&argv(&["echo", "it's", ""]), "echo", home), r"echo 'it'\''s' ''");
+        assert_eq!(
+            command_line(&argv(&["cp", "/home/u/a", "/tmp/b"]), "cp", home),
+            "cp ~/a /tmp/b"
+        );
+        assert_eq!(
+            command_line(&argv(&["echo", "it's", ""]), "echo", home),
+            r"echo 'it'\''s' ''"
+        );
         assert_eq!(command_line(&[], "kworker/0:1", home), "kworker/0:1");
         let long = "x".repeat(100);
-        assert_eq!(command_line(&argv(&["echo", &long]), "echo", home).chars().count(), MAX_COMMAND);
+        assert_eq!(
+            command_line(&argv(&["echo", &long]), "echo", home)
+                .chars()
+                .count(),
+            MAX_COMMAND
+        );
     }
 
     #[test]

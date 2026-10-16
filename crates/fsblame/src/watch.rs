@@ -136,7 +136,9 @@ impl Epoll {
 fn check_fd(fd: i32) -> Result<(), Failure> {
     // SAFETY: F_GETFD only queries the descriptor table.
     if fd < 0 || unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
-        return Err(Failure::Usage(anyhow!("--ready-fd {fd} is not an open file descriptor")));
+        return Err(Failure::Usage(anyhow!(
+            "--ready-fd {fd} is not an open file descriptor"
+        )));
     }
     Ok(())
 }
@@ -148,7 +150,7 @@ fn signal_ready(fd: i32) -> io::Result<()> {
     file.write_all(b"ready\n")
 }
 
-/// Raises the RLIMIT_MEMLOCK soft limit to the hard limit; kernels before 5.11 charge BPF
+/// Raises the `RLIMIT_MEMLOCK` soft limit to the hard limit; kernels before 5.11 charge BPF
 /// memory there.
 fn raise_memlock() {
     let mut limit = libc::rlimit {
@@ -157,7 +159,9 @@ fn raise_memlock() {
     };
     // SAFETY: `limit` is valid for both calls.
     unsafe {
-        if libc::getrlimit(libc::RLIMIT_MEMLOCK, &raw mut limit) == 0 && limit.rlim_cur < limit.rlim_max {
+        if libc::getrlimit(libc::RLIMIT_MEMLOCK, &raw mut limit) == 0
+            && limit.rlim_cur < limit.rlim_max
+        {
             limit.rlim_cur = limit.rlim_max;
             libc::setrlimit(libc::RLIMIT_MEMLOCK, &raw const limit);
         }
@@ -170,7 +174,15 @@ fn passwd_home(uid: libc::uid_t) -> Option<PathBuf> {
     let mut result = std::ptr::null_mut();
     // SAFETY: all pointers are valid; on success `result` points at `pwd`, whose strings live
     // in `buf`.
-    let rc = unsafe { libc::getpwuid_r(uid, pwd.as_mut_ptr(), buf.as_mut_ptr(), buf.len(), &raw mut result) };
+    let rc = unsafe {
+        libc::getpwuid_r(
+            uid,
+            pwd.as_mut_ptr(),
+            buf.as_mut_ptr(),
+            buf.len(),
+            &raw mut result,
+        )
+    };
     if rc != 0 || result.is_null() {
         return None;
     }
@@ -181,11 +193,16 @@ fn passwd_home(uid: libc::uid_t) -> Option<PathBuf> {
 
 /// The home directory of the user fsblame runs for (the sudo caller, if any), for `~`.
 fn home_dir() -> Option<PathBuf> {
-    if let Some(uid) = std::env::var("SUDO_UID").ok().and_then(|uid| uid.parse().ok()) {
+    if let Some(uid) = std::env::var("SUDO_UID")
+        .ok()
+        .and_then(|uid| uid.parse().ok())
+    {
         return passwd_home(uid);
     }
     // SAFETY: getuid cannot fail.
-    std::env::var_os("HOME").map(PathBuf::from).or_else(|| passwd_home(unsafe { libc::getuid() }))
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .or_else(|| passwd_home(unsafe { libc::getuid() }))
 }
 
 /// `fsblame watch`.
@@ -202,7 +219,10 @@ pub fn run(args: &WatchArgs) -> Result<(), Failure> {
         report
             .render_human(&mut io::stderr(), false)
             .context("writing diagnostics")?;
-        return Err(doctor::failure(&report, "cannot start; see the FAIL lines above"));
+        return Err(doctor::failure(
+            &report,
+            "cannot start; see the FAIL lines above",
+        ));
     }
     doctor::print_problems(&report).context("writing diagnostics")?;
 
@@ -219,11 +239,17 @@ pub fn run(args: &WatchArgs) -> Result<(), Failure> {
         }
     })?;
     for missing in &tracer.missing {
-        eprintln!("fsblame: warning: {}", missing.error.describe(&missing.hook));
+        eprintln!(
+            "fsblame: warning: {}",
+            missing.error.describe(&missing.hook)
+        );
     }
     if !tracer.unavailable.is_empty() {
         let names: Vec<&str> = tracer.unavailable.iter().map(|op| op.name()).collect();
-        eprintln!("fsblame: warning: not reported on this kernel: {}", names.join(", "));
+        eprintln!(
+            "fsblame: warning: not reported on this kernel: {}",
+            names.join(", ")
+        );
     }
 
     let watched: Vec<String> = roots
@@ -232,18 +258,31 @@ pub fn run(args: &WatchArgs) -> Result<(), Failure> {
         .map(|(_, r)| r.path.display().to_string())
         .collect();
     let nested = roots.iter().filter(|(_, r)| r.nested).count();
-    let op_names: Vec<&str> = ops.iter().map(|op| op.name()).collect();
+    let op_names: Vec<&str> = ops.iter().map(super::ops::Op::name).collect();
     eprintln!(
         "fsblame: watching {}{} for {}; Ctrl-C to stop",
         watched.join(", "),
-        if nested > 0 { format!(" (+{nested} mounts below)") } else { String::new() },
-        if args.op.is_empty() { "all ops".to_owned() } else { op_names.join(",") },
+        if nested > 0 {
+            format!(" (+{nested} mounts below)")
+        } else {
+            String::new()
+        },
+        if args.op.is_empty() {
+            "all ops".to_owned()
+        } else {
+            op_names.join(",")
+        },
     );
 
     let clock = Clock::new();
     let out = BufWriter::new(io::stdout().lock());
     if args.json {
-        stream(Engine::new(roots, Json::new(out, clock)), &mut tracer, &signals, args)
+        stream(
+            Engine::new(roots, Json::new(out, clock)),
+            &mut tracer,
+            &signals,
+            args,
+        )
     } else {
         let human = Human::new(out, clock, home_dir(), args.depth);
         stream(Engine::new(roots, human), &mut tracer, &signals, args)
@@ -255,11 +294,18 @@ fn output_result(result: io::Result<()>) -> Result<bool, Failure> {
     match result {
         Ok(()) => Ok(true),
         Err(e) if e.kind() == io::ErrorKind::BrokenPipe => Ok(false),
-        Err(e) => Err(Failure::Runtime(anyhow::Error::new(e).context("writing output"))),
+        Err(e) => Err(Failure::Runtime(
+            anyhow::Error::new(e).context("writing output"),
+        )),
     }
 }
 
-fn stream<S: Sink>(mut engine: Engine<S>, tracer: &mut Tracer, signals: &Signals, args: &WatchArgs) -> Result<(), Failure> {
+fn stream<S: Sink>(
+    mut engine: Engine<S>,
+    tracer: &mut Tracer,
+    signals: &Signals,
+    args: &WatchArgs,
+) -> Result<(), Failure> {
     let epoll = Epoll::new(&[tracer.ring.as_raw_fd(), signals.fd.as_raw_fd()])?;
     if let Some(fd) = args.ready_fd {
         signal_ready(fd).with_context(|| format!("writing to --ready-fd {fd}"))?;
@@ -268,7 +314,8 @@ fn stream<S: Sink>(mut engine: Engine<S>, tracer: &mut Tracer, signals: &Signals
     let mut open = true;
     while open {
         let left = deadline.map_or(TICK_MS, |d| {
-            u64::try_from(d.saturating_duration_since(Instant::now()).as_millis()).unwrap_or(u64::MAX)
+            u64::try_from(d.saturating_duration_since(Instant::now()).as_millis())
+                .unwrap_or(u64::MAX)
         });
         let ready = epoll.wait(i32::try_from(left.min(TICK_MS)).expect("at most TICK_MS"))?;
         if ready.contains(&1) {
@@ -281,7 +328,8 @@ fn stream<S: Sink>(mut engine: Engine<S>, tracer: &mut Tracer, signals: &Signals
         // Drain for at most one tick (longer when stopping): under a flood of records (a busy
         // build forks and execs without pause) the ring never runs dry, and the stop checks
         // above must still run.
-        let budget = Instant::now() + Duration::from_millis(if open { TICK_MS } else { STOP_DRAIN_MS });
+        let budget =
+            Instant::now() + Duration::from_millis(if open { TICK_MS } else { STOP_DRAIN_MS });
         while let Some(item) = tracer.ring.next() {
             if !output_result(engine.handle(&item, &mut tracer.writes))? {
                 return Ok(());
@@ -298,11 +346,16 @@ fn stream<S: Sink>(mut engine: Engine<S>, tracer: &mut Tracer, signals: &Signals
 
     let drops = tracer.ring_drops();
     if drops > 0 {
-        eprintln!("fsblame: warning: {drops} kernel records were lost because the ring buffer was full");
+        eprintln!(
+            "fsblame: warning: {drops} kernel records were lost because the ring buffer was full"
+        );
     }
     let counts = engine.counts();
     if counts.malformed > 0 {
-        eprintln!("fsblame: warning: {} malformed records were ignored", counts.malformed);
+        eprintln!(
+            "fsblame: warning: {} malformed records were ignored",
+            counts.malformed
+        );
     }
     eprintln!("fsblame: {} changes reported", counts.touches);
     Ok(())

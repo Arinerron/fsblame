@@ -11,7 +11,10 @@ fn clock_ns(clock: libc::clockid_t) -> i128 {
     };
     // SAFETY: `ts` is a valid, writable timespec.
     let rc = unsafe { libc::clock_gettime(clock, &raw mut ts) };
-    assert_eq!(rc, 0, "clock_gettime({clock}) cannot fail for a supported clock");
+    assert_eq!(
+        rc, 0,
+        "clock_gettime({clock}) cannot fail for a supported clock"
+    );
     i128::from(ts.tv_sec) * NANOS + i128::from(ts.tv_nsec)
 }
 
@@ -109,7 +112,10 @@ mod tests {
             rfc3339(951_827_696_789_012_345),
             "2000-02-29T12:34:56.789012Z"
         );
-        assert_eq!(rfc3339(1_791_986_531_000_000_000), "2026-10-14T14:02:11.000000Z");
+        assert_eq!(
+            rfc3339(1_791_986_531_000_000_000),
+            "2026-10-14T14:02:11.000000Z"
+        );
         assert_eq!(rfc3339(-1_000_000_000), "1969-12-31T23:59:59.000000Z");
     }
 }

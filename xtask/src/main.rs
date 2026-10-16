@@ -10,6 +10,7 @@
 use std::{
     env,
     ffi::OsString,
+    fmt::Write as _,
     fs,
     io::{BufRead as _, BufReader, Read as _},
     os::unix::{ffi::OsStrExt as _, process::CommandExt as _},
@@ -68,17 +69,61 @@ struct Scenario {
 }
 
 const SCENARIOS: &[Scenario] = &[
-    Scenario { id: "a", name: "write + fsync is a write touch with bytes and comm", run: write_fsync },
-    Scenario { id: "b", name: "create + unlink are both reported", run: create_unlink },
-    Scenario { id: "c", name: "rename across two watch roots has old and new path; hard link", run: rename_link },
-    Scenario { id: "d", name: "chmod is reported with the new mode", run: chmod },
-    Scenario { id: "e", name: "subtree: mkdir -p a/b/c and a deep write have full paths", run: subtree },
-    Scenario { id: "f", name: "lineage keeps an exited ancestor shell chain", run: lineage },
-    Scenario { id: "g", name: "npm lifecycle environment gives origin npm-lifecycle", run: origin },
-    Scenario { id: "h", name: "unprivileged run exits 4 with a setcap hint", run: unprivileged },
-    Scenario { id: "i", name: "setcap'd copy runs as the normal user", run: setcap },
-    Scenario { id: "j", name: "doctor --json reports every op available", run: doctor_ops },
-    Scenario { id: "k", name: "--duration stops the watcher on time", run: duration },
+    Scenario {
+        id: "a",
+        name: "write + fsync is a write touch with bytes and comm",
+        run: write_fsync,
+    },
+    Scenario {
+        id: "b",
+        name: "create + unlink are both reported",
+        run: create_unlink,
+    },
+    Scenario {
+        id: "c",
+        name: "rename across two watch roots has old and new path; hard link",
+        run: rename_link,
+    },
+    Scenario {
+        id: "d",
+        name: "chmod is reported with the new mode",
+        run: chmod,
+    },
+    Scenario {
+        id: "e",
+        name: "subtree: mkdir -p a/b/c and a deep write have full paths",
+        run: subtree,
+    },
+    Scenario {
+        id: "f",
+        name: "lineage keeps an exited ancestor shell chain",
+        run: lineage,
+    },
+    Scenario {
+        id: "g",
+        name: "npm lifecycle environment gives origin npm-lifecycle",
+        run: origin,
+    },
+    Scenario {
+        id: "h",
+        name: "unprivileged run exits 4 with a setcap hint",
+        run: unprivileged,
+    },
+    Scenario {
+        id: "i",
+        name: "setcap'd copy runs as the normal user",
+        run: setcap,
+    },
+    Scenario {
+        id: "j",
+        name: "doctor --json reports every op available",
+        run: doctor_ops,
+    },
+    Scenario {
+        id: "k",
+        name: "--duration stops the watcher on time",
+        run: duration,
+    },
 ];
 
 fn print_scenarios() {
@@ -96,10 +141,13 @@ fn test_e2e(args: &[OsString]) -> Result<bool> {
         match arg.to_str() {
             Some("--bin") => bin = Some(PathBuf::from(it.next().context("--bin needs a path")?)),
             Some("--only") => {
-                let ids = it.next().and_then(|v| v.to_str()).context("--only needs scenario ids")?;
+                let ids = it
+                    .next()
+                    .and_then(|v| v.to_str())
+                    .context("--only needs scenario ids")?;
                 only = Some(ids.split(',').map(str::to_owned).collect());
             }
-            _ => bail!("unknown argument {arg:?}\n{USAGE}"),
+            _ => bail!("unknown argument {}\n{USAGE}", arg.display()),
         }
     }
 
@@ -108,7 +156,10 @@ fn test_e2e(args: &[OsString]) -> Result<bool> {
         unsafe { libc::geteuid() } != 0,
         "run as your normal user: the scenarios use `sudo -n` themselves and test unprivileged runs"
     );
-    let sudo = Command::new("sudo").args(["-n", "true"]).status().context("running sudo")?;
+    let sudo = Command::new("sudo")
+        .args(["-n", "true"])
+        .status()
+        .context("running sudo")?;
     ensure!(sudo.success(), "needs passwordless `sudo -n`");
 
     let bin = match bin {
@@ -120,12 +171,19 @@ fn test_e2e(args: &[OsString]) -> Result<bool> {
     fs::create_dir_all(&work).with_context(|| format!("creating {}", work.display()))?;
     check_work_fs(&work)?;
     let ctx = Ctx { bin, work };
-    println!("fsblame e2e: {} (work dir {})", ctx.bin.display(), ctx.work.display());
+    println!(
+        "fsblame e2e: {} (work dir {})",
+        ctx.bin.display(),
+        ctx.work.display()
+    );
 
     let mut failed = 0;
     let mut ran = 0;
     for scenario in SCENARIOS {
-        if only.as_ref().is_some_and(|ids| !ids.iter().any(|id| id == scenario.id)) {
+        if only
+            .as_ref()
+            .is_some_and(|ids| !ids.iter().any(|id| id == scenario.id))
+        {
             continue;
         }
         ran += 1;
@@ -150,7 +208,9 @@ fn test_e2e(args: &[OsString]) -> Result<bool> {
 
 /// Builds the release binary and returns its path.
 fn build() -> Result<PathBuf> {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().context("workspace root")?;
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .context("workspace root")?;
     let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let out = Command::new(cargo)
         .current_dir(root)
@@ -190,7 +250,7 @@ fn check_work_fs(dir: &Path) -> Result<()> {
     // SAFETY: statfs succeeded and filled `st`.
     let st = unsafe { st.assume_init() };
     ensure!(
-        i64::from(st.f_type) != TMPFS_MAGIC,
+        st.f_type != TMPFS_MAGIC,
         "{} is on tmpfs; the e2e work dir must be on a disk filesystem",
         dir.display()
     );
@@ -231,7 +291,10 @@ impl Ctx {
     /// `sudo -n fsblame watch --json <paths>`, attached and ready.
     fn watch(&self, paths: &[&Path]) -> Result<Watcher> {
         let mut cmd = Command::new("sudo");
-        cmd.arg("-n").arg(&self.bin).args(["watch", "--json", "--duration", MAX_RUN]).args(paths);
+        cmd.arg("-n")
+            .arg(&self.bin)
+            .args(["watch", "--json", "--duration", MAX_RUN])
+            .args(paths);
         Watcher::start(cmd)
     }
 }
@@ -304,13 +367,20 @@ impl Watcher {
                 Err(mpsc::RecvTimeoutError::Timeout) if Instant::now() < deadline => {
                     if watcher.child.try_wait()?.is_some() {
                         let done = watcher.join()?;
-                        bail!("fsblame exited before attaching ({}):\n{}", done.status, done.stderr);
+                        bail!(
+                            "fsblame exited before attaching ({}):\n{}",
+                            done.status,
+                            done.stderr
+                        );
                     }
                 }
                 Err(_) => {
                     watcher.kill();
                     let done = watcher.join()?;
-                    bail!("fsblame did not attach within {READY_TIMEOUT:?}:\n{}", done.stderr);
+                    bail!(
+                        "fsblame did not attach within {READY_TIMEOUT:?}:\n{}",
+                        done.stderr
+                    );
                 }
             }
         }
@@ -351,14 +421,26 @@ impl Watcher {
 
     fn kill(&mut self) {
         let group = format!("-{}", self.child.id());
-        let _ = Command::new("sudo").args(["-n", "kill", "-KILL", "--", &group]).status();
+        let _ = Command::new("sudo")
+            .args(["-n", "kill", "-KILL", "--", &group])
+            .status();
     }
 
     fn join(mut self) -> Result<Finished> {
         let status = self.child.wait()?;
-        let stdout = self.stdout.join().map_err(|_| anyhow::anyhow!("stdout reader panicked"))?;
-        let stderr = self.stderr.join().map_err(|_| anyhow::anyhow!("stderr reader panicked"))?;
-        Ok(Finished { status, stdout, stderr })
+        let stdout = self
+            .stdout
+            .join()
+            .map_err(|_| anyhow::anyhow!("stdout reader panicked"))?;
+        let stderr = self
+            .stderr
+            .join()
+            .map_err(|_| anyhow::anyhow!("stderr reader panicked"))?;
+        Ok(Finished {
+            status,
+            stdout,
+            stderr,
+        })
     }
 }
 
@@ -390,10 +472,10 @@ fn summary(touches: &[Value]) -> String {
                 t["proc"]["comm"].as_str().unwrap_or("?")
             );
             if let Some(old) = t["old_path"].as_str() {
-                line.push_str(&format!(" (from {old})"));
+                let _ = write!(line, " (from {old})");
             }
             if let Some(target) = t["target"].as_str() {
-                line.push_str(&format!(" (target {target})"));
+                let _ = write!(line, " (target {target})");
             }
             line
         })
@@ -418,12 +500,23 @@ fn write_fsync(ctx: &Ctx) -> Result<String> {
     let dir = ctx.dir("a-write")?;
     let file = dir.join("data.bin");
     let watcher = ctx.watch(&[&dir])?;
-    sh(&dir, "dd if=/dev/zero of=data.bin bs=1024 count=8 conv=fsync status=none")?;
+    sh(
+        &dir,
+        "dd if=/dev/zero of=data.bin bs=1024 count=8 conv=fsync status=none",
+    )?;
     let touches = watcher.stop()?.touches()?;
     let t = touch(&touches, "write", &file)?;
     let bytes = t["bytes"].as_u64().unwrap_or(0);
-    ensure!(bytes > 0, "write reported {bytes} bytes; {}", summary(&touches));
-    ensure!(t["proc"]["comm"] == "dd", "write attributed to {}, not dd", t["proc"]["comm"]);
+    ensure!(
+        bytes > 0,
+        "write reported {bytes} bytes; {}",
+        summary(&touches)
+    );
+    ensure!(
+        t["proc"]["comm"] == "dd",
+        "write attributed to {}, not dd",
+        t["proc"]["comm"]
+    );
     Ok(format!("{bytes} B by dd"))
 }
 
@@ -435,8 +528,16 @@ fn create_unlink(ctx: &Ctx) -> Result<String> {
     let touches = watcher.stop()?.touches()?;
     let created = touch(&touches, "create", &file)?;
     let removed = touch(&touches, "unlink", &file)?;
-    ensure!(created["proc"]["comm"] == "touch", "create attributed to {}", created["proc"]["comm"]);
-    ensure!(removed["proc"]["comm"] == "rm", "unlink attributed to {}", removed["proc"]["comm"]);
+    ensure!(
+        created["proc"]["comm"] == "touch",
+        "create attributed to {}",
+        created["proc"]["comm"]
+    );
+    ensure!(
+        removed["proc"]["comm"] == "rm",
+        "unlink attributed to {}",
+        removed["proc"]["comm"]
+    );
     Ok("create by touch, unlink by rm".to_owned())
 }
 
@@ -447,7 +548,10 @@ fn rename_link(ctx: &Ctx) -> Result<String> {
     fs::create_dir_all(&dst)?;
     fs::write(src.join("moved.txt"), "payload\n")?;
     let watcher = ctx.watch(&[&src, &dst])?;
-    sh(&base, "mv src/moved.txt dst/renamed.txt && ln dst/renamed.txt src/hardlink")?;
+    sh(
+        &base,
+        "mv src/moved.txt dst/renamed.txt && ln dst/renamed.txt src/hardlink",
+    )?;
     let touches = watcher.stop()?.touches()?;
     let renamed = touch(&touches, "rename", &dst.join("renamed.txt"))?;
     let old = text(&src.join("moved.txt"));
@@ -456,7 +560,11 @@ fn rename_link(ctx: &Ctx) -> Result<String> {
         "rename old_path is {}, expected {old}",
         renamed["old_path"]
     );
-    ensure!(renamed["proc"]["comm"] == "mv", "rename attributed to {}", renamed["proc"]["comm"]);
+    ensure!(
+        renamed["proc"]["comm"] == "mv",
+        "rename attributed to {}",
+        renamed["proc"]["comm"]
+    );
     let linked = touch(&touches, "link", &src.join("hardlink"))?;
     let target = text(&dst.join("renamed.txt"));
     ensure!(
@@ -475,9 +583,20 @@ fn chmod(ctx: &Ctx) -> Result<String> {
     sh(&dir, "chmod 600 mode.txt")?;
     let touches = watcher.stop()?.touches()?;
     let t = touch(&touches, "chmod", &file)?;
-    ensure!(t["change"]["mode"] == "0600", "chmod change is {}", t["change"]);
-    ensure!(t["proc"]["comm"] == "chmod", "chmod attributed to {}", t["proc"]["comm"]);
-    Ok(format!("{} -> {}", t["change"]["old_mode"], t["change"]["mode"]))
+    ensure!(
+        t["change"]["mode"] == "0600",
+        "chmod change is {}",
+        t["change"]
+    );
+    ensure!(
+        t["proc"]["comm"] == "chmod",
+        "chmod attributed to {}",
+        t["proc"]["comm"]
+    );
+    Ok(format!(
+        "{} -> {}",
+        t["change"]["old_mode"], t["change"]["mode"]
+    ))
 }
 
 fn subtree(ctx: &Ctx) -> Result<String> {
@@ -504,7 +623,11 @@ fn lineage(ctx: &Ctx) -> Result<String> {
     sh(&dir, r#"sh -c "sleep 0.3; echo x > f" & exit 0"#)?;
     let deadline = Instant::now() + Duration::from_secs(10);
     while fs::read_to_string(&file).map_or(true, |s| s != "x\n") {
-        ensure!(Instant::now() < deadline, "the background writer never wrote {}", file.display());
+        ensure!(
+            Instant::now() < deadline,
+            "the background writer never wrote {}",
+            file.display()
+        );
         thread::sleep(Duration::from_millis(50));
     }
     let touches = watcher.stop()?.touches()?;
@@ -512,11 +635,20 @@ fn lineage(ctx: &Ctx) -> Result<String> {
     let argv = |v: &Value| -> String {
         v["argv"]
             .as_array()
-            .map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" "))
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
             .unwrap_or_default()
     };
     ensure!(t["proc"]["comm"] == "sh", "writer is {}", t["proc"]["comm"]);
-    ensure!(argv(&t["proc"]).contains("sleep 0.3; echo x > f"), "writer argv: {}", argv(&t["proc"]));
+    ensure!(
+        argv(&t["proc"]).contains("sleep 0.3; echo x > f"),
+        "writer argv: {}",
+        argv(&t["proc"])
+    );
     let ancestry = t["ancestry"].as_array().context("no ancestry")?;
     let outer = ancestry.first().context("empty ancestry")?;
     ensure!(
@@ -525,12 +657,18 @@ fn lineage(ctx: &Ctx) -> Result<String> {
         outer["comm"],
         argv(outer)
     );
-    ensure!(outer["exited"] == true, "the outer shell is not marked exited: {outer}");
+    ensure!(
+        outer["exited"] == true,
+        "the outer shell is not marked exited: {outer}"
+    );
     let me = u64::from(std::process::id());
     ensure!(
         ancestry.iter().any(|p| p["pid"] == me),
         "ancestry does not reach the xtask (pid {me}): {:?}",
-        ancestry.iter().map(|p| p["comm"].clone()).collect::<Vec<_>>()
+        ancestry
+            .iter()
+            .map(|p| p["comm"].clone())
+            .collect::<Vec<_>>()
     );
     let chain: Vec<&str> = std::iter::once(&t["proc"])
         .chain(ancestry.iter().take(3))
@@ -556,10 +694,15 @@ fn origin(ctx: &Ctx) -> Result<String> {
     let t = touch(&touches, "write", &file)?;
     let origin = &t["origin"];
     ensure!(
-        origin["kind"] == "npm-lifecycle" && origin["package"] == "demo" && origin["phase"] == "postinstall",
+        origin["kind"] == "npm-lifecycle"
+            && origin["package"] == "demo"
+            && origin["phase"] == "postinstall",
         "origin is {origin}"
     );
-    Ok(format!("{} {}@{} {}", origin["kind"], origin["package"], origin["version"], origin["phase"]))
+    Ok(format!(
+        "{} {}@{} {}",
+        origin["kind"], origin["package"], origin["version"], origin["phase"]
+    ))
 }
 
 fn unprivileged(ctx: &Ctx) -> Result<String> {
@@ -571,7 +714,11 @@ fn unprivileged(ctx: &Ctx) -> Result<String> {
         .output()
         .context("running fsblame unprivileged")?;
     let stderr = String::from_utf8_lossy(&out.stderr);
-    ensure!(out.status.code() == Some(4), "exit status {}, expected 4:\n{stderr}", out.status);
+    ensure!(
+        out.status.code() == Some(4),
+        "exit status {}, expected 4:\n{stderr}",
+        out.status
+    );
     ensure!(
         stderr.contains("setcap cap_bpf,cap_perfmon+ep"),
         "no setcap hint on stderr:\n{stderr}"
@@ -584,7 +731,12 @@ struct Uncap<'a>(&'a Path);
 
 impl Drop for Uncap<'_> {
     fn drop(&mut self) {
-        let _ = Command::new("sudo").arg("-n").arg("setcap").arg("-r").arg(self.0).status();
+        let _ = Command::new("sudo")
+            .arg("-n")
+            .arg("setcap")
+            .arg("-r")
+            .arg(self.0)
+            .status();
     }
 }
 
@@ -605,12 +757,16 @@ fn setcap(ctx: &Ctx) -> Result<String> {
 
     let file = dir.join("as-user.txt");
     let mut cmd = Command::new(&copy);
-    cmd.args(["watch", "--json", "--duration", MAX_RUN]).arg(&dir);
+    cmd.args(["watch", "--json", "--duration", MAX_RUN])
+        .arg(&dir);
     let watcher = Watcher::start(cmd)?;
     sh(&dir, "echo capable > as-user.txt")?;
     let touches = watcher.stop()?.touches()?;
     touch(&touches, "write", &file)?;
-    Ok(format!("{} with cap_bpf,cap_perfmon+ep, no sudo", copy.display()))
+    Ok(format!(
+        "{} with cap_bpf,cap_perfmon+ep, no sudo",
+        copy.display()
+    ))
 }
 
 fn doctor_ops(ctx: &Ctx) -> Result<String> {
@@ -630,22 +786,42 @@ fn doctor_ops(ctx: &Ctx) -> Result<String> {
         String::from_utf8_lossy(&out.stderr)
     );
     let report: Value = serde_json::from_slice(&out.stdout).context("doctor --json output")?;
-    let ops = report["ops"].as_array().context("no ops in doctor --json")?;
-    ensure!(ops.len() == 14, "doctor lists {} ops, expected 14", ops.len());
+    let ops = report["ops"]
+        .as_array()
+        .context("no ops in doctor --json")?;
+    ensure!(
+        ops.len() == 14,
+        "doctor lists {} ops, expected 14",
+        ops.len()
+    );
     let disabled: Vec<String> = ops
         .iter()
         .filter(|op| op["status"] != "available")
         .map(|op| format!("{} ({}: {})", op["name"], op["reason"], op["detail"]))
         .collect();
-    ensure!(disabled.is_empty(), "ops not available: {}", disabled.join(", "));
+    ensure!(
+        disabled.is_empty(),
+        "ops not available: {}",
+        disabled.join(", ")
+    );
     let check = report["checks"]
         .as_array()
         .and_then(|checks| checks.iter().find(|c| c["id"] == "probe.ops"))
         .context("no probe.ops check")?;
-    ensure!(check["status"] == "pass", "probe.ops is {}: {}", check["status"], check["observed"]);
+    ensure!(
+        check["status"] == "pass",
+        "probe.ops is {}: {}",
+        check["status"],
+        check["observed"]
+    );
     let insns = |name: &str| -> Result<u64> {
-        let op = ops.iter().find(|op| op["name"] == name).context("op missing")?;
-        let n = op["insns"].as_u64().with_context(|| format!("no insns for {name}"))?;
+        let op = ops
+            .iter()
+            .find(|op| op["name"] == name)
+            .context("op missing")?;
+        let n = op["insns"]
+            .as_u64()
+            .with_context(|| format!("no insns for {name}"))?;
         ensure!(n < VERIFIER_LIMIT, "{name} at {n} insns");
         Ok(n)
     };
@@ -659,15 +835,26 @@ fn doctor_ops(ctx: &Ctx) -> Result<String> {
 fn duration(ctx: &Ctx) -> Result<String> {
     let dir = ctx.dir("k-duration")?;
     let mut cmd = Command::new("sudo");
-    cmd.arg("-n").arg(&ctx.bin).args(["watch", "--duration", "2s"]).arg(&dir);
+    cmd.arg("-n")
+        .arg(&ctx.bin)
+        .args(["watch", "--duration", "2s"])
+        .arg(&dir);
     let watcher = Watcher::start(cmd)?;
     let ready_at = watcher.ready_at;
     let done = watcher.wait(Duration::from_secs(10))?;
     let elapsed = ready_at.elapsed();
-    ensure!(done.status.success(), "exit {}:\n{}", done.status, done.stderr);
+    ensure!(
+        done.status.success(),
+        "exit {}:\n{}",
+        done.status,
+        done.stderr
+    );
     ensure!(
         elapsed >= Duration::from_millis(1500) && elapsed <= Duration::from_secs(4),
         "stopped {elapsed:?} after attaching, expected about 2s"
     );
-    Ok(format!("exited {:.2}s after attaching", elapsed.as_secs_f64()))
+    Ok(format!(
+        "exited {:.2}s after attaching",
+        elapsed.as_secs_f64()
+    ))
 }

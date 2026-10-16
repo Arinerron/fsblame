@@ -51,7 +51,12 @@ pub struct WatchArgs {
     pub paths: Vec<PathBuf>,
     /// Report only these operations: write, create, mkdir, mknod, symlink, link, unlink,
     /// rmdir, rename, chmod, chown, truncate, utimes, setattr.
-    #[arg(long, value_delimiter = ',', value_name = "LIST", hide_possible_values = true)]
+    #[arg(
+        long,
+        value_delimiter = ',',
+        value_name = "LIST",
+        hide_possible_values = true
+    )]
     pub op: Vec<Op>,
     /// Ignore changes below this path (repeatable).
     #[arg(long, value_name = "PATH")]
@@ -83,7 +88,9 @@ pub struct DoctorArgs {
 
 /// `250ms`, `30s`, `5m`, `1h`; a bare number is seconds.
 fn parse_duration(text: &str) -> Result<Duration, String> {
-    let split = text.find(|c: char| !c.is_ascii_digit() && c != '.').unwrap_or(text.len());
+    let split = text
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(text.len());
     let (number, unit) = text.split_at(split);
     let value: f64 = number
         .parse()
@@ -93,7 +100,11 @@ fn parse_duration(text: &str) -> Result<Duration, String> {
         "" | "s" => 1.0,
         "m" => 60.0,
         "h" => 3600.0,
-        _ => return Err(format!("unknown unit {unit:?} in {text:?}; use ms, s, m or h")),
+        _ => {
+            return Err(format!(
+                "unknown unit {unit:?} in {text:?}; use ms, s, m or h"
+            ));
+        }
     };
     Duration::try_from_secs_f64(value * scale).map_err(|e| format!("{text:?}: {e}"))
 }
@@ -120,7 +131,8 @@ mod tests {
         assert!(cli.command.is_none());
         assert_eq!(cli.watch.paths, [PathBuf::from("a"), PathBuf::from("b")]);
 
-        let cli = Cli::try_parse_from(["fsblame", "watch", "a", "--op", "write,rename", "--json"]).unwrap();
+        let cli = Cli::try_parse_from(["fsblame", "watch", "a", "--op", "write,rename", "--json"])
+            .unwrap();
         let Some(Command::Watch(args)) = cli.command else {
             panic!("not watch");
         };

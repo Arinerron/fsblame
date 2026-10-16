@@ -13,7 +13,10 @@ use aya::{
     Btf, Ebpf, EbpfLoader,
     programs::{BtfTracePoint, FEntry},
 };
-use bpfdoctor::{Cap, Check, Diagnostic, Doctor, Env, Fix, RealEnv, Report, Status, Tool, errno_name, ids_for_errno};
+use bpfdoctor::{
+    Cap, Check, Diagnostic, Doctor, Env, Fix, RealEnv, Report, Status, Tool, errno_name,
+    ids_for_errno,
+};
 use fsblame_abi::{self as abi, DevFilter};
 use serde::Serialize;
 
@@ -44,7 +47,9 @@ pub fn tool() -> Tool {
 
 fn privileged(env: &dyn Env, tool: &Tool) -> bool {
     let effective = env.caps().effective;
-    tool.required_caps.iter().all(|cap| cap.granted_by(effective))
+    tool.required_caps
+        .iter()
+        .all(|cap| cap.granted_by(effective))
 }
 
 const SKIPPED: &str = "skipped: required capabilities not effective";
@@ -57,10 +62,11 @@ fn brief(e: &(dyn std::error::Error + 'static)) -> String {
     );
     let mut next = Some(e);
     while let Some(err) = next {
-        if let Some(aya::programs::ProgramError::LoadError { verifier_log, .. }) = err.downcast_ref() {
-            if let Some(verdict) = tracer::verdict(&format!("{verifier_log:?}")) {
-                return format!("{label}, verifier: {verdict}");
-            }
+        if let Some(aya::programs::ProgramError::LoadError { verifier_log, .. }) =
+            err.downcast_ref()
+            && let Some(verdict) = tracer::verdict(&format!("{verifier_log:?}"))
+        {
+            return format!("{label}, verifier: {verdict}");
         }
         next = err.source();
     }
@@ -101,7 +107,13 @@ impl Check for FentryProbe {
     fn run(&self, env: &dyn Env, tool: &Tool) -> Diagnostic {
         const CANONICAL: &str = "security_inode_unlink";
         let diag = |status, observed: String| {
-            Diagnostic::new(self.id(), "fentry on VFS security hooks", true, status, observed)
+            Diagnostic::new(
+                self.id(),
+                "fentry on VFS security hooks",
+                true,
+                status,
+                observed,
+            )
         };
         let explain = "fsblame attaches BPF trampolines (fentry) to the security_* hooks that every \
                        modifying VFS operation calls; that needs the function in kernel BTF, \
@@ -135,7 +147,10 @@ impl Check for FentryProbe {
         if failed.is_empty() {
             return diag(
                 Status::Pass,
-                format!("fentry attached to {CANONICAL} and all {} tracer hooks", FS_HOOKS.len()),
+                format!(
+                    "fentry attached to {CANONICAL} and all {} tracer hooks",
+                    FS_HOOKS.len()
+                ),
             );
         }
         diag(
@@ -162,14 +177,22 @@ impl Check for SchedProbe {
 
     fn run(&self, env: &dyn Env, tool: &Tool) -> Diagnostic {
         let diag = |status, observed: String| {
-            Diagnostic::new(self.id(), "sched tracepoints (tp_btf)", true, status, observed)
+            Diagnostic::new(
+                self.id(),
+                "sched tracepoints (tp_btf)",
+                true,
+                status,
+                observed,
+            )
         };
         if !privileged(env, tool) {
             return diag(Status::Skip, SKIPPED.to_owned());
         }
         let (btf, mut ebpf) = match load_probes() {
             Ok(loaded) => loaded,
-            Err(why) => return diag(Status::Fail, why).with_impact("fsblame cannot load its BPF programs"),
+            Err(why) => {
+                return diag(Status::Fail, why).with_impact("fsblame cannot load its BPF programs");
+            }
         };
         let mut failed = Vec::new();
         for (_, tracepoint) in SCHED_HOOKS {
@@ -191,19 +214,23 @@ impl Check for SchedProbe {
         if failed.is_empty() {
             return diag(
                 Status::Pass,
-                "tp_btf attached to sched_process_fork, sched_process_exec and sched_process_exit".to_owned(),
+                "tp_btf attached to sched_process_fork, sched_process_exec and sched_process_exit"
+                    .to_owned(),
             );
         }
-        diag(Status::Fail, format!("tp_btf failed: {}", failed.join("; ")))
-            .with_impact("no process lineage: fsblame cannot tell which command made a change")
-            .with_fix(Fix::new(
-                "ls -l /sys/kernel/btf/vmlinux && zgrep CONFIG_DEBUG_INFO_BTF= /proc/config.gz",
-                "tp_btf needs kernel BTF (CONFIG_DEBUG_INFO_BTF=y, 5.5+)",
-            ))
-            .with_explain(
-                "fork, exec and exit events let fsblame keep the argv, cwd and environment of \
+        diag(
+            Status::Fail,
+            format!("tp_btf failed: {}", failed.join("; ")),
+        )
+        .with_impact("no process lineage: fsblame cannot tell which command made a change")
+        .with_fix(Fix::new(
+            "ls -l /sys/kernel/btf/vmlinux && zgrep CONFIG_DEBUG_INFO_BTF= /proc/config.gz",
+            "tp_btf needs kernel BTF (CONFIG_DEBUG_INFO_BTF=y, 5.5+)",
+        ))
+        .with_explain(
+            "fork, exec and exit events let fsblame keep the argv, cwd and environment of \
                  processes that exit before their file changes are reported",
-            )
+        )
     }
 }
 
@@ -290,7 +317,13 @@ impl Check for OpsProbe {
 
     fn run(&self, env: &dyn Env, tool: &Tool) -> Diagnostic {
         let diag = |status, observed: String| {
-            Diagnostic::new(self.id(), "Operations the tracer can report", false, status, observed)
+            Diagnostic::new(
+                self.id(),
+                "Operations the tracer can report",
+                false,
+                status,
+                observed,
+            )
         };
         if !privileged(env, tool) {
             let _ = self.ops.set(unprobed());
@@ -309,8 +342,11 @@ impl Check for OpsProbe {
             Ok(outcomes) => outcomes,
             Err(error) => {
                 let _ = self.ops.set(unprobed());
-                return diag(Status::Fail, format!("the tracer object did not load: {error}"))
-                    .with_impact("fsblame cannot run its file programs");
+                return diag(
+                    Status::Fail,
+                    format!("the tracer object did not load: {error}"),
+                )
+                .with_impact("fsblame cannot run its file programs");
             }
         };
         let ops = op_statuses(&outcomes);
@@ -331,7 +367,11 @@ fn ops_diagnostic(
         .iter()
         .filter_map(|o| o.result.as_ref().err().map(|e| (o, e)))
         .collect();
-    let disabled: Vec<&str> = ops.iter().filter(|o| o.status != "available").map(|o| o.name).collect();
+    let disabled: Vec<&str> = ops
+        .iter()
+        .filter(|o| o.status != "available")
+        .map(|o| o.name)
+        .collect();
     if failed.is_empty() {
         let largest = outcomes
             .iter()
@@ -349,13 +389,20 @@ fn ops_diagnostic(
     }
 
     let observed: Vec<String> = failed.iter().map(|(o, e)| e.describe(&o.hook)).collect();
-    let status = if disabled.len() == ops.len() { Status::Fail } else { Status::Warn };
+    let status = if disabled.len() == ops.len() {
+        Status::Fail
+    } else {
+        Status::Warn
+    };
     let mut impact = if disabled.is_empty() {
         String::from("all operations are still reported")
     } else {
         format!("{} operations will not be reported", disabled.join(", "))
     };
-    if failed.iter().any(|(o, _)| o.hook.program == "on_rw_verify_area") {
+    if failed
+        .iter()
+        .any(|(o, _)| o.hook.program == "on_rw_verify_area")
+    {
         impact.push_str("; writes are reported without byte counts");
     }
     if failed.iter().any(|(o, _)| o.hook.always) {
@@ -369,7 +416,11 @@ fn ops_diagnostic(
     let has = |want: fn(Cause) -> bool| causes.iter().any(|&c| want(c));
     let mut explain = Vec::new();
     if has(|c| matches!(c, Cause::TooComplex { .. })) {
-        let available: Vec<&str> = ops.iter().filter(|o| o.status == "available").map(|o| o.name).collect();
+        let available: Vec<&str> = ops
+            .iter()
+            .filter(|o| o.status == "available")
+            .map(|o| o.name)
+            .collect();
         let rename = failed
             .iter()
             .any(|(o, e)| o.hook.always && matches!(e.cause(), Cause::TooComplex { .. }));
@@ -440,8 +491,12 @@ enum Concern {
 fn fs_concern(fstype: &str) -> Option<Concern> {
     match fstype {
         "overlay" => Some(Concern::Overlay),
-        "nfs" | "nfs4" | "cifs" | "smb3" | "9p" | "ceph" | "glusterfs" | "afs" => Some(Concern::Network),
-        t if t == "fuse" || t == "fuseblk" || t == "virtiofs" || t.starts_with("fuse.") => Some(Concern::Fuse),
+        "nfs" | "nfs4" | "cifs" | "smb3" | "9p" | "ceph" | "glusterfs" | "afs" => {
+            Some(Concern::Network)
+        }
+        t if t == "fuse" || t == "fuseblk" || t == "virtiofs" || t.starts_with("fuse.") => {
+            Some(Concern::Fuse)
+        }
         _ => None,
     }
 }
@@ -457,7 +512,12 @@ impl Check for WatchFs {
         };
         let mounts = match roots::mounts() {
             Ok(mounts) => mounts,
-            Err(e) => return diag(Status::Skip, format!("cannot read /proc/self/mountinfo: {e}")),
+            Err(e) => {
+                return diag(
+                    Status::Skip,
+                    format!("cannot read /proc/self/mountinfo: {e}"),
+                );
+            }
         };
         let mut fine = Vec::new();
         let mut warned = None;
@@ -468,7 +528,12 @@ impl Check for WatchFs {
             });
             let (canonical, mount) = match located {
                 Ok(found) => found,
-                Err(e) => return diag(Status::Warn, format!("cannot inspect {}: {e}", path.display())),
+                Err(e) => {
+                    return diag(
+                        Status::Warn,
+                        format!("cannot inspect {}: {e}", path.display()),
+                    );
+                }
             };
             match fs_concern(&mount.fstype) {
                 None => fine.push(format!("{} on {}", canonical.display(), mount.fstype)),
@@ -540,9 +605,17 @@ pub fn failure(report: &Report, message: &str) -> Failure {
         .checks
         .iter()
         .filter(|c| c.status == Status::Fail && c.required)
-        .all(|c| ["kernel.", "platform.", "probe."].iter().any(|p| c.id.starts_with(p)));
+        .all(|c| {
+            ["kernel.", "platform.", "probe."]
+                .iter()
+                .any(|p| c.id.starts_with(p))
+        });
     let error = anyhow!("{message}");
-    if unsupported { Failure::Unsupported(error) } else { Failure::Privileges(error) }
+    if unsupported {
+        Failure::Unsupported(error)
+    } else {
+        Failure::Privileges(error)
+    }
 }
 
 fn color(stream: &impl IsTerminal) -> bool {
@@ -554,7 +627,12 @@ pub fn explain_load_failure(error: &LoadError, paths: &[PathBuf]) -> io::Result<
     let tool = tool();
     let mut ids: Vec<&str> = error.errno.map_or(&[][..], ids_for_errno).to_vec();
     if error.class() == Class::Unsupported {
-        ids.extend(["kernel.version", "kernel.btf", "probe.fentry_security", "probe.sched_tp"]);
+        ids.extend([
+            "kernel.version",
+            "kernel.btf",
+            "probe.fentry_security",
+            "probe.sched_tp",
+        ]);
     }
     let report = full(paths.to_vec(), Rc::default()).run_ids(&RealEnv, &tool, &ids);
     report.render_human(&mut io::stderr(), color(&io::stderr()))
@@ -608,7 +686,10 @@ pub fn run(args: &DoctorArgs) -> Result<(), Failure> {
     };
     rendered.map_err(|e| Failure::Runtime(e.into()))?;
     if report.has_fail() {
-        return Err(failure(&report, "fsblame cannot run here; see the FAIL lines above"));
+        return Err(failure(
+            &report,
+            "fsblame cannot run here; see the FAIL lines above",
+        ));
     }
     Ok(())
 }

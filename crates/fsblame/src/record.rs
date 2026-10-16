@@ -40,8 +40,14 @@ impl<'a> Exec<'a> {
         }
         let half = usize::try_from(abi::ENV_CAP / 2).expect("small");
         let (head, tail) = self.env.split_at(half.min(self.env.len()));
-        let head = head.iter().rposition(|&b| b == 0).map_or(&[][..], |end| &head[..=end]);
-        let tail = tail.iter().position(|&b| b == 0).map_or(&[][..], |start| &tail[start + 1..]);
+        let head = head
+            .iter()
+            .rposition(|&b| b == 0)
+            .map_or(&[][..], |end| &head[..=end]);
+        let tail = tail
+            .iter()
+            .position(|&b| b == 0)
+            .map_or(&[][..], |start| &tail[start + 1..]);
         Cow::Owned([head, tail].concat())
     }
 }
@@ -187,7 +193,10 @@ mod tests {
             panic!("not an exec");
         };
         let entries = exec.env_entries();
-        let kept: Vec<&[u8]> = entries.split(|&b| b == 0).filter(|e| e.contains(&b'=')).collect();
+        let kept: Vec<&[u8]> = entries
+            .split(|&b| b == 0)
+            .filter(|e| e.contains(&b'='))
+            .collect();
         assert_eq!(kept, [&b"A=1"[..], b"npm_lifecycle_event=postinstall"]);
     }
 
@@ -202,6 +211,9 @@ mod tests {
                 len: bytes.len()
             }
         );
-        assert_eq!(decode(&[1, 0]).unwrap_err(), Malformed { kind: None, len: 2 });
+        assert_eq!(
+            decode(&[1, 0]).unwrap_err(),
+            Malformed { kind: None, len: 2 }
+        );
     }
 }

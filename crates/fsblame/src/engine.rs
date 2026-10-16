@@ -6,8 +6,8 @@ use std::{collections::HashMap, io, path::PathBuf, sync::Arc};
 use aya::maps::{HashMap as BpfHashMap, MapData};
 use fsblame_abi::{self as abi, WriteKey, WriteVal};
 use procctx::{
-    Config, Context, ExecEvent, ExitEvent, ForkEvent, Origin, ProcFs, ProcInfo, ProcKey,
-    ProcTable, StartClock, Stop, classify_origin,
+    Config, Context, ExecEvent, ExitEvent, ForkEvent, Origin, ProcFs, ProcInfo, ProcKey, ProcTable,
+    StartClock, Stop, classify_origin,
 };
 
 use crate::{
@@ -224,7 +224,11 @@ pub struct Engine<S> {
 }
 
 fn write_key((tgid, file): (u32, u64)) -> WriteKey {
-    WriteKey { tgid, _pad: 0, file }
+    WriteKey {
+        tgid,
+        _pad: 0,
+        file,
+    }
 }
 
 fn flag(flags: u32, bit: u32) -> bool {
@@ -310,7 +314,10 @@ impl<S: Sink> Engine<S> {
         // The fork event named the parent that started this process. The exec record's
         // `real_parent` is the parent at exec time, which is the reaper when the parent exited
         // in between (`sh -c 'cmd & exit'`); it only fills in a process forked before the start.
-        let forked_here = self.procs.get_key(key).is_some_and(|info| info.ppid.is_some());
+        let forked_here = self
+            .procs
+            .get_key(key)
+            .is_some_and(|info| info.ppid.is_some());
         self.procs.on_exec(ExecEvent {
             ts_ns: r.hdr.ts_ns,
             key,
@@ -334,8 +341,15 @@ impl<S: Sink> Engine<S> {
             self.counts.malformed += 1;
             return Ok(());
         };
-        let path1 = self.roots.path(r.root, r.dev, fs.path, flag(r.hdr.flags, abi::F_PATH_TRUNC));
-        let path2 = self.roots.path(r.root2, r.dev, fs.path2, flag(r.hdr.flags, abi::F_PATH2_TRUNC));
+        let path1 = self
+            .roots
+            .path(r.root, r.dev, fs.path, flag(r.hdr.flags, abi::F_PATH_TRUNC));
+        let path2 = self.roots.path(
+            r.root2,
+            r.dev,
+            fs.path2,
+            flag(r.hdr.flags, abi::F_PATH2_TRUNC),
+        );
         let Some(path) = path1 else {
             self.counts.malformed += 1;
             return Ok(());
@@ -396,13 +410,20 @@ impl<S: Sink> Engine<S> {
         // Report pending writes to the inodes involved first, keeping causal order.
         self.flush_file(file, totals)?;
         if op == Op::Rename && r.aux2 != 0 {
-            self.flush_file(FileId { dev: r.dev, ino: r.aux2 }, totals)?;
+            self.flush_file(
+                FileId {
+                    dev: r.dev,
+                    ino: r.aux2,
+                },
+                totals,
+            )?;
         }
         let change = match op {
             Op::Chmod => Change::Mode(u32::try_from(r.aux2).unwrap_or(0)),
             Op::Chown => Change::Owner {
                 uid: (r.aux & ATTR_UID != 0).then(|| u32::try_from(r.aux2 >> 32).unwrap_or(0)),
-                gid: (r.aux & ATTR_GID != 0).then(|| u32::try_from(r.aux2 & 0xffff_ffff).unwrap_or(0)),
+                gid: (r.aux & ATTR_GID != 0)
+                    .then(|| u32::try_from(r.aux2 & 0xffff_ffff).unwrap_or(0)),
             },
             Op::Truncate => Change::Size(r.aux2),
             Op::Rename => Change::Rename {
@@ -462,7 +483,12 @@ impl<S: Sink> Engine<S> {
 
     /// A process exited: report and forget its bindings.
     fn finish_process(&mut self, tgid: u32, totals: &mut impl Totals) -> io::Result<()> {
-        let keys: Vec<(u32, u64)> = self.bindings.keys().filter(|k| k.0 == tgid).copied().collect();
+        let keys: Vec<(u32, u64)> = self
+            .bindings
+            .keys()
+            .filter(|k| k.0 == tgid)
+            .copied()
+            .collect();
         let now = clock::boot_now_ns();
         for key in keys {
             self.refresh(key, now, totals, true)?;
@@ -492,7 +518,13 @@ impl<S: Sink> Engine<S> {
 
     /// Updates a binding from the kernel and reports its window when finished, quiet, held
     /// long enough, or `force`d.
-    fn refresh(&mut self, key: (u32, u64), now: u64, totals: &mut impl Totals, force: bool) -> io::Result<()> {
+    fn refresh(
+        &mut self,
+        key: (u32, u64),
+        now: u64,
+        totals: &mut impl Totals,
+        force: bool,
+    ) -> io::Result<()> {
         let Some(mut binding) = self.bindings.remove(&key) else {
             return Ok(());
         };
@@ -552,9 +584,15 @@ impl<S: Sink> Engine<S> {
         let chain = ancestry.chain;
         let context = Context {
             cgroup: chain.iter().find_map(|info| info.cgroup.clone()),
-            unit: chain.iter().find_map(|info| info.cgroup.as_ref()?.unit.clone()),
-            container: chain.iter().find_map(|info| info.cgroup.as_ref()?.container.clone()),
-            tmux: chain.iter().find_map(|info| info.env.as_ref()?.tmux.clone()),
+            unit: chain
+                .iter()
+                .find_map(|info| info.cgroup.as_ref()?.unit.clone()),
+            container: chain
+                .iter()
+                .find_map(|info| info.cgroup.as_ref()?.container.clone()),
+            tmux: chain
+                .iter()
+                .find_map(|info| info.env.as_ref()?.tmux.clone()),
         };
         Lineage {
             origin: classify_origin(&chain),

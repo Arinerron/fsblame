@@ -50,7 +50,9 @@ fn unescape(field: &str) -> PathBuf {
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        let octal = bytes.get(i + 1..i + 4).filter(|d| d.iter().all(|b| (b'0'..=b'7').contains(b)));
+        let octal = bytes
+            .get(i + 1..i + 4)
+            .filter(|d| d.iter().all(|b| (b'0'..=b'7').contains(b)));
         match (bytes[i], octal) {
             (b'\\', Some(d)) => {
                 out.push((d[0] - b'0') << 6 | (d[1] - b'0') << 3 | (d[2] - b'0'));
@@ -94,7 +96,9 @@ pub fn parse_mountinfo(text: &str) -> Vec<Mount> {
 
 /// The mounts of this process's mount namespace.
 pub fn mounts() -> io::Result<Vec<Mount>> {
-    Ok(parse_mountinfo(&fs::read_to_string("/proc/self/mountinfo")?))
+    Ok(parse_mountinfo(&fs::read_to_string(
+        "/proc/self/mountinfo",
+    )?))
 }
 
 /// Opens `path` without following permissions (`O_PATH`), for identity queries only.
@@ -152,12 +156,15 @@ pub struct Roots {
 
 impl Roots {
     /// Resolves the watch and exclude paths, adding every mount below a watch root (the
-    /// kernel's d_parent walk does not cross mounts). Fails on paths that do not exist.
+    /// kernel's `d_parent` walk does not cross mounts). Fails on paths that do not exist.
     pub fn resolve(watch: &[PathBuf], exclude: &[PathBuf]) -> anyhow::Result<Self> {
         let mounts = mounts().context("reading /proc/self/mountinfo")?;
         let mut roots: Vec<Root> = Vec::new();
         let mut seen = HashSet::new();
-        let given = watch.iter().map(|p| (p, false)).chain(exclude.iter().map(|p| (p, true)));
+        let given = watch
+            .iter()
+            .map(|p| (p, false))
+            .chain(exclude.iter().map(|p| (p, true)));
         for (path, exclude) in given {
             let canonical = fs::canonicalize(path)
                 .with_context(|| format!("cannot watch {}", path.display()))?;
@@ -180,7 +187,7 @@ impl Roots {
                 .iter()
                 .filter(|r| mount.point.starts_with(&r.path) && mount.point != r.path)
                 .max_by_key(|r| r.path.as_os_str().len());
-            if !enclosing.is_some_and(|r| !r.exclude) {
+            if enclosing.is_none_or(|r| r.exclude) {
                 continue;
             }
             // A mount hidden by another one on the same point is unreachable; skip it.
@@ -217,7 +224,12 @@ impl Roots {
 
     /// The `.rodata` device prefilter: every superblock holding a watch root.
     pub fn dev_filter(&self) -> DevFilter {
-        let mut devs: Vec<u32> = self.roots.iter().filter(|r| !r.exclude).map(|r| r.dev).collect();
+        let mut devs: Vec<u32> = self
+            .roots
+            .iter()
+            .filter(|r| !r.exclude)
+            .map(|r| r.dev)
+            .collect();
         devs.sort_unstable();
         devs.dedup();
         let mut filter = DevFilter {
@@ -254,7 +266,11 @@ impl Roots {
             abi::ROOT_FSROOT => Some(self.fs_path(dev, &rel)),
             id => {
                 let root = self.roots.get(usize::try_from(id).ok()?)?;
-                Some(if rel.as_os_str().is_empty() { root.path.clone() } else { root.path.join(rel) })
+                Some(if rel.as_os_str().is_empty() {
+                    root.path.clone()
+                } else {
+                    root.path.join(rel)
+                })
             }
         }
     }
@@ -269,7 +285,10 @@ impl Roots {
             .filter_map(|m| Some((m, rel.strip_prefix(&m.root).ok()?)))
             .min_by_key(|(m, _)| m.point.as_os_str().len())
             .map_or_else(
-                || Path::new(&format!("<dev {}>", dev_string(dev))).join(rel.strip_prefix("/").unwrap_or(&rel)),
+                || {
+                    Path::new(&format!("<dev {}>", dev_string(dev)))
+                        .join(rel.strip_prefix("/").unwrap_or(&rel))
+                },
                 |(m, below)| m.point.join(below),
             )
     }
@@ -320,7 +339,10 @@ mod tests {
             roots.path(0, 0, names, false),
             Some(PathBuf::from("/home/u/proj/a/b/c/deep.txt"))
         );
-        assert_eq!(roots.path(0, 0, b"", false), Some(PathBuf::from("/home/u/proj")));
+        assert_eq!(
+            roots.path(0, 0, b"", false),
+            Some(PathBuf::from("/home/u/proj"))
+        );
         assert_eq!(
             roots.path(0, 0, b"f\0d\0", true),
             Some(PathBuf::from("/home/u/proj/…/d/f"))

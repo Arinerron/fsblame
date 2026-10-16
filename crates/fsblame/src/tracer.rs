@@ -71,7 +71,7 @@ pub fn grouped(n: u64) -> String {
     let digits = n.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
     for (i, c) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i) % 3 == 0 {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(c);
@@ -83,14 +83,20 @@ pub fn grouped(n: u64) -> String {
 fn logged_number(log: &str, marker: &str) -> Option<u64> {
     log.lines().rev().find_map(|line| {
         let rest = &line[line.find(marker)? + marker.len()..];
-        let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+        let end = rest
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(rest.len());
         rest[..end].parse().ok()
     })
 }
 
 /// The verifier's verdict: the line before its statistics, else the last line.
 pub fn verdict(log: &str) -> Option<&str> {
-    let lines: Vec<&str> = log.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    let lines: Vec<&str> = log
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
     lines
         .iter()
         .position(|l| l.starts_with("verification time") || l.starts_with("processed "))
@@ -120,16 +126,21 @@ impl LoadError {
         let mut missing_symbol = false;
         let mut next: Option<&(dyn std::error::Error + 'static)> = Some(&e);
         while let Some(err) = next {
-            if let Some(ProgramError::LoadError { verifier_log: log, .. }) = err.downcast_ref() {
+            if let Some(ProgramError::LoadError {
+                verifier_log: log, ..
+            }) = err.downcast_ref()
+            {
                 let log = format!("{log:?}");
                 verifier_log = (!log.trim().is_empty()).then_some(log);
             }
             // `ProgramError::Btf` is transparent: the chain never yields its `BtfError` itself.
-            missing_symbol |= matches!(err.downcast_ref(), Some(BtfError::UnknownBtfTypeName { .. }))
-                || matches!(
-                    err.downcast_ref(),
-                    Some(ProgramError::Btf(BtfError::UnknownBtfTypeName { .. }))
-                );
+            missing_symbol |= matches!(
+                err.downcast_ref(),
+                Some(BtfError::UnknownBtfTypeName { .. })
+            ) || matches!(
+                err.downcast_ref(),
+                Some(ProgramError::Btf(BtfError::UnknownBtfTypeName { .. }))
+            );
             next = err.source();
         }
         Self {
@@ -158,9 +169,14 @@ impl LoadError {
         }
         match self.errno {
             Some(libc::EPERM | libc::EACCES) => Cause::Denied,
-            Some(libc::ENOENT | libc::EINVAL | libc::E2BIG | libc::ENOSYS | libc::EOPNOTSUPP | ENOTSUPP) => {
-                Cause::Missing
-            }
+            Some(
+                libc::ENOENT
+                | libc::EINVAL
+                | libc::E2BIG
+                | libc::ENOSYS
+                | libc::EOPNOTSUPP
+                | ENOTSUPP,
+            ) => Cause::Missing,
             _ => Cause::Other,
         }
     }
@@ -186,7 +202,10 @@ impl LoadError {
                         hook.program,
                         grouped(n)
                     ),
-                    None => format!("{} exceeded the BPF verifier complexity limit ({limit} insns)", hook.program),
+                    None => format!(
+                        "{} exceeded the BPF verifier complexity limit ({limit} insns)",
+                        hook.program
+                    ),
                 }
             }
             Cause::Missing => format!(
@@ -196,12 +215,17 @@ impl LoadError {
             Cause::Denied => format!(
                 "loading {} was refused ({}): privileges or kernel lockdown",
                 hook.program,
-                self.errno.and_then(bpfdoctor::errno_name).unwrap_or("EPERM")
+                self.errno
+                    .and_then(bpfdoctor::errno_name)
+                    .unwrap_or("EPERM")
             ),
             Cause::Rejected => format!(
                 "the verifier rejected {}: {}",
                 hook.program,
-                self.verifier_log.as_deref().and_then(verdict).unwrap_or("no verdict logged")
+                self.verifier_log
+                    .as_deref()
+                    .and_then(verdict)
+                    .unwrap_or("no verdict logged")
             ),
             Cause::Other => format!("{}: {:#}", self.what, self.source),
         }
@@ -311,7 +335,10 @@ fn attach_fentry(ebpf: &mut Ebpf, btf: &Btf, hook: &Hook) -> Result<Option<u32>,
         .map_err(|e| LoadError::new(what("typing"), e))?;
     prog.load(hook.function, btf)
         .map_err(|e| LoadError::new(what("loading"), e))?;
-    let insns = prog.info().ok().and_then(|info| info.verified_instruction_count());
+    let insns = prog
+        .info()
+        .ok()
+        .and_then(|info| info.verified_instruction_count());
     prog.attach()
         .map_err(|e| LoadError::new(what("attaching"), e))?;
     log::debug!(
@@ -348,7 +375,10 @@ impl Tracer {
 
         {
             let map = ebpf.map_mut("roots").ok_or_else(|| {
-                LoadError::new("finding map roots", std::io::Error::other("not in the BPF object"))
+                LoadError::new(
+                    "finding map roots",
+                    std::io::Error::other("not in the BPF object"),
+                )
             })?;
             let mut map: HashMap<_, RootKey, RootVal> =
                 HashMap::try_from(map).map_err(|e| LoadError::new("opening map roots", e))?;
@@ -359,8 +389,9 @@ impl Tracer {
                     ino: root.ino,
                 };
                 let flags = if root.exclude { abi::ROOT_F_EXCLUDE } else { 0 };
-                map.insert(key, RootVal { id, flags }, 0)
-                    .map_err(|e| LoadError::new(format!("adding {} to roots", root.path.display()), e))?;
+                map.insert(key, RootVal { id, flags }, 0).map_err(|e| {
+                    LoadError::new(format!("adding {} to roots", root.path.display()), e)
+                })?;
             }
         }
 
@@ -372,7 +403,8 @@ impl Tracer {
                 .map_err(|e| LoadError::new(what("typing"), e))?;
             prog.load(tracepoint, &btf)
                 .map_err(|e| LoadError::new(what("loading"), e))?;
-            prog.attach().map_err(|e| LoadError::new(what("attaching"), e))?;
+            prog.attach()
+                .map_err(|e| LoadError::new(what("attaching"), e))?;
         }
 
         let mut missing = Vec::new();
@@ -380,10 +412,9 @@ impl Tracer {
         for hook in FS_HOOKS.iter().filter(|hook| hook.wanted(ops)) {
             match attach_fentry(&mut ebpf, &btf, hook) {
                 Ok(_) => attached.push(*hook),
-                Err(error) if error.class() == Class::Unsupported => missing.push(Missing {
-                    hook: *hook,
-                    error,
-                }),
+                Err(error) if error.class() == Class::Unsupported => {
+                    missing.push(Missing { hook: *hook, error })
+                }
                 Err(error) => return Err(error),
             }
         }
@@ -397,7 +428,10 @@ impl Tracer {
 
         let mut take = |name: &str| {
             ebpf.take_map(name).ok_or_else(|| {
-                LoadError::new(format!("finding map {name}"), std::io::Error::other("not in the BPF object"))
+                LoadError::new(
+                    format!("finding map {name}"),
+                    std::io::Error::other("not in the BPF object"),
+                )
             })
         };
         let ring = RingBuf::try_from(take("events")?)

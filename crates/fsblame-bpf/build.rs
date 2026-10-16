@@ -11,17 +11,29 @@ fn main() {
 
     let header = fsblame_abi::header();
     fs::write(out.join("fsblame_wire.h"), header.finish()).expect("write fsblame_wire.h");
+    let hash = header.abi_hash();
+    let hex = format!("{hash:#018x}");
+    // Insert underscores every 4 hex digits for clippy::unreadable_literal.
+    let readable = format!(
+        "0x{}_{}_{}_{}",
+        &hex[2..6],
+        &hex[6..10],
+        &hex[10..14],
+        &hex[14..18]
+    );
     fs::write(
         out.join("abi_hash.rs"),
         format!(
-            "/// ABI hash of `fsblame_wire.h` (`FSBLAME_WIRE_H_ABI_HASH`).\npub const ABI_HASH: u64 = {:#018x};\n",
-            header.abi_hash()
+            "/// ABI hash of `fsblame_wire.h` (`FSBLAME_WIRE_H_ABI_HASH`).\npub const ABI_HASH: u64 = {readable};\n",
         ),
     )
     .expect("write abi_hash.rs");
 
     // libbpf's bpf_tracing.h keys pt_regs access off __TARGET_ARCH_<arch>.
-    let arch = match env::var("CARGO_CFG_TARGET_ARCH").expect("target arch").as_str() {
+    let arch = match env::var("CARGO_CFG_TARGET_ARCH")
+        .expect("target arch")
+        .as_str()
+    {
         "x86_64" => "x86",
         "aarch64" => "arm64",
         "riscv64" => "riscv",
@@ -30,14 +42,19 @@ fn main() {
         "powerpc64" => "powerpc",
         other => panic!("no __TARGET_ARCH mapping for {other}"),
     };
-    let target = match env::var("CARGO_CFG_TARGET_ENDIAN").expect("target endian").as_str() {
+    let target = match env::var("CARGO_CFG_TARGET_ENDIAN")
+        .expect("target endian")
+        .as_str()
+    {
         "big" => "bpfeb",
         _ => "bpfel",
     };
     let clang = env::var_os("CLANG").unwrap_or_else(|| "clang".into());
     for name in OBJECTS {
         let status = Command::new(&clang)
-            .args(["-target", target, "-O2", "-g", "-mcpu=v3", "-Wall", "-Werror"])
+            .args([
+                "-target", target, "-O2", "-g", "-mcpu=v3", "-Wall", "-Werror",
+            ])
             .arg(format!("-D__TARGET_ARCH_{arch}"))
             .args(["-I", "bpf", "-I", "bpf/include", "-I"])
             .arg(&out)
@@ -47,7 +64,10 @@ fn main() {
             .arg(out.join(format!("{name}.bpf.o")))
             .status()
             .unwrap_or_else(|e| panic!("failed to run {}: {e}", clang.display()));
-        assert!(status.success(), "clang failed on bpf/{name}.bpf.c: {status}");
+        assert!(
+            status.success(),
+            "clang failed on bpf/{name}.bpf.c: {status}"
+        );
     }
     println!("cargo:rerun-if-changed=bpf");
     println!("cargo:rerun-if-env-changed=CLANG");

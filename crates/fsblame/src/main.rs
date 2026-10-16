@@ -30,7 +30,11 @@ impl log::Log for StderrLog {
 
     fn log(&self, record: &log::Record<'_>) {
         if self.enabled(record.metadata()) {
-            eprintln!("fsblame: {}: {}", record.level().as_str().to_lowercase(), record.args());
+            eprintln!(
+                "fsblame: {}: {}",
+                record.level().as_str().to_lowercase(),
+                record.args()
+            );
         }
     }
 

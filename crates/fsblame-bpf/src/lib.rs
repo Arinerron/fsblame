@@ -12,8 +12,12 @@ struct Aligned<B: ?Sized>(B);
 
 macro_rules! object {
     ($name:literal) => {{
-        static OBJECT: &Aligned<[u8]> =
-            &Aligned(*include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".bpf.o")));
+        static OBJECT: &Aligned<[u8]> = &Aligned(*include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/",
+            $name,
+            ".bpf.o"
+        )));
         &OBJECT.0
     }};
 }
@@ -22,5 +26,5 @@ macro_rules! object {
 pub static OBJECT: &[u8] = object!("fsblame");
 
 /// Feature probes for `fsblame doctor`: a do-nothing program per attach point, named
-/// `probe_<function>` (fentry) or `probe_<tracepoint>` (tp_btf), and no output.
+/// `probe_<function>` (fentry) or `probe_<tracepoint>` (`tp_btf`), and no output.
 pub static PROBE_OBJECT: &[u8] = object!("probe");
