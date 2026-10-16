@@ -430,9 +430,9 @@ mod tests {
     fn durations_accept_units_and_bare_seconds() {
         assert_eq!(parse_duration("250ms"), Ok(Duration::from_millis(250)));
         assert_eq!(parse_duration("1.5s"), Ok(Duration::from_millis(1500)));
-        assert_eq!(parse_duration("2m"), Ok(Duration::from_secs(120)));
+        assert_eq!(parse_duration("2m"), Ok(Duration::from_mins(2)));
         assert_eq!(parse_duration("7"), Ok(Duration::from_secs(7)));
-        assert_eq!(parse_duration("7d"), Ok(Duration::from_secs(7 * 86_400)));
+        assert_eq!(parse_duration("7d"), Ok(Duration::from_hours(7 * 24)));
         assert!(parse_duration("5w").is_err());
         assert!(parse_duration("s").is_err());
     }
@@ -443,10 +443,7 @@ mod tests {
             parse_time("2026-10-14T14:02:11Z"),
             Ok(TimeArg::At(1_791_986_531_000_000_000))
         );
-        assert_eq!(
-            parse_time("30m"),
-            Ok(TimeArg::Ago(Duration::from_secs(1800)))
-        );
+        assert_eq!(parse_time("30m"), Ok(TimeArg::Ago(Duration::from_mins(30))));
         assert_eq!(
             TimeArg::Ago(Duration::from_secs(2)).unix_ns(5_000_000_000),
             3_000_000_000
@@ -484,8 +481,8 @@ mod tests {
         let Some(Command::Blame(args)) = cli.command else {
             panic!("not blame");
         };
-        assert!(args.paths.is_empty());
-        assert_eq!(args.since, Some(TimeArg::Ago(Duration::from_secs(7200))));
+        assert_eq!(args.paths, [] as [PathBuf; 0]);
+        assert_eq!(args.since, Some(TimeArg::Ago(Duration::from_hours(2))));
         assert_eq!(args.limit, Some(1));
         assert!(Cli::try_parse_from(["fsblame", "blame", "--limit", "0"]).is_err());
         assert!(Cli::try_parse_from(["fsblame", "blame", "--ring-size", "4M"]).is_err());

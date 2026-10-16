@@ -462,7 +462,7 @@ fn finish_reports_every_pending_window_once() {
     };
     assert_eq!(window(touch), (25, 2));
     h.finish();
-    assert!(h.touches().is_empty());
+    assert_eq!(h.touches(), []);
 }
 
 #[test]
@@ -471,7 +471,7 @@ fn reused_struct_file_hands_the_old_binding_totals_over() {
     h.feed(&fs_item(first_write(T0, SH, 0xf1, 7, 10)));
     h.kernel.set(SH, 0xf1, T0, (20, 2), T0 + 10 * MS);
     h.poll(T0 + 100 * MS);
-    assert!(h.touches().is_empty());
+    assert_eq!(h.touches(), []);
     // One more write, then the file is closed and its struct file reused for inode 9: the
     // kernel replaced the binding and handed the old one's final totals over.
     h.feed(&fs_item(replacing_write(

@@ -398,7 +398,6 @@ fn build() -> Result<PathBuf> {
 
 /// The work directory must hold file capabilities (scenario i) and be a real filesystem.
 fn check_work_fs(dir: &Path) -> Result<()> {
-    const TMPFS_MAGIC: i64 = 0x0102_1994;
     let path = std::ffi::CString::new(dir.as_os_str().as_bytes())?;
     let mut st = std::mem::MaybeUninit::<libc::statfs>::uninit();
     // SAFETY: `path` is a C string and `st` is writable for one statfs.
@@ -411,7 +410,8 @@ fn check_work_fs(dir: &Path) -> Result<()> {
     // SAFETY: statfs succeeded and filled `st`.
     let st = unsafe { st.assume_init() };
     ensure!(
-        st.f_type != TMPFS_MAGIC,
+        // An untyped literal: `f_type`'s integer type differs between architectures.
+        st.f_type != 0x0102_1994, // TMPFS_MAGIC
         "{} is on tmpfs; the work dir must be on a disk filesystem",
         dir.display()
     );

@@ -234,6 +234,7 @@ dependencies = [
  "fsblame-bpf",
  "libc",
  "log",
+ "memchr",
  "procctx",
  "serde",
  "serde_json",

@@ -1056,7 +1056,7 @@ impl Summary {
     pub fn report(&self, ts: Timestamp, lost: LossTotals) -> SummaryReport<'_> {
         let mut groups: Vec<GroupReport<'_>> = self.groups.iter().map(Tally::report).collect();
         // Stable: groups with equal counts stay in the order they first changed something.
-        groups.sort_by(|a, b| b.changes.cmp(&a.changes));
+        groups.sort_by_key(|g| std::cmp::Reverse(g.changes));
         groups.extend(self.other.as_ref().map(Tally::report));
         SummaryReport {
             v: Version,
