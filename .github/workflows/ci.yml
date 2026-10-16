@@ -15,7 +15,7 @@ jobs:
     name: rustfmt and clippy
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           path: fsblame
           submodules: true
@@ -31,7 +31,7 @@ jobs:
     name: x86_64 build and unit tests
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           path: fsblame
           submodules: true
@@ -57,7 +57,7 @@ jobs:
         working-directory: fsblame
         # tar keeps the executable bits that upload-artifact drops.
         run: tar -cf e2e-bins.tar -C target/x86_64-unknown-linux-musl/release fsblame -C ../../debug xtask
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: e2e-bins
           path: fsblame/e2e-bins.tar
@@ -67,7 +67,7 @@ jobs:
     name: aarch64 check, build and qemu smoke
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           path: fsblame
           submodules: true
@@ -92,7 +92,7 @@ jobs:
     name: fuzz record decoding, report lines and globs
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           path: fsblame
           submodules: true
@@ -109,7 +109,7 @@ jobs:
           done
       - name: Upload crashing inputs
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fuzz-artifacts
           path: fsblame/fuzz/artifacts
@@ -126,7 +126,7 @@ jobs:
         # the 6.1, 6.6 and 6.12 LTS lines, and the newest stable.
         kernel: [v5.17.15, v6.1.190, v6.6.159, v6.12.113, v7.2.6]
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: e2e-bins
       - name: Unpack the binaries built by build-test
