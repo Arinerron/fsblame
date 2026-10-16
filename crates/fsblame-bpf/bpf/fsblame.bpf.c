@@ -12,7 +12,9 @@
  * hook that follows consumes it and accumulates into `writes`, keyed by (tgid, struct file *).
  * Only the first write of a binding produces a record; userspace drains the totals. A shared
  * mapping that becomes writable (security_mmap_file, security_file_mprotect) is reported once
- * per binding (`mapped`): stores through it never pass a write hook.
+ * per binding (`mapped`): stores through it never pass a write hook. A binding belongs to one
+ * open instance of its struct file (`files`); on_file_free ends the instance, so a reused
+ * struct file starts a new binding.
  *
  * Creates: open(O_CREAT) of a name missing from the dentry cache runs the create check before
  * the lookup that tells whether the file exists. on_create leaves such a create (its dentry is
@@ -21,6 +23,14 @@
  *
  * cwd: on_exec_cwd walks the new image's working directory into `cwd_buf` and on_exec, which
  * runs right after it on the same tracepoint and CPU, copies it into the exec record.
+ *
+ * Tracking (`track`, fsblame run and watch --tree): only the processes in `tracked` are
+ * reported. The loader seeds it; on_fork adds the new processes of tracked ones and on_exit
+ * removes a process once its last thread is gone. Every reporting path checks it after its
+ * cheap scalar tests and before scope_of. With `scope` beyond the watch roots (fsblame run
+ * without paths), every filesystem but the pseudo ones is in scope and paths are reported
+ * relative to their filesystem root (ROOT_FSROOT), which userspace maps through mountinfo.
+ * Both are .rodata: with tracking off and the default scope the checks compile away.
  *
  * Every fentry program that reports owns one `fs_buf` slot, so programs never share scratch
  * space: the same program cannot nest on one CPU (the kernel skips recursive runs).
@@ -57,6 +67,26 @@ char LICENSE[] SEC("license") = "Dual MIT/GPL";
 #define VM_WRITE 0x2
 #define VM_SHARED 0x8
 #define MAX_PID_NS_LEVEL 32
+#define SB_KERNMOUNT (1UL << 22)
+
+/* Magic numbers (uapi/linux/magic.h and the filesystems' sources) of the filesystems that
+ * expose kernel state rather than files: out of scope beyond the watch roots. */
+#define PROC_SUPER_MAGIC 0x9fa0
+#define SYSFS_MAGIC 0x62656572
+#define CGROUP_SUPER_MAGIC 0x27e0eb
+#define CGROUP2_SUPER_MAGIC 0x63677270
+#define DEVPTS_SUPER_MAGIC 0x1cd1
+#define DEBUGFS_MAGIC 0x64626720
+#define TRACEFS_MAGIC 0x74726163
+#define BPF_FS_MAGIC 0xcafe4a11
+#define SECURITYFS_MAGIC 0x73636673
+#define PSTOREFS_MAGIC 0x6165676c
+#define CONFIGFS_MAGIC 0x62656570
+#define BINFMTFS_MAGIC 0x42494e4d
+#define MQUEUE_MAGIC 0x19800202
+#define FUSE_CTL_SUPER_MAGIC 0x65735543
+#define SELINUX_MAGIC 0xf97cff8c
+#define SMACK_MAGIC 0x43415d53
 
 /* fs_buf slots: the op programs use their op, the mapping and open programs the slots after
  * them. */
@@ -120,7 +150,22 @@ struct write_stash {
 struct mapping {
 	u64 ino;
 	u64 start_ns;
+	u64 first_ns; /* when reported; stale if before the struct file's `since` */
 	u32 dev;
+	u32 _pad;
+};
+
+/*
+ * One open instance of a struct file that has a binding. The slab hands a freed struct file
+ * straight back, and ext4 hands a freed inode number back, so (tgid, file, ino) alone merges
+ * the writes of distinct files. on_file_free drops the entry when the file is freed; without
+ * that hook, a changed inode (address or i_generation) still tells instances apart. A binding
+ * is the instance's when it started at or after `since`.
+ */
+struct file_seen {
+	u64 since;
+	u64 inode; /* struct inode * */
+	u32 gen;   /* i_generation */
 	u32 _pad;
 };
 
@@ -142,6 +187,8 @@ struct scope {
 const volatile u32 self_tgid = 0;
 const volatile u32 op_mask = 0; /* bit (1 << OP_*) */
 const volatile struct dev_filter dev_filter = {};
+const volatile u32 scope = SCOPE_ROOTS; /* SCOPE_* */
+const volatile u32 track = 0;           /* report only the processes in `tracked` */
 
 /* Bumped on every directory rename on a watched filesystem: invalidates all verdicts. */
 u64 dir_epoch = 0;
@@ -188,6 +235,13 @@ struct {
 	__type(value, struct mapping);
 } mapped SEC(".maps");
 
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 16384);
+	__type(key, u64); /* struct file * */
+	__type(value, struct file_seen);
+} files SEC(".maps");
+
 /* The dentry, still in lookup, of each thread's open(O_CREAT) on a watched filesystem that
  * passed the create check before its lookup (see on_create). */
 struct {
@@ -196,6 +250,14 @@ struct {
 	__type(key, u32);   /* tid */
 	__type(value, u64); /* struct dentry * */
 } creating SEC(".maps");
+
+/* The processes whose changes are reported when `track` is set. */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 1); /* resized by the loader when tracking */
+	__type(key, u32);       /* tgid */
+	__type(value, u8);
+} tracked SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
@@ -237,18 +299,40 @@ static __always_inline u32 current_tgid(void)
 	return bpf_get_current_pid_tgid() >> 32;
 }
 
-static __always_inline void output(void *data, u64 size)
+static __always_inline void count(u32 slot)
 {
-	if (bpf_ringbuf_output(&events, data, size, 0)) {
-		u32 slot = STAT_RING_DROPS;
-		u64 *n = bpf_map_lookup_elem(&stats, &slot);
+	u64 *n = bpf_map_lookup_elem(&stats, &slot);
 
-		if (n)
-			*n += 1;
-	}
+	if (n)
+		*n += 1;
 }
 
-/* Whether `dev` holds a watch root. Constant-folded against .rodata by the verifier. */
+static __always_inline void output(void *data, u64 size)
+{
+	if (bpf_ringbuf_output(&events, data, size, 0))
+		count(STAT_RING_DROPS);
+}
+
+/* Whether the changes of process `tgid` are left out because tracking is on and it is not
+ * tracked. */
+static __always_inline bool untracked(u32 tgid)
+{
+	return track && !bpf_map_lookup_elem(&tracked, &tgid);
+}
+
+/* Whether the current process's `op` is reported: the op selected, the hooks armed, not
+ * fsblame itself, and tracked when tracking. The map lookup goes last. */
+static __always_inline bool reporting(u16 op)
+{
+	u32 tgid;
+
+	if (!(op_mask & (1U << op)) || !armed)
+		return false;
+	tgid = current_tgid();
+	return tgid != self_tgid && !untracked(tgid);
+}
+
+/* Whether `dev` is in the device filter. Constant-folded against .rodata by the verifier. */
 static __always_inline bool dev_watched(u32 dev)
 {
 	u32 n = dev_filter.count;
@@ -259,6 +343,47 @@ static __always_inline bool dev_watched(u32 dev)
 	for (u32 i = 0; i < MAX_DEVS; i++) {
 		if (i < n && dev_filter.devs[i] == dev)
 			return true;
+	}
+	return false;
+}
+
+/* Whether scope_of walks the dentries of `dev` looking for roots, and caches verdicts. */
+static __always_inline bool dev_walked(u32 dev)
+{
+	return scope != SCOPE_ALL && dev_watched(dev);
+}
+
+/* Whether a path on `dev` can be in scope. */
+static __always_inline bool dev_in_scope(u32 dev)
+{
+	return scope != SCOPE_ROOTS || dev_watched(dev);
+}
+
+/* Whether `sb` exposes kernel state rather than files (proc, sysfs, cgroups, ...) or is
+ * internal to the kernel (kern_mount: memfd, pipes, sockets), which no path reaches: out of
+ * scope beyond the watch roots. */
+static __always_inline bool pseudo_fs(struct super_block *sb)
+{
+	if (sb->s_flags & SB_KERNMOUNT)
+		return true;
+	switch (sb->s_magic) {
+	case PROC_SUPER_MAGIC:
+	case SYSFS_MAGIC:
+	case CGROUP_SUPER_MAGIC:
+	case CGROUP2_SUPER_MAGIC:
+	case DEVPTS_SUPER_MAGIC:
+	case DEBUGFS_MAGIC:
+	case TRACEFS_MAGIC:
+	case BPF_FS_MAGIC:
+	case SECURITYFS_MAGIC:
+	case PSTOREFS_MAGIC:
+	case CONFIGFS_MAGIC:
+	case BINFMTFS_MAGIC:
+	case MQUEUE_MAGIC:
+	case FUSE_CTL_SUPER_MAGIC:
+	case SELINUX_MAGIC:
+	case SMACK_MAGIC:
+		return true;
 	}
 	return false;
 }
@@ -296,6 +421,8 @@ static long match_step(u64 index, void *data)
 	return 0;
 }
 
+/* Whether `d` on `dev` is in scope, and relative to what: its watch root (with the names up to
+ * it), its filesystem root (beyond the watch roots), or nothing (ROOT_NONE). */
 static __always_inline struct scope scope_of(struct dentry *d, u32 dev)
 {
 	struct scope s = { .root = ROOT_NONE, .depth = 0 };
@@ -305,7 +432,14 @@ static __always_inline struct scope scope_of(struct dentry *d, u32 dev)
 	struct match m;
 	u64 key, ino, epoch;
 
-	if (!dev_watched(dev))
+	if (scope != SCOPE_ROOTS) {
+		if (pseudo_fs(d->d_sb))
+			return s;
+		s.root = ROOT_FSROOT;
+	}
+	/* Watch roots: another filesystem is out of scope. Beyond them: one without excludes is
+	 * in scope as a whole. */
+	if (!dev_walked(dev))
 		return s;
 	key = (u64)d;
 	parent = d->d_parent;
@@ -321,7 +455,7 @@ static __always_inline struct scope scope_of(struct dentry *d, u32 dev)
 	m.d = d;
 	m.dev = dev;
 	m.depth = 0;
-	m.root = ROOT_NONE;
+	m.root = s.root; /* what a walk that meets no root or exclude yields */
 	m._pad = 0;
 	bpf_loop(WALK_MAX, match_step, &m, 0);
 	fresh.parent = (u64)parent;
@@ -396,11 +530,11 @@ static __always_inline u32 emit_names(struct fs_scratch *s, u32 slot, u32 off, s
 	return s->cur;
 }
 
-/* The path of `d`: relative to its watch root when in scope, else to its filesystem root. */
+/* The path of `d`: relative to its watch root when in one, else to its filesystem root. */
 static __always_inline u32 emit_path(struct fs_scratch *s, u32 slot, u32 off, struct dentry *d,
 				     struct scope sc, u32 *root, u32 *trunc)
 {
-	if (sc.root == ROOT_NONE) {
+	if (sc.root == ROOT_NONE || sc.root == ROOT_FSROOT) {
 		*root = ROOT_FSROOT;
 		return emit_names(s, slot, off, d, WALK_MAX, trunc);
 	}
@@ -475,18 +609,18 @@ static __always_inline void set_inode(struct fs_rec *r, struct inode *inode)
 /*
  * Reports an operation on `d` (path) and optionally a second name `d2` (path2) or a raw
  * string `raw` (path2, ROOT_RAW). In scope when either name is. `mode` overrides the inode's
- * mode when non-zero; `inode` supplies ino and mode (NULL: d's inode).
+ * mode when non-zero; `inode` supplies ino and mode (NULL: d's inode). The caller checked
+ * reporting(op).
  */
-static __always_inline int report(u32 slot, u16 op, struct dentry *d, struct dentry *d2,
-				  const char *raw, struct inode *inode, u32 mode, u64 aux, u64 aux2)
+static __always_inline int emit_change(u32 slot, u16 op, struct dentry *d, struct dentry *d2,
+				       const char *raw, struct inode *inode, u32 mode, u64 aux,
+				       u64 aux2)
 {
 	struct scope sc, sc2 = { .root = ROOT_NONE, .depth = 0 };
 	struct fs_scratch *s;
 	u32 dev, trunc = 0, trunc2 = 0, end, end2;
 	long n;
 
-	if (!(op_mask & (1U << op)) || !armed || current_tgid() == self_tgid)
-		return 0;
 	dev = d->d_sb->s_dev;
 	sc = scope_of(d, dev);
 	if (d2)
@@ -524,6 +658,15 @@ static __always_inline int report(u32 slot, u16 op, struct dentry *d, struct den
 	return 0;
 }
 
+/* emit_change() if the current process's `op` is reported. */
+static __always_inline int report(u32 slot, u16 op, struct dentry *d, struct dentry *d2,
+				  const char *raw, struct inode *inode, u32 mode, u64 aux, u64 aux2)
+{
+	if (!reporting(op))
+		return 0;
+	return emit_change(slot, op, d, d2, raw, inode, mode, aux, aux2);
+}
+
 /* Whether `d` is still being looked up (d_in_lookup). The flag became `enum dentry_flags`, and
  * moved, in Linux 6.15. */
 static __always_inline bool in_lookup(struct dentry *d)
@@ -542,7 +685,8 @@ static __always_inline bool in_lookup(struct dentry *d)
  * matched by dentry, not just by thread: the create may run creates of its own in between (an
  * overlay creates the file on its upper layer). A create of the pending dentry decided here (its
  * open failed after the check, and a later one found the name cached) clears the entry so that
- * the open is not reported again.
+ * the open is not reported again. A process that is not reported leaves no entry for
+ * on_file_post_open to find.
  */
 SEC("fentry/security_inode_create")
 int BPF_PROG(on_create, struct inode *dir, struct dentry *dentry, umode_t mode)
@@ -550,7 +694,9 @@ int BPF_PROG(on_create, struct inode *dir, struct dentry *dentry, umode_t mode)
 	u32 tid = (u32)bpf_get_current_pid_tgid();
 	u64 d = (u64)dentry, *pending;
 
-	if (creates_confirmed && dev_watched(dentry->d_sb->s_dev)) {
+	if (!reporting(OP_CREATE))
+		return 0;
+	if (creates_confirmed && dev_in_scope(dentry->d_sb->s_dev)) {
 		if (in_lookup(dentry)) {
 			bpf_map_update_elem(&creating, &tid, &d, BPF_ANY);
 			return 0;
@@ -559,7 +705,7 @@ int BPF_PROG(on_create, struct inode *dir, struct dentry *dentry, umode_t mode)
 		if (pending && *pending == d)
 			bpf_map_delete_elem(&creating, &tid);
 	}
-	return report(OP_CREATE, OP_CREATE, dentry, NULL, NULL, NULL, mode | S_IFREG, 0, 0);
+	return emit_change(OP_CREATE, OP_CREATE, dentry, NULL, NULL, NULL, mode | S_IFREG, 0, 0);
 }
 
 /* Reports the create of an open that on_create left to it. Runs after every successful open:
@@ -629,8 +775,8 @@ int BPF_PROG(on_rename, struct inode *old_dir, struct dentry *old_dentry, struct
 	bool moves_dir = (src && S_ISDIR(src->i_mode)) ||
 			 ((flags & RENAME_EXCHANGE) && dst && S_ISDIR(dst->i_mode));
 
-	/* Every dentry below a moved directory may change scope. */
-	if (moves_dir && dev_watched(old_dentry->d_sb->s_dev))
+	/* Every dentry below a moved directory may change scope, whoever moved it. */
+	if (moves_dir && dev_walked(old_dentry->d_sb->s_dev))
 		__sync_fetch_and_add(&dir_epoch, 1);
 	return report(OP_RENAME, OP_RENAME, new_dentry, old_dentry, NULL, src, 0, flags,
 		      dst ? dst->i_ino : 0);
@@ -683,6 +829,39 @@ int on_setattr(u64 *ctx)
 	return report(OP_SETATTR, op, dentry, NULL, NULL, NULL, 0, valid, value);
 }
 
+/*
+ * Whether `file` is overlayfs's own open of a layer's file under the overlay's path, as made
+ * before Linux 6.9 (open_with_fake_path, then a backing file keeping the real path aside): its
+ * inode is the layer's, not its dentry's. A write or mapping through the overlay's file
+ * reaches the hooks again with this one, under another struct file, after the overlay's own
+ * was reported. From Linux 6.9 the file has the layer's path, which is out of scope.
+ */
+static __always_inline bool layer_file(struct file *file)
+{
+	return file->f_path.dentry->d_inode != file->f_inode;
+}
+
+/* When the current open instance of `file` was first seen (see struct file_seen); `now` for
+ * one seen for the first time, or whose inode changed under it. */
+static __always_inline u64 file_since(struct file *file, struct inode *inode, u64 now)
+{
+	struct file_seen *f, fresh = { .since = now, .inode = (u64)inode, ._pad = 0 };
+	u64 key = (u64)file;
+
+	fresh.gen = inode->i_generation;
+	f = bpf_map_lookup_elem(&files, &key);
+	if (f && f->inode == fresh.inode && f->gen == fresh.gen)
+		return f->since;
+	if (!f && bpf_map_update_elem(&files, &key, &fresh, BPF_NOEXIST)) {
+		/* Another thread saw it first. */
+		f = bpf_map_lookup_elem(&files, &key);
+		return f ? f->since : now;
+	}
+	if (f)
+		bpf_map_update_elem(&files, &key, &fresh, BPF_ANY);
+	return now;
+}
+
 SEC("fentry/rw_verify_area")
 int BPF_PROG(on_rw_verify_area, int read_write, struct file *file, const loff_t *ppos, size_t count)
 {
@@ -711,12 +890,12 @@ int BPF_PROG(on_file_permission, struct file *file, int mask)
 	struct dentry *d;
 	struct scope sc;
 	u32 zero = 0, slot = OP_WRITE, dev, tgid, trunc = 0, end;
-	u64 id, bytes = 0, now, ino;
+	u64 id, bytes = 0, now, ino, since;
 
 	if (!(mask & MAY_WRITE) || !armed)
 		return 0;
 	inode = file->f_inode;
-	if (!inode || (inode->i_mode & S_IFMT) != S_IFREG)
+	if (!inode || (inode->i_mode & S_IFMT) != S_IFREG || layer_file(file))
 		return 0;
 	id = bpf_get_current_pid_tgid();
 	st = bpf_map_lookup_elem(&stash, &zero);
@@ -725,7 +904,7 @@ int BPF_PROG(on_file_permission, struct file *file, int mask)
 		st->file = 0;
 	}
 	tgid = id >> 32;
-	if (tgid == self_tgid)
+	if (tgid == self_tgid || untracked(tgid))
 		return 0;
 	d = file->f_path.dentry;
 	dev = inode->i_sb->s_dev;
@@ -734,12 +913,17 @@ int BPF_PROG(on_file_permission, struct file *file, int mask)
 		return 0;
 
 	now = bpf_ktime_get_boot_ns();
+	/* Another CPU may have started the instance a moment "later". */
+	since = file_since(file, inode, now);
+	if (now < since)
+		now = since;
 	ino = inode->i_ino;
 	key.tgid = tgid;
 	key._pad = 0;
 	key.file = (u64)file;
 	v = bpf_map_lookup_elem(&writes, &key);
-	if (v && v->ino == ino && v->dev == dev) {
+	/* A binding of an earlier open instance of this struct file is replaced below. */
+	if (v && v->first_ns >= since && v->ino == ino && v->dev == dev) {
 		__sync_fetch_and_add(&v->bytes, bytes);
 		__sync_fetch_and_add(&v->calls, 1);
 		v->last_ns = now;
@@ -758,8 +942,8 @@ int BPF_PROG(on_file_permission, struct file *file, int mask)
 		return 0;
 	fill_task(&s->rec, OP_WRITE, now);
 	if (v) {
-		/* The struct file was freed and reused for another inode: hand over the old
-		 * binding's final totals with the new binding. */
+		/* The struct file was freed and reused (for another file, or another open of
+		 * this one): hand over the old binding's final totals with the new binding. */
 		s->rec.hdr.flags |= F_REPLACED;
 		s->rec.aux = v->bytes;
 		s->rec.aux2 = v->calls;
@@ -787,6 +971,24 @@ int BPF_PROG(on_file_permission, struct file *file, int mask)
 	return 0;
 }
 
+/* A struct file is being freed: its next use is another open instance (see file_seen). Runs
+ * on every file release system-wide, so files that cannot carry a binding stop at a flag
+ * test and a device compare; the rest cost one map delete. */
+SEC("fentry/security_file_free")
+int BPF_PROG(on_file_free, struct file *file)
+{
+	struct inode *inode;
+	u64 key = (u64)file;
+
+	if (!(op_mask & (1U << OP_WRITE)) || !(file->f_mode & FMODE_WRITE))
+		return 0;
+	inode = file->f_inode;
+	if (!inode || !dev_in_scope(inode->i_sb->s_dev))
+		return 0;
+	bpf_map_delete_elem(&files, &key);
+	return 0;
+}
+
 /*
  * Reports a shared mapping of `file` that became writable (`via` is MAP_VIA_*), once per
  * (tgid, struct file) binding: stores through it change the file without a write call. Kept
@@ -801,15 +1003,15 @@ static __always_inline int report_mapped(u32 slot, struct file *file, u64 via)
 	struct dentry *d;
 	struct scope sc;
 	u32 dev, tgid, trunc = 0, end;
-	u64 ino, start;
+	u64 ino, start, now, since;
 
 	if (!(op_mask & (1U << OP_WRITE)) || !armed)
 		return 0;
 	inode = file->f_inode;
-	if (!inode || (inode->i_mode & S_IFMT) != S_IFREG)
+	if (!inode || (inode->i_mode & S_IFMT) != S_IFREG || layer_file(file))
 		return 0;
 	tgid = current_tgid();
-	if (tgid == self_tgid)
+	if (tgid == self_tgid || untracked(tgid))
 		return 0;
 	d = file->f_path.dentry;
 	dev = inode->i_sb->s_dev;
@@ -819,14 +1021,19 @@ static __always_inline int report_mapped(u32 slot, struct file *file, u64 via)
 
 	ino = inode->i_ino;
 	start = bpf_get_current_task_btf()->group_leader->start_boottime;
+	now = bpf_ktime_get_boot_ns();
+	since = file_since(file, inode, now);
+	if (now < since)
+		now = since;
 	key.tgid = tgid;
 	key._pad = 0;
 	key.file = (u64)file;
 	v = bpf_map_lookup_elem(&mapped, &key);
-	if (v && v->ino == ino && v->dev == dev && v->start_ns == start)
+	if (v && v->first_ns >= since && v->ino == ino && v->dev == dev && v->start_ns == start)
 		return 0;
 	fresh.ino = ino;
 	fresh.start_ns = start;
+	fresh.first_ns = now;
 	fresh.dev = dev;
 	fresh._pad = 0;
 	/* A stale binding is replaced; a new one is reported by the thread that creates it. */
@@ -836,7 +1043,7 @@ static __always_inline int report_mapped(u32 slot, struct file *file, u64 via)
 	s = bpf_map_lookup_elem(&fs_buf, &slot);
 	if (!s)
 		return 0;
-	fill_task(&s->rec, OP_WRITE, bpf_ktime_get_boot_ns());
+	fill_task(&s->rec, OP_WRITE, now);
 	s->rec.hdr.flags = F_MAPPED;
 	s->rec.dev = dev;
 	s->rec.ino = ino;
@@ -881,9 +1088,21 @@ SEC("tp_btf/sched_process_fork")
 int BPF_PROG(on_fork, struct task_struct *parent, struct task_struct *child)
 {
 	struct fork_rec r;
+	u32 tgid;
+	u8 one = 1;
 
 	if (child->pid != child->tgid) /* a thread */
 		return 0;
+	/* `parent` is the forking task: a tracked process's new processes are tracked, also
+	 * those it starts with CLONE_PARENT. */
+	if (track) {
+		tgid = parent->tgid;
+		if (bpf_map_lookup_elem(&tracked, &tgid)) {
+			tgid = child->tgid;
+			if (bpf_map_update_elem(&tracked, &tgid, &one, BPF_ANY))
+				count(STAT_TRACK_FULL);
+		}
+	}
 	r.hdr.kind = REC_FORK;
 	r.hdr.op = 0;
 	r.hdr.flags = 0;
@@ -911,6 +1130,12 @@ int BPF_PROG(on_exit, struct task_struct *p)
 	r.code = p->exit_code;
 	r.start_ns = p->group_leader->start_boottime;
 	output(&r, sizeof(r));
+	/* The pid may be reused by a process nobody tracks. */
+	if (track) {
+		u32 tgid = p->tgid;
+
+		bpf_map_delete_elem(&tracked, &tgid);
+	}
 	return 0;
 }
 

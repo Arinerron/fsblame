@@ -180,13 +180,23 @@ impl Hook {
 }
 
 /// The fentry hooks, in attach order.
-pub const FS_HOOKS: [Hook; 14] = [
+pub const FS_HOOKS: [Hook; 15] = [
     Hook {
         program: "on_rw_verify_area",
         function: "rw_verify_area",
         ops: &[Op::Write],
         always: false,
         role: Role::Supplements("writes are reported without byte counts"),
+    },
+    Hook {
+        program: "on_file_free",
+        function: "security_file_free",
+        ops: &[Op::Write],
+        always: false,
+        role: Role::Supplements(
+            "writes to one file through successive opens may be reported as one window when \
+             the kernel reuses the struct file",
+        ),
     },
     Hook {
         program: "on_file_permission",

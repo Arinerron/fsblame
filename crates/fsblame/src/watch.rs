@@ -2,15 +2,16 @@
 //!
 //! [`run`] is shared by the subcommands that watch: it attaches the tracer, writes every
 //! reported change, every loss and (optionally) the summary to a [`Sink`], and returns the
-//! run's totals. [`command`] is `fsblame watch` on top of it.
+//! run's totals. [`follow`] is the same loop restricted to the processes of a [`Follow`],
+//! which also decides when it ends. [`command`] is `fsblame watch` on top of them.
 
 use std::{
-    ffi::{CStr, OsStr},
-    fs::File,
-    io::{self, BufWriter, IsTerminal as _, Write as _},
+    ffi::{CStr, OsStr, OsString},
+    fs::{self, File},
+    io::{self, BufWriter, IsTerminal, Write as _},
     mem::MaybeUninit,
     os::{
-        fd::{AsRawFd as _, FromRawFd as _, OwnedFd},
+        fd::{AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd},
         unix::ffi::OsStrExt as _,
     },
     path::PathBuf,
@@ -21,7 +22,7 @@ use anyhow::{Context as _, anyhow};
 use bpfdoctor::RealEnv;
 
 use crate::{
-    cli::{ColorMode, WatchArgs},
+    cli::{ColorMode, TraceArgs, WatchArgs},
     clock::{self, Clock},
     doctor,
     engine::Engine,
@@ -31,7 +32,7 @@ use crate::{
     render::{Human, Json},
     report::{Line, LossReason, LossTotals, LostReport, Sink, Summary, Timestamp, Version},
     roots::Roots,
-    tracer::{Class, Tracer},
+    tracer::{Class, Processes, Tracer},
 };
 
 /// Longest wait for events, so pending writes are polled in time.
@@ -44,7 +45,8 @@ const LOSS_EVERY: Duration = Duration::from_secs(1);
 /// What [`run`] watches and how.
 #[derive(Clone, Debug)]
 pub struct WatchOptions {
-    /// Files or directories to watch; a directory includes its whole subtree.
+    /// Files or directories to watch; a directory includes its whole subtree. Empty: every
+    /// filesystem but the pseudo ones (`fsblame run` without paths).
     pub paths: Vec<PathBuf>,
     /// Subtrees to ignore.
     pub exclude: Vec<PathBuf>,
@@ -66,25 +68,18 @@ pub struct WatchOptions {
 }
 
 impl WatchOptions {
-    /// The options `fsblame watch` was given.
-    pub fn from_args(args: &WatchArgs) -> Self {
+    /// Watching `paths` as `trace` says, with no time limit and no readiness descriptor.
+    pub fn new(paths: &[PathBuf], trace: &TraceArgs) -> Self {
         Self {
-            paths: args.paths.clone(),
-            exclude: args.exclude.clone(),
-            ops: args.op.clone(),
-            filter: Filter::new(FilterSpec {
-                include: args.include.clone(),
-                comm: args.comm.clone(),
-                ignore_comm: args.ignore_comm.clone(),
-                uid: args.uid.clone(),
-                unit: args.unit.clone(),
-                pid: args.pid.clone(),
-            }),
-            ring_bytes: args.ring_size,
-            duration: args.duration,
-            ready_fd: args.ready_fd,
-            quiet: args.quiet,
-            summary: args.summary,
+            paths: paths.to_vec(),
+            exclude: trace.exclude.clone(),
+            ops: trace.filter.op.clone(),
+            filter: Filter::new(FilterSpec::from(&trace.filter)),
+            ring_bytes: trace.ring_size,
+            duration: None,
+            ready_fd: None,
+            quiet: trace.quiet,
+            summary: trace.summary,
         }
     }
 }
@@ -98,6 +93,21 @@ pub struct Outcome {
     pub lost: LossTotals,
     /// Records that did not decode.
     pub malformed: u64,
+}
+
+/// The processes a run follows ([`follow`]): only their changes are reported, and they
+/// decide when the run ends.
+pub trait Follow {
+    /// Seeds the tracked set. Runs once the tracer is attached and armed and before the first
+    /// record is read, so the kernel already tracks every process a tracked one starts.
+    fn start(&mut self, tracer: &mut Tracer) -> Result<(), Failure>;
+    /// A descriptor that becomes readable when the run is over, such as a command's pidfd.
+    fn end(&self) -> Option<BorrowedFd<'_>>;
+    /// Handles SIGINT, SIGTERM or SIGHUP; returns whether it stops the run.
+    fn signal(&mut self, signal: i32) -> bool;
+    /// Whose changes are reported and what stops the run, for the start banner, such as
+    /// `by process 42 and its descendants; Ctrl-C to stop`.
+    fn banner(&self) -> String;
 }
 
 fn os_error(what: &str) -> anyhow::Error {
@@ -132,18 +142,17 @@ impl Signals {
         })
     }
 
-    /// Consumes pending signals.
-    fn drain(&self) {
+    /// Takes the next pending signal, if any.
+    fn pop(&self) -> Option<i32> {
         let mut info = MaybeUninit::<libc::signalfd_siginfo>::uninit();
+        let size = size_of::<libc::signalfd_siginfo>();
         // SAFETY: reads at most one siginfo into `info`; the descriptor is non-blocking.
-        while unsafe {
-            libc::read(
-                self.fd.as_raw_fd(),
-                info.as_mut_ptr().cast(),
-                size_of::<libc::signalfd_siginfo>(),
-            )
-        } > 0
-        {}
+        let n = unsafe { libc::read(self.fd.as_raw_fd(), info.as_mut_ptr().cast(), size) };
+        if usize::try_from(n).ok() != Some(size) {
+            return None;
+        }
+        // SAFETY: the kernel filled the whole siginfo.
+        i32::try_from(unsafe { info.assume_init() }.ssi_signo).ok()
     }
 }
 
@@ -235,7 +244,17 @@ fn raise_memlock() {
     }
 }
 
-fn passwd_home(uid: libc::uid_t) -> Option<PathBuf> {
+/// A user's entry in the user database.
+#[derive(Clone, Debug)]
+pub(crate) struct Account {
+    /// Home directory.
+    pub home: PathBuf,
+    /// Login shell.
+    pub shell: OsString,
+}
+
+/// The user database entry of `uid`.
+pub(crate) fn account(uid: libc::uid_t) -> Option<Account> {
     let mut pwd = MaybeUninit::<libc::passwd>::uninit();
     let mut buf = vec![0 as libc::c_char; 16 * 1024];
     let mut result = std::ptr::null_mut();
@@ -253,46 +272,163 @@ fn passwd_home(uid: libc::uid_t) -> Option<PathBuf> {
     if rc != 0 || result.is_null() {
         return None;
     }
-    // SAFETY: getpwuid_r succeeded, so `pwd` is initialised and `pw_dir` is a C string in `buf`.
-    let dir = unsafe { CStr::from_ptr(pwd.assume_init().pw_dir) };
-    Some(PathBuf::from(OsStr::from_bytes(dir.to_bytes())))
+    // SAFETY: getpwuid_r succeeded, so `pwd` is initialised.
+    let pwd = unsafe { pwd.assume_init() };
+    let text = |field: *const libc::c_char| {
+        if field.is_null() {
+            return OsString::new();
+        }
+        // SAFETY: a non-null field of the entry is a C string in `buf`.
+        OsStr::from_bytes(unsafe { CStr::from_ptr(field) }.to_bytes()).to_owned()
+    };
+    Some(Account {
+        home: PathBuf::from(text(pwd.pw_dir)),
+        shell: text(pwd.pw_shell),
+    })
 }
 
 /// The home directory of the user fsblame runs for (the sudo caller, if any), for `~`.
-fn home_dir() -> Option<PathBuf> {
+pub fn home_dir() -> Option<PathBuf> {
     if let Some(uid) = std::env::var("SUDO_UID")
         .ok()
         .and_then(|uid| uid.parse().ok())
     {
-        return passwd_home(uid);
+        return account(uid).map(|a| a.home);
     }
     // SAFETY: getuid cannot fail.
     std::env::var_os("HOME")
         .map(PathBuf::from)
-        .or_else(|| passwd_home(unsafe { libc::getuid() }))
+        .or_else(|| account(unsafe { libc::getuid() }).map(|a| a.home))
 }
 
-/// Whether human output gets colors: `auto` means stdout is a terminal and `NO_COLOR` is
-/// unset or empty.
-fn use_color(mode: ColorMode) -> bool {
+/// Whether human output to `out` gets colors: `auto` means `out` is a terminal and
+/// `NO_COLOR` is unset or empty.
+pub fn use_color(mode: ColorMode, out: &impl IsTerminal) -> bool {
     match mode {
         ColorMode::Always => true,
         ColorMode::Never => false,
         ColorMode::Auto => {
-            io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty())
+            out.is_terminal() && std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty())
         }
     }
 }
 
 /// `fsblame watch`: the tree view or NDJSON on stdout.
 pub fn command(args: &WatchArgs) -> Result<(), Failure> {
-    let opts = WatchOptions::from_args(args);
-    let color = !args.json && use_color(args.color);
-    let out = BufWriter::new(io::stdout().lock());
-    if args.json {
-        run(&opts, &mut Json::new(out))?;
+    let opts = WatchOptions {
+        duration: args.stop.duration,
+        ready_fd: args.stop.ready_fd,
+        ..WatchOptions::new(&args.paths, &args.trace)
+    };
+    let mut tree = if args.tree.is_empty() {
+        None
     } else {
-        run(&opts, &mut Human::new(out, home_dir(), args.depth, color))?;
+        Some(Tree::new(&args.tree)?)
+    };
+    let follower = tree.as_mut().map(|tree| tree as &mut dyn Follow);
+    let out = BufWriter::new(io::stdout().lock());
+    if args.view.json {
+        watch(&opts, follower, &mut Json::new(out))?;
+    } else {
+        let color = use_color(args.view.color, &io::stdout());
+        let mut sink = Human::new(out, home_dir(), args.view.depth, color);
+        watch(&opts, follower, &mut sink)?;
+    }
+    Ok(())
+}
+
+/// `watch --tree`: the given processes and their descendants.
+#[derive(Debug)]
+struct Tree {
+    /// Process ids.
+    pids: Vec<u32>,
+}
+
+impl Tree {
+    /// The processes of `pids`; a thread id stands for its process. Fails with a usage error
+    /// for one that does not exist, and as unsupported when the kernel does not list the
+    /// children of a process (`CONFIG_PROC_CHILDREN`).
+    fn new(pids: &[u32]) -> Result<Self, Failure> {
+        if !fs::exists("/proc/thread-self/children").unwrap_or(false) {
+            return Err(Failure::Unsupported(anyhow!(
+                "--tree needs /proc/<pid>/task/<tid>/children, which this kernel does not \
+                 provide (CONFIG_PROC_CHILDREN)"
+            )));
+        }
+        let mut tree = Self { pids: Vec::new() };
+        for &pid in pids {
+            let tgid = process_of(pid)
+                .ok_or_else(|| Failure::Usage(anyhow!("--tree {pid}: no such process")))?;
+            if !tree.pids.contains(&tgid) {
+                tree.pids.push(tgid);
+            }
+        }
+        Ok(tree)
+    }
+}
+
+impl Follow for Tree {
+    fn start(&mut self, tracer: &mut Tracer) -> Result<(), Failure> {
+        for &pid in &self.pids {
+            track_tree(tracer, pid)?;
+        }
+        Ok(())
+    }
+
+    fn end(&self) -> Option<BorrowedFd<'_>> {
+        None
+    }
+
+    fn signal(&mut self, _signal: i32) -> bool {
+        true
+    }
+
+    fn banner(&self) -> String {
+        let pids: Vec<String> = self.pids.iter().map(u32::to_string).collect();
+        if let [pid] = &pids[..] {
+            format!(" by process {pid} and its descendants; Ctrl-C to stop")
+        } else {
+            format!(
+                " by processes {} and their descendants; Ctrl-C to stop",
+                pids.join(", ")
+            )
+        }
+    }
+}
+
+/// The process (thread group) of `pid`, which may also be a thread id; `None` if there is
+/// no such task.
+fn process_of(pid: u32) -> Option<u32> {
+    fs::read_to_string(format!("/proc/{pid}/status"))
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("Tgid:"))
+        .and_then(|tgid| tgid.trim().parse().ok())
+}
+
+/// Tracks process `root` and its descendants. Each process is tracked before its children
+/// are read: a child it forks after that is tracked by the kernel, one it forked before is
+/// listed. A process that exits meanwhile is skipped with its children, which its exit
+/// handed to another parent.
+fn track_tree(tracer: &mut Tracer, root: u32) -> Result<(), Failure> {
+    let mut pending = vec![root];
+    while let Some(pid) = pending.pop() {
+        tracer.track(pid).map_err(|e| {
+            Failure::Runtime(anyhow::Error::new(e).context(format!("tracking process {pid}")))
+        })?;
+        let Ok(tasks) = fs::read_dir(format!("/proc/{pid}/task")) else {
+            continue;
+        };
+        for task in tasks.flatten() {
+            // Children are listed per thread: the one that forked them.
+            if let Ok(children) = fs::read_to_string(task.path().join("children")) {
+                pending.extend(
+                    children
+                        .split_ascii_whitespace()
+                        .filter_map(|child| child.parse::<u32>().ok()),
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -303,6 +439,24 @@ pub fn command(args: &WatchArgs) -> Result<(), Failure> {
 /// start banner, warnings and the final count go to stderr. A closed output (broken pipe)
 /// ends the run early without an error.
 pub fn run(opts: &WatchOptions, sink: &mut dyn Sink) -> Result<Outcome, Failure> {
+    watch(opts, None, sink)
+}
+
+/// [`run`] for the changes of the processes `follower` tracks, which also handles the stop
+/// signals and may end the run.
+pub fn follow(
+    opts: &WatchOptions,
+    follower: &mut dyn Follow,
+    sink: &mut dyn Sink,
+) -> Result<Outcome, Failure> {
+    watch(opts, Some(follower), sink)
+}
+
+fn watch(
+    opts: &WatchOptions,
+    mut follower: Option<&mut dyn Follow>,
+    sink: &mut dyn Sink,
+) -> Result<Outcome, Failure> {
     if let Some(fd) = opts.ready_fd {
         check_fd(fd)?;
     }
@@ -324,16 +478,22 @@ pub fn run(opts: &WatchOptions, sink: &mut dyn Sink) -> Result<Outcome, Failure>
 
     raise_memlock();
     let signals = Signals::new()?;
-    let mut tracer = Tracer::load(&roots, selected, opts.ring_bytes).map_err(|error| {
-        // Diagnostics are best effort; the load error itself is what gets reported.
-        let _ = doctor::explain_load_failure(&error, &opts.paths);
-        let message = anyhow!("{error}");
-        match error.class() {
-            Class::Privileges => Failure::Privileges(message),
-            Class::Unsupported => Failure::Unsupported(message),
-            Class::Runtime => Failure::Runtime(message),
-        }
-    })?;
+    let processes = if follower.is_some() {
+        Processes::Tracked
+    } else {
+        Processes::All
+    };
+    let mut tracer =
+        Tracer::load(&roots, selected, opts.ring_bytes, processes).map_err(|error| {
+            // Diagnostics are best effort; the load error itself is what gets reported.
+            let _ = doctor::explain_load_failure(&error, &opts.paths);
+            let message = anyhow!("{error}");
+            match error.class() {
+                Class::Privileges => Failure::Privileges(message),
+                Class::Unsupported => Failure::Unsupported(message),
+                Class::Runtime => Failure::Runtime(message),
+            }
+        })?;
     for missing in &tracer.missing {
         eprintln!(
             "fsblame: warning: {}",
@@ -349,27 +509,36 @@ pub fn run(opts: &WatchOptions, sink: &mut dyn Sink) -> Result<Outcome, Failure>
     }
 
     if !opts.quiet {
-        let watched: Vec<String> = roots
-            .iter()
-            .filter(|(_, r)| !r.exclude && !r.nested)
-            .map(|(_, r)| r.path.display().to_string())
-            .collect();
-        let nested = roots.iter().filter(|(_, r)| r.nested).count();
+        let place = if roots.everywhere() {
+            "every filesystem".to_owned()
+        } else {
+            let watched: Vec<String> = roots
+                .iter()
+                .filter(|(_, r)| !r.exclude && !r.nested)
+                .map(|(_, r)| r.path.display().to_string())
+                .collect();
+            let nested = roots.iter().filter(|(_, r)| r.nested).count();
+            if nested > 0 {
+                format!("{} (+{nested} mounts below)", watched.join(", "))
+            } else {
+                watched.join(", ")
+            }
+        };
         let op_names: Vec<&str> = selected.iter().map(Op::name).collect();
         eprintln!(
-            "fsblame: watching {}{} for {}; Ctrl-C to stop",
-            watched.join(", "),
-            if nested > 0 {
-                format!(" (+{nested} mounts below)")
-            } else {
-                String::new()
-            },
+            "fsblame: watching {place} for {}{}",
             if opts.ops.is_empty() {
                 "all ops".to_owned()
             } else {
                 op_names.join(",")
             },
+            follower
+                .as_deref()
+                .map_or_else(|| "; Ctrl-C to stop".to_owned(), Follow::banner),
         );
+    }
+    if let Some(follower) = follower.as_deref_mut() {
+        follower.start(&mut tracer)?;
     }
 
     let clock = Clock::new();
@@ -378,11 +547,11 @@ pub fn run(opts: &WatchOptions, sink: &mut dyn Sink) -> Result<Outcome, Failure>
         summary: opts.summary.then(Summary::new),
     };
     let engine = Engine::new(roots, clock, opts.filter.clone(), output);
-    stream(engine, &mut tracer, &signals, opts, clock)
+    stream(engine, &mut tracer, &signals, follower, opts, clock)
 }
 
-/// An output error ends the run; a closed pipe ends it cleanly.
-fn output_result(result: io::Result<()>) -> Result<bool, Failure> {
+/// An output error ends the run; a closed pipe ends it cleanly (`false`).
+pub fn output_result(result: io::Result<()>) -> Result<bool, Failure> {
     match result {
         Ok(()) => Ok(true),
         Err(e) if e.kind() == io::ErrorKind::BrokenPipe => Ok(false),
@@ -450,16 +619,14 @@ impl LossMeter {
 /// Writes the `lost` lines due for `totals`; `all` writes every unreported loss.
 fn report_losses(
     engine: &mut Engine<Output<'_>>,
-    meters: &mut [LossMeter; 2],
+    meters: &mut [LossMeter; 3],
     totals: LossTotals,
     clock: Clock,
     all: bool,
 ) -> io::Result<()> {
     let now = Instant::now();
-    for (meter, total) in meters
-        .iter_mut()
-        .zip([totals.ring_full, totals.write_evicted])
-    {
+    let totals = [totals.ring_full, totals.write_evicted, totals.track_full];
+    for (meter, total) in meters.iter_mut().zip(totals) {
         if let Some(count) = meter.due(total, now, all) {
             engine.sink_mut().line(&Line::Lost(LostReport {
                 v: Version,
@@ -480,6 +647,7 @@ fn outcome(engine: &Engine<Output<'_>>, tracer: &Tracer) -> Outcome {
         lost: LossTotals {
             ring_full: tracer.ring_drops(),
             write_evicted: counts.evicted,
+            track_full: tracer.track_full(),
         },
         malformed: counts.malformed,
     }
@@ -491,14 +659,25 @@ fn stream(
     mut engine: Engine<Output<'_>>,
     tracer: &mut Tracer,
     signals: &Signals,
+    mut follower: Option<&mut dyn Follow>,
     opts: &WatchOptions,
     clock: Clock,
 ) -> Result<Outcome, Failure> {
+    const SIGNALS: u64 = 1;
+    const END: u64 = 2;
     let mut meters = [
         LossMeter::new(LossReason::RingFull),
         LossMeter::new(LossReason::WriteEvicted),
+        LossMeter::new(LossReason::TrackFull),
     ];
-    let epoll = Epoll::new(&[tracer.ring.as_raw_fd(), signals.fd.as_raw_fd()])?;
+    let mut fds = vec![tracer.ring.as_raw_fd(), signals.fd.as_raw_fd()];
+    fds.extend(
+        follower
+            .as_deref()
+            .and_then(Follow::end)
+            .map(|fd| fd.as_raw_fd()),
+    );
+    let epoll = Epoll::new(&fds)?;
     if let Some(fd) = opts.ready_fd {
         signal_ready(fd).with_context(|| format!("writing to --ready-fd {fd}"))?;
     }
@@ -510,8 +689,14 @@ fn stream(
                 .unwrap_or(u64::MAX)
         });
         let ready = epoll.wait(i32::try_from(left.min(TICK_MS)).expect("at most TICK_MS"))?;
-        if ready.contains(&1) {
-            signals.drain();
+        if ready.contains(&SIGNALS) {
+            while let Some(signal) = signals.pop() {
+                if follower.as_deref_mut().is_none_or(|f| f.signal(signal)) {
+                    open = false;
+                }
+            }
+        }
+        if ready.contains(&END) || deadline.is_some_and(|d| Instant::now() >= d) {
             open = false;
         }
         if deadline.is_some_and(|d| Instant::now() >= d) {
@@ -576,6 +761,14 @@ fn stream(
             "fsblame: warning: the latest byte counts of {} open files were lost because the \
              kernel write table was full",
             result.lost.write_evicted
+        );
+    }
+    if result.lost.track_full > 0 {
+        eprintln!(
+            "fsblame: warning: {} new processes were not followed because {} processes were \
+             tracked; their changes are missing",
+            result.lost.track_full,
+            crate::tracer::TRACKED_MAX
         );
     }
     if result.malformed > 0 {

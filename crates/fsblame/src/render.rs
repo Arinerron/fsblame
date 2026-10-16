@@ -450,6 +450,10 @@ impl<W: Write> Human<W> {
                 "latest byte counts of {} lost (kernel write table full)",
                 counted(lost.count, "open file", "open files")
             ),
+            LossReason::TrackFull => format!(
+                "changes of {} lost (tracked-process table full)",
+                counted(lost.count, "new process", "new processes")
+            ),
         };
         writeln!(
             io::stderr().lock(),
@@ -545,6 +549,12 @@ impl<W: Write> Human<W> {
                 parts.push(format!(
                     "latest byte counts of {} (kernel write table full)",
                     counted(s.lost.write_evicted, "open file", "open files")
+                ));
+            }
+            if s.lost.track_full > 0 {
+                parts.push(format!(
+                    "changes of {} (tracked-process table full)",
+                    counted(s.lost.track_full, "new process", "new processes")
                 ));
             }
             writeln!(self.out, "  lost: {}", parts.join(", "))?;
@@ -788,7 +798,7 @@ mod tests {
             crate::report::Timestamp::from_unix_ns(0),
             crate::report::LossTotals {
                 ring_full: 3,
-                write_evicted: 0,
+                ..Default::default()
             },
         );
         let text = human(&Line::Summary(report), false);

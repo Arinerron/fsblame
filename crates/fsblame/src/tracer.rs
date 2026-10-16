@@ -4,7 +4,7 @@ use std::fmt;
 
 use aya::{
     Btf, BtfError, Ebpf, EbpfLoader, VerifierLogLevel,
-    maps::{Array, HashMap, MapData, PerCpuArray, RingBuf},
+    maps::{Array, HashMap, MapData, MapError, PerCpuArray, RingBuf},
     programs::{BtfTracePoint, FEntry, Program, ProgramError},
 };
 use fsblame_abi::{self as abi, DevFilter, RootKey, RootVal, WriteKey, WriteVal};
@@ -275,6 +275,19 @@ pub struct HookOutcome {
     pub result: Result<Option<u32>, LoadError>,
 }
 
+/// Most processes tracked at once (entries of the `tracked` map) when following processes.
+pub const TRACKED_MAX: u32 = 65_536;
+
+/// Whose changes the file hooks report.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Processes {
+    /// Every process but fsblame.
+    All,
+    /// The processes added with [`Tracer::track`] and every process they start once added
+    /// (the kernel adds those itself).
+    Tracked,
+}
+
 /// The loaded, attached tracer.
 pub struct Tracer {
     /// Keeps the programs and their links alive.
@@ -283,6 +296,7 @@ pub struct Tracer {
     pub ring: RingBuf<MapData>,
     /// Write coalescing totals.
     pub writes: HashMap<MapData, WriteKey, WriteVal>,
+    tracked: HashMap<MapData, u32, u8>,
     stats: PerCpuArray<MapData, u64>,
     /// Hooks that are unavailable on this kernel.
     pub missing: Vec<Missing>,
@@ -321,16 +335,20 @@ fn log_level() -> VerifierLogLevel {
 }
 
 /// The tracer object for `ops`, with its maps created (the `events` ring buffer of
-/// `ring_bytes`) and no program loaded yet.
+/// `ring_bytes`) and no program loaded yet. `scope` is the `SCOPE_*` of the roots; the
+/// `tracked` map has room only when following `processes`.
 fn open(
     btf: &Btf,
     ops: OpSet,
     dev_filter: &DevFilter,
     root_slots: u32,
     ring_bytes: u32,
+    scope: u32,
+    processes: Processes,
 ) -> Result<Ebpf, LoadError> {
     let self_tgid = std::process::id();
     let op_mask = ops.mask();
+    let track = u32::from(processes == Processes::Tracked);
     // security_inode_setattr gained a leading idmap in 6.0 and distributions backport it, so
     // its arity comes from the prototype, not the kernel version.
     let setattr_idmap = u32::from(
@@ -344,8 +362,11 @@ fn open(
         .override_global("self_tgid", &self_tgid, true)
         .override_global("op_mask", &op_mask, true)
         .override_global("dev_filter", dev_filter, true)
+        .override_global("scope", &scope, true)
+        .override_global("track", &track, true)
         .override_global("setattr_idmap", &setattr_idmap, true)
         .map_max_entries("roots", root_slots)
+        .map_max_entries("tracked", if track == 0 { 1 } else { TRACKED_MAX })
         .map_max_entries("events", ring_bytes)
         .load(fsblame_bpf::OBJECT)
         .map_err(|e| LoadError::new("loading the BPF object", e))
@@ -403,11 +424,19 @@ fn attach_tp(
 }
 
 /// Loads every optional program of the tracer (the fentry hooks and [`EXEC_CWD_HOOK`]),
-/// configured for watch roots on the devices of `dev_filter`, and reports how each fared.
-/// The programs detach when this returns.
+/// configured for watch roots on the devices of `dev_filter` and every process, and reports
+/// how each fared. The programs detach when this returns.
 pub fn probe_hooks(dev_filter: &DevFilter) -> Result<Vec<HookOutcome>, LoadError> {
     let btf = Btf::from_sys_fs().map_err(|e| LoadError::new("reading kernel BTF", e))?;
-    let mut ebpf = open(&btf, OpSet::new(&[]), dev_filter, 1, abi::RINGBUF_BYTES)?;
+    let mut ebpf = open(
+        &btf,
+        OpSet::new(&[]),
+        dev_filter,
+        1,
+        abi::RINGBUF_BYTES,
+        abi::SCOPE_ROOTS,
+        Processes::All,
+    )?;
     let mut outcomes: Vec<HookOutcome> = FS_HOOKS
         .iter()
         .map(|hook| HookOutcome {
@@ -427,38 +456,58 @@ pub fn probe_hooks(dev_filter: &DevFilter) -> Result<Vec<HookOutcome>, LoadError
     Ok(outcomes)
 }
 
+/// Fills the `roots` map of `ebpf` with `roots`, each under its id.
+fn fill_roots(ebpf: &mut Ebpf, roots: &Roots) -> Result<(), LoadError> {
+    let map = ebpf.map_mut("roots").ok_or_else(|| {
+        LoadError::new(
+            "finding map roots",
+            std::io::Error::other("not in the BPF object"),
+        )
+    })?;
+    let mut map: HashMap<_, RootKey, RootVal> =
+        HashMap::try_from(map).map_err(|e| LoadError::new("opening map roots", e))?;
+    for (id, root) in roots.iter() {
+        let key = RootKey {
+            dev: root.dev,
+            _pad: 0,
+            ino: root.ino,
+        };
+        let flags = if root.exclude { abi::ROOT_F_EXCLUDE } else { 0 };
+        map.insert(key, RootVal { id, flags }, 0)
+            .map_err(|e| LoadError::new(format!("adding {} to roots", root.path.display()), e))?;
+    }
+    Ok(())
+}
+
 impl Tracer {
-    /// Loads the tracer for `roots`, reporting `ops` through a ring buffer of `ring_bytes`
-    /// (a power of two and a multiple of the page size). The sched tracepoints are required;
-    /// an optional program (fentry hook, cwd capture) whose kernel function is missing or
-    /// unattachable is skipped and listed in [`missing`](Self::missing), unless no file hook
-    /// attaches at all.
-    pub fn load(roots: &Roots, ops: OpSet, ring_bytes: u32) -> Result<Self, LoadError> {
+    /// Loads the tracer for `roots`, reporting `ops` of `processes` through a ring buffer of
+    /// `ring_bytes` (a power of two and a multiple of the page size). The sched tracepoints
+    /// are required; an optional program (fentry hook, cwd capture) whose kernel function is
+    /// missing or unattachable is skipped and listed in [`missing`](Self::missing), unless no
+    /// file hook attaches at all.
+    pub fn load(
+        roots: &Roots,
+        ops: OpSet,
+        ring_bytes: u32,
+        processes: Processes,
+    ) -> Result<Self, LoadError> {
         let btf = Btf::from_sys_fs().map_err(|e| LoadError::new("reading kernel BTF", e))?;
         let root_slots = u32::try_from(roots.len()).unwrap_or(u32::MAX).max(1);
-        let mut ebpf = open(&btf, ops, &roots.dev_filter(), root_slots, ring_bytes)?;
-
-        {
-            let map = ebpf.map_mut("roots").ok_or_else(|| {
-                LoadError::new(
-                    "finding map roots",
-                    std::io::Error::other("not in the BPF object"),
-                )
-            })?;
-            let mut map: HashMap<_, RootKey, RootVal> =
-                HashMap::try_from(map).map_err(|e| LoadError::new("opening map roots", e))?;
-            for (id, root) in roots.iter() {
-                let key = RootKey {
-                    dev: root.dev,
-                    _pad: 0,
-                    ino: root.ino,
-                };
-                let flags = if root.exclude { abi::ROOT_F_EXCLUDE } else { 0 };
-                map.insert(key, RootVal { id, flags }, 0).map_err(|e| {
-                    LoadError::new(format!("adding {} to roots", root.path.display()), e)
-                })?;
-            }
-        }
+        let scope = match (roots.everywhere(), roots.len()) {
+            (false, _) => abi::SCOPE_ROOTS,
+            (true, 0) => abi::SCOPE_ALL,
+            (true, _) => abi::SCOPE_ALL_EXCLUDES,
+        };
+        let mut ebpf = open(
+            &btf,
+            ops,
+            &roots.dev_filter(),
+            root_slots,
+            ring_bytes,
+            scope,
+            processes,
+        )?;
+        fill_roots(&mut ebpf, roots)?;
 
         // on_exec reads what on_exec_cwd leaves on its CPU, and programs on one tracepoint run
         // in attach order: the cwd capture goes first.
@@ -532,22 +581,43 @@ impl Tracer {
             .map_err(|e| LoadError::new("opening map events", e))?;
         let writes = HashMap::try_from(take("writes")?)
             .map_err(|e| LoadError::new("opening map writes", e))?;
+        let tracked = HashMap::try_from(take("tracked")?)
+            .map_err(|e| LoadError::new("opening map tracked", e))?;
         let stats = PerCpuArray::try_from(take("stats")?)
             .map_err(|e| LoadError::new("opening map stats", e))?;
         Ok(Self {
             _ebpf: ebpf,
             ring,
             writes,
+            tracked,
             stats,
             missing,
             unavailable,
         })
     }
 
+    /// Adds process `pid` to the tracked set of a tracer loaded for
+    /// [`Processes::Tracked`]; from now on the kernel adds every process it starts. Fails
+    /// when [`TRACKED_MAX`] processes are tracked.
+    pub fn track(&mut self, pid: u32) -> Result<(), MapError> {
+        self.tracked.insert(pid, 1, 0)
+    }
+
+    /// The sum over all CPUs of a `stats` slot.
+    fn stat(&self, slot: u32) -> u64 {
+        self.stats
+            .get(&slot, 0)
+            .map_or(0, |per_cpu| per_cpu.iter().sum())
+    }
+
     /// Records the kernel could not put in the ring buffer because it was full.
     pub fn ring_drops(&self) -> u64 {
-        self.stats
-            .get(&abi::STAT_RING_DROPS, 0)
-            .map_or(0, |per_cpu| per_cpu.iter().sum())
+        self.stat(abi::STAT_RING_DROPS)
+    }
+
+    /// New processes of tracked ones that were left untracked because [`TRACKED_MAX`]
+    /// processes were tracked; their changes are not reported.
+    pub fn track_full(&self) -> u64 {
+        self.stat(abi::STAT_TRACK_FULL)
     }
 }

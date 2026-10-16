@@ -210,7 +210,7 @@ pub struct Lineage {
     pub origin: Option<Origin>,
 }
 
-/// One open file of one process, being coalesced.
+/// One open instance of a file in one process, as the kernel's `writes` map counts it.
 #[derive(Debug)]
 struct Binding {
     /// Kernel `first_ns`: tells this binding from a later one for the same key.
@@ -222,31 +222,83 @@ struct Binding {
     actor: Actor,
     /// Totals (bytes, calls) last read from the kernel.
     seen: (u64, u64),
-    /// Totals already reported.
-    reported: (u64, u64),
+    /// Totals already added to a [`Window`].
+    credited: (u64, u64),
     /// Latest write as last read from the kernel.
     last_ns: u64,
-    /// When the unreported window opened.
-    window_ns: u64,
     next_poll_ns: u64,
 }
 
 impl Binding {
-    fn delta(&self) -> Touch {
+    /// The window this binding's writes go to.
+    fn window_key(&self) -> WindowKey {
+        WindowKey {
+            tgid: self.actor.tgid,
+            start_ns: self.actor.start_ns,
+            file: self.file,
+        }
+    }
+}
+
+/// Identity of a write window: one process and one file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct WindowKey {
+    tgid: u32,
+    /// Start time of the process: a reused pid is another process.
+    start_ns: u64,
+    file: FileId,
+}
+
+/// Unreported writes of one process to one file, summed over every binding (open instance)
+/// that wrote it, so a process that opens, appends to and closes a file over and over reports
+/// one change, as one that keeps it open does.
+#[derive(Debug)]
+struct Window {
+    path: PathBuf,
+    truncated: bool,
+    mode: u32,
+    actor: Actor,
+    bytes: u64,
+    calls: u64,
+    /// When the window opened.
+    opened_ns: u64,
+    /// Latest write.
+    last_ns: u64,
+    /// When the window is next checked for quiet or hold, with its bindings refreshed.
+    next_poll_ns: u64,
+}
+
+impl Window {
+    /// An empty window for `binding`'s file, opened at `now`.
+    fn new(binding: &Binding, now: u64) -> Self {
+        Self {
+            path: binding.path.clone(),
+            truncated: binding.truncated,
+            mode: binding.mode,
+            actor: binding.actor.clone(),
+            bytes: 0,
+            calls: 0,
+            opened_ns: now,
+            last_ns: 0,
+            next_poll_ns: now + POLL_NS,
+        }
+    }
+
+    fn into_touch(self, file: FileId) -> Touch {
         Touch {
             ts_ns: self.last_ns,
             op: Op::Write,
-            path: self.path.clone(),
+            path: self.path,
             truncated: self.truncated,
             old_path: None,
             target: None,
-            file: self.file,
+            file,
             mode: self.mode,
             change: Change::Write {
-                bytes: self.seen.0.saturating_sub(self.reported.0),
-                calls: self.seen.1.saturating_sub(self.reported.1),
+                bytes: self.bytes,
+                calls: self.calls,
             },
-            actor: self.actor.clone(),
+            actor: self.actor,
         }
     }
 }
@@ -274,6 +326,8 @@ pub struct Engine<S> {
     sink: S,
     /// Keyed by (tgid, `struct file` address), as the kernel's `writes` map.
     bindings: HashMap<(u32, u64), Binding>,
+    /// Write windows not reported yet.
+    windows: HashMap<WindowKey, Window>,
     /// Scratch for the cwd of an exec record, reused across execs.
     cwd: Vec<u8>,
     last_expire_ns: u64,
@@ -311,6 +365,7 @@ impl<S: Sink> Engine<S> {
             filter,
             sink,
             bindings: HashMap::new(),
+            windows: HashMap::new(),
             cwd: Vec::new(),
             last_expire_ns: 0,
             counts: Counts::default(),
@@ -343,6 +398,10 @@ impl<S: Sink> Engine<S> {
                 Ok(())
             }
             Ok(Record::Exec(exec)) => {
+                // Report the writes of the image being replaced while the table still
+                // describes it: `sh -c 'echo x >> f; mkdir d'` execs mkdir in place, and its
+                // pending window for `f` would otherwise carry mkdir's comm and argv.
+                self.flush_process(exec.rec.tgid, exec.rec.hdr.ts_ns, totals)?;
                 self.on_exec(&exec);
                 Ok(())
             }
@@ -470,25 +529,23 @@ impl<S: Sink> Engine<S> {
                     // the totals since the last poll along.
                     self.counts.evicted += 1;
                 }
-                self.report_binding(&mut old)?;
+                self.credit(&mut old, r.hdr.ts_ns)?;
             }
             let now = r.hdr.ts_ns;
-            self.bindings.insert(
-                key,
-                Binding {
-                    first_ns: now,
-                    path,
-                    truncated,
-                    file,
-                    mode: r.mode,
-                    actor,
-                    seen: (r.bytes, 1),
-                    reported: (0, 0),
-                    last_ns: now,
-                    window_ns: now,
-                    next_poll_ns: now + POLL_NS,
-                },
-            );
+            let mut binding = Binding {
+                first_ns: now,
+                path,
+                truncated,
+                file,
+                mode: r.mode,
+                actor,
+                seen: (r.bytes, 1),
+                credited: (0, 0),
+                last_ns: now,
+                next_poll_ns: now + POLL_NS,
+            };
+            self.credit(&mut binding, now)?;
+            self.bindings.insert(key, binding);
             return Ok(());
         }
 
@@ -542,14 +599,40 @@ impl<S: Sink> Engine<S> {
 
     /// Reads kernel totals for the bindings due and reports finished write windows.
     pub fn poll(&mut self, now_ns: u64, totals: &mut impl Totals) -> io::Result<()> {
+        // A window due for a check has every binding feeding it refreshed first, so its
+        // latest write is current when quiet is judged.
         let due: Vec<(u32, u64)> = self
             .bindings
             .iter()
-            .filter(|(_, b)| b.next_poll_ns <= now_ns)
+            .filter(|(_, b)| {
+                b.next_poll_ns <= now_ns
+                    || self
+                        .windows
+                        .get(&b.window_key())
+                        .is_some_and(|w| w.next_poll_ns <= now_ns)
+            })
             .map(|(key, _)| *key)
             .collect();
         for key in due {
-            self.refresh(key, now_ns, totals, false)?;
+            self.refresh(key, now_ns, totals)?;
+        }
+        let due: Vec<WindowKey> = self
+            .windows
+            .iter()
+            .filter(|(_, w)| w.next_poll_ns <= now_ns)
+            .map(|(key, _)| *key)
+            .collect();
+        for key in due {
+            let Some(window) = self.windows.get_mut(&key) else {
+                continue;
+            };
+            let quiet = now_ns.saturating_sub(window.last_ns) >= QUIET_NS;
+            let held = now_ns.saturating_sub(window.opened_ns) >= HOLD_NS;
+            if quiet || held {
+                self.report_window(key)?;
+            } else {
+                window.next_poll_ns = now_ns + POLL_NS;
+            }
         }
         if now_ns.saturating_sub(self.last_expire_ns) >= EXPIRE_EVERY_NS {
             self.procs.expire(now_ns);
@@ -563,26 +646,38 @@ impl<S: Sink> Engine<S> {
         let now = clock::boot_now_ns();
         let keys: Vec<(u32, u64)> = self.bindings.keys().copied().collect();
         for key in keys {
-            self.refresh(key, now, totals, true)?;
+            self.refresh(key, now, totals)?;
         }
+        self.report_windows(|_| true)?;
         self.sink.flush()
+    }
+
+    /// The keys of process `tgid`'s bindings.
+    fn process_keys(&self, tgid: u32) -> Vec<(u32, u64)> {
+        self.bindings
+            .keys()
+            .filter(|k| k.0 == tgid)
+            .copied()
+            .collect()
+    }
+
+    /// Reports the pending write windows of process `tgid` as of `now`, keeping its bindings.
+    fn flush_process(&mut self, tgid: u32, now: u64, totals: &mut impl Totals) -> io::Result<()> {
+        for key in self.process_keys(tgid) {
+            self.refresh(key, now, totals)?;
+        }
+        self.report_windows(|key| key.tgid == tgid)
     }
 
     /// A process exited: report and forget its bindings.
     fn finish_process(&mut self, tgid: u32, totals: &mut impl Totals) -> io::Result<()> {
-        let keys: Vec<(u32, u64)> = self
-            .bindings
-            .keys()
-            .filter(|k| k.0 == tgid)
-            .copied()
-            .collect();
         let now = clock::boot_now_ns();
-        for key in keys {
-            self.refresh(key, now, totals, true)?;
+        for key in self.process_keys(tgid) {
+            self.refresh(key, now, totals)?;
             self.bindings.remove(&key);
             totals.remove(&write_key(key));
         }
-        Ok(())
+        self.report_windows(|key| key.tgid == tgid)
     }
 
     /// Reports pending writes to `file`.
@@ -598,36 +693,27 @@ impl<S: Sink> Engine<S> {
             .collect();
         let now = clock::boot_now_ns();
         for key in keys {
-            self.refresh(key, now, totals, true)?;
+            self.refresh(key, now, totals)?;
         }
-        Ok(())
+        self.report_windows(|key| key.file == file)
     }
 
-    /// Updates a binding from the kernel and reports its window when finished, quiet, held
-    /// long enough, or `force`d.
-    fn refresh(
-        &mut self,
-        key: (u32, u64),
-        now: u64,
-        totals: &mut impl Totals,
-        force: bool,
-    ) -> io::Result<()> {
+    /// Updates a binding from the kernel and adds its new writes to its window; `now` opens
+    /// the window if there is none.
+    fn refresh(&mut self, key: (u32, u64), now: u64, totals: &mut impl Totals) -> io::Result<()> {
         let Some(mut binding) = self.bindings.remove(&key) else {
             return Ok(());
         };
         let gone = match totals.get(&write_key(key)) {
             Some(v) if v.first_ns == binding.first_ns => {
                 if v.calls != binding.seen.1 {
-                    if binding.seen == binding.reported {
-                        binding.window_ns = now;
-                    }
                     binding.seen = (v.bytes, v.calls);
                     binding.last_ns = v.last_ns;
                 }
                 false
             }
             // Superseded by a newer binding for a reused struct file (its record follows):
-            // report what was seen of this one.
+            // what was seen of this one stays in its window.
             Some(_) => true,
             // Evicted from the LRU: the writes since the last poll are lost.
             None => {
@@ -635,11 +721,7 @@ impl<S: Sink> Engine<S> {
                 true
             }
         };
-        let quiet = now.saturating_sub(binding.last_ns) >= QUIET_NS;
-        let held = now.saturating_sub(binding.window_ns) >= HOLD_NS;
-        if force || gone || quiet || held {
-            self.report_binding(&mut binding)?;
-        }
+        self.credit(&mut binding, now)?;
         if !gone {
             let idle = now.saturating_sub(binding.last_ns) >= IDLE_NS;
             binding.next_poll_ns = now + if idle { IDLE_POLL_NS } else { POLL_NS };
@@ -648,13 +730,50 @@ impl<S: Sink> Engine<S> {
         Ok(())
     }
 
-    fn report_binding(&mut self, binding: &mut Binding) -> io::Result<()> {
-        if binding.seen.1 > binding.reported.1 {
-            let touch = binding.delta();
-            binding.reported = binding.seen;
-            self.emit(&touch)?;
+    /// Adds the writes of `binding` not yet credited to its window, opening one at `now` if
+    /// there is none. A pending window of the same file under another path (the inode number
+    /// was reused, or the file renamed) is reported first.
+    fn credit(&mut self, binding: &mut Binding, now: u64) -> io::Result<()> {
+        if binding.seen.1 <= binding.credited.1 {
+            return Ok(());
+        }
+        let (bytes, calls) = (
+            binding.seen.0.saturating_sub(binding.credited.0),
+            binding.seen.1 - binding.credited.1,
+        );
+        binding.credited = binding.seen;
+        let key = binding.window_key();
+        if self
+            .windows
+            .get(&key)
+            .is_some_and(|w| w.path != binding.path)
+        {
+            self.report_window(key)?;
+        }
+        let window = self
+            .windows
+            .entry(key)
+            .or_insert_with(|| Window::new(binding, now));
+        window.bytes += bytes;
+        window.calls += calls;
+        window.last_ns = window.last_ns.max(binding.last_ns);
+        Ok(())
+    }
+
+    /// Reports the pending windows whose key `which` selects.
+    fn report_windows(&mut self, which: impl Fn(&WindowKey) -> bool) -> io::Result<()> {
+        let keys: Vec<WindowKey> = self.windows.keys().copied().filter(which).collect();
+        for key in keys {
+            self.report_window(key)?;
         }
         Ok(())
+    }
+
+    fn report_window(&mut self, key: WindowKey) -> io::Result<()> {
+        match self.windows.remove(&key) {
+            Some(window) => self.emit(&window.into_touch(key.file)),
+            None => Ok(()),
+        }
     }
 
     /// Reports `touch` if the filter admits it. The lineage is resolved only for admitted
@@ -712,3 +831,7 @@ impl<S: Sink> Engine<S> {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "engine_tests.rs"]
+mod tests;

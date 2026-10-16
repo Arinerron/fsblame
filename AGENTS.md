@@ -134,7 +134,10 @@ of the mount point, confirmed by the `work` subdirectory overlayfs keeps. On thi
 `stat` inode numbers of merged-view files equal the kernel's `i_ino` with xino on, off and on a
 single filesystem (checked through `/proc/locks`); with layers on several filesystems and xino
 off, directory numbers are reassigned on every inode load and can equal a file's, so roots below
-such an overlay's root are held open and `fsblame.watchfs` warns.
+such an overlay's root are held open and `fsblame.watchfs` warns. Before Linux 6.9 overlayfs
+opened a layer's file under the overlay's path (`open_with_fake_path`, then a backing file), so a
+write through the overlay passed the write hook again with that file; `layer_file` (its inode is
+not its dentry's) makes `on_file_permission` and `report_mapped` skip it.
 
 ### Path reconstruction
 
@@ -244,9 +247,9 @@ runs its workload, sends SIGINT (sudo relays it) and asserts on the NDJSON:
 | g | npm lifecycle env → `origin.kind == "npm-lifecycle"`, package `demo`, phase `postinstall` |
 | h | unprivileged run → exit 4, stderr has `setcap cap_bpf,cap_perfmon+ep` |
 | i | copy to `~/.cache/fsblame-e2e/bin`, `setcap`, run as the user → write reported; caps removed after |
-| j | `doctor --json` → all 14 ops `available`, `probe.ops` pass, rename/link insns < 1,000,000 |
+| j | `doctor --json` → all 14 ops `available`, `probe.ops` pass (or warn only for hooks absent from BTF, such as `security_file_post_open` before 6.9), rename/link insns < 1,000,000 |
 | k | `--duration 2s` → exits 0 about 2 s after attaching |
-| l | overlay mounted in the work dir, the whole tree watched (merged view, upper layer, work dir): append to a cold lower file, chmod, rm, create + write, mkdir → each exactly once at its merged path, no create for the appended file, nothing under `upper/` or `work/` |
+| l | overlay mounted in the work dir, the whole tree watched (merged view, upper layer, work dir): append to a cold lower file, chmod, rm, create + write, mkdir → each exactly once at its merged path, nothing under `upper/` or `work/`, no create for the appended file (one allowed when `security_file_post_open` could not attach) |
 
 ## Known limitations (MVP)
 
@@ -257,7 +260,8 @@ runs its workload, sends SIGINT (sudo relays it) and asserts on the NDJSON:
   are watched through their merged view, but an overlay mounted in another mount namespace
   (rootless Podman) is not visible, so its upper layer is reported as a plain directory, and
   writes through a shared mapping of an overlay file made writable by `mprotect(2)` are not
-  seen (the hook gets the upper layer's file).
+  seen on any kernel (the hook gets the upper layer's file: a `layer_file` before 6.9, the
+  upper path from 6.9).
 - A path longer than `PATH_CAP` (1024 bytes) or `WALK_MAX` (64) components below its root is
   cut at the top and marked truncated.
 - An environment longer than 8 KiB loses its middle; variables set there (rare: tools append)

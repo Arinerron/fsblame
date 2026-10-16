@@ -1,0 +1,16 @@
+# /etc/default/fsblame: settings of fsblame-record.service.
+
+# Files and directories to record changes to, separated by spaces; a directory includes its
+# whole subtree. Paths with spaces are not supported here.
+FSBLAME_PATHS="/etc /usr/local"
+
+# Further `fsblame record` flags (see `fsblame record --help`), for example:
+#   --exclude PATH      ignore changes below PATH (repeatable)
+#   --op LIST           record only these operations, such as write,rename,unlink
+#   --ignore-comm LIST  never record changes by these thread names
+#   --max-size SIZE     start a new journal file at this size (default 64M)
+#   --keep N            keep this many journal files (default 8)
+#   --ring-size SIZE    kernel ring buffer size (default 16M)
+#   --summary           end each run with a summary line
+#   --quiet             no start banner or final count in the service log
+FSBLAME_ARGS=""

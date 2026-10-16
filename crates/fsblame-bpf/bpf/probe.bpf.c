@@ -24,6 +24,7 @@ u64 sink = 0;
 
 PROBE_FENTRY(security_file_permission)
 PROBE_FENTRY(rw_verify_area)
+PROBE_FENTRY(security_file_free)
 PROBE_FENTRY(security_mmap_file)
 PROBE_FENTRY(security_file_mprotect)
 PROBE_FENTRY(security_inode_create)

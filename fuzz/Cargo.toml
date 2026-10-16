@@ -1,0 +1,39 @@
+[package]
+name = "fsblame-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+fsblame = { path = "../crates/fsblame" }
+libfuzzer-sys = "0.4"
+serde_json = "1"
+
+# A workspace of its own: cargo-fuzz builds it with nightly and sanitizer flags, apart from the
+# main workspace (which lists `fuzz` in `exclude`).
+[workspace]
+
+[[bin]]
+name = "record_decode"
+path = "fuzz_targets/record_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "report_line"
+path = "fuzz_targets/report_line.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "glob_match"
+path = "fuzz_targets/glob_match.rs"
+test = false
+doc = false
+bench = false

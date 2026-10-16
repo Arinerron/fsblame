@@ -1,0 +1,77 @@
+# fsblame-record.service: record which processes change the watched paths, from boot on, so
+# `fsblame blame PATH` can answer for changes made while nobody was watching.
+#
+# Install (as root):
+#   install -m 0755 fsblame /usr/local/bin/fsblame
+#   install -m 0644 contrib/systemd/fsblame-record.service /etc/systemd/system/
+#   install -m 0644 contrib/systemd/fsblame.default /etc/default/fsblame
+#   $EDITOR /etc/default/fsblame          # set FSBLAME_PATHS (and FSBLAME_ARGS)
+#   systemctl daemon-reload
+#   systemctl enable --now fsblame-record.service
+#
+# Then: `sudo fsblame blame /etc/hosts`, `sudo fsblame blame --since 2h /etc`.
+# The journal is /var/lib/fsblame (root only: lines hold other users' command lines).
+# `fsblame doctor` explains a failure to start; `journalctl -u fsblame-record` shows it.
+
+[Unit]
+Description=fsblame: record which commands change watched files
+Documentation=man:fsblame-record(1) man:fsblame-blame(1)
+After=local-fs.target
+
+[Service]
+Type=exec
+EnvironmentFile=/etc/default/fsblame
+# $FSBLAME_ARGS and $FSBLAME_PATHS are split at whitespace into separate arguments.
+ExecStart=/usr/local/bin/fsblame record --journal ${STATE_DIRECTORY} $FSBLAME_ARGS $FSBLAME_PATHS
+# SIGTERM is a clean stop: fsblame drains the ring buffer and writes pending changes.
+TimeoutStopSec=10s
+Restart=on-failure
+RestartSec=5s
+# Usage errors (2), missing privileges (4) and an unsupported kernel (5) do not go away by
+# restarting.
+RestartPreventExitStatus=2 4 5
+
+StateDirectory=fsblame
+StateDirectoryMode=0700
+UMask=0077
+
+# Capabilities, all of them needed and nothing more (the service runs as root, uid 0):
+#   CAP_BPF              create the maps and load the programs.
+#   CAP_PERFMON          attach the fentry and tp_btf tracing programs and let them read
+#                        kernel memory.
+#   CAP_SYS_PTRACE       read /proc/<pid>/{cwd,exe,environ,cmdline} of other users' processes
+#                        for the lineage (ptrace access mode checks), also under hidepid=.
+#   CAP_DAC_READ_SEARCH  resolve watched paths inside other users' private directories
+#                        (such as a 0700 home) and read their processes' 0400 /proc files.
+# Memory for the maps is charged to the cgroup on Linux 5.11 and later; LimitMEMLOCK= covers
+# older kernels without CAP_SYS_RESOURCE.
+CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
+AmbientCapabilities=
+LimitMEMLOCK=infinity
+NoNewPrivileges=yes
+
+# Hardening that leaves BPF and what is watched intact. fsblame must see the host's
+# filesystems as they are: ProtectHome=, PrivateTmp= and PrivateDevices= would replace /home,
+# /tmp and /dev with private copies, so changes there would go unreported. ProtectSystem=strict
+# only remounts the same filesystems read-only (the kernel reports changes by inode, wherever
+# they are made), and BPF needs no device nodes or writable /sys.
+ProtectSystem=strict
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service bpf
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

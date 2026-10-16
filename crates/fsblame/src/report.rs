@@ -620,6 +620,9 @@ pub enum LossReason {
     /// The kernel's write table evicted bindings: the byte and call counts of their latest
     /// writes are missing.
     WriteEvicted,
+    /// The kernel's tracked-process table was full (`fsblame run`, `watch --tree`): new
+    /// processes of tracked ones were left untracked, and their changes are missing.
+    TrackFull,
 }
 
 /// Losses since the previous `lost` line of the same reason: `{"type":"lost",...}`.
@@ -631,7 +634,8 @@ pub struct LostReport {
     pub ts: Timestamp,
     /// What was lost.
     pub reason: LossReason,
-    /// Records ([`LossReason::RingFull`]) or write bindings ([`LossReason::WriteEvicted`]).
+    /// Records ([`LossReason::RingFull`]), write bindings ([`LossReason::WriteEvicted`]) or
+    /// processes ([`LossReason::TrackFull`]).
     pub count: u64,
 }
 
@@ -642,12 +646,15 @@ pub struct LossTotals {
     pub ring_full: u64,
     /// Write bindings evicted before their latest counts were read.
     pub write_evicted: u64,
+    /// Processes left untracked because the tracked-process table was full.
+    #[serde(default)]
+    pub track_full: u64,
 }
 
 impl LossTotals {
     /// Whether nothing was lost.
     pub fn is_empty(&self) -> bool {
-        self.ring_full == 0 && self.write_evicted == 0
+        self.ring_full == 0 && self.write_evicted == 0 && self.track_full == 0
     }
 }
 
@@ -996,6 +1003,7 @@ pub(crate) mod tests {
                 LossTotals {
                     ring_full: 12,
                     write_evicted: 1,
+                    track_full: 2,
                 },
             )),
         ];

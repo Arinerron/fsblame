@@ -82,12 +82,15 @@ struct qstr {
 
 struct super_block {
 	dev_t s_dev;
+	unsigned long s_flags;
+	unsigned long s_magic;
 };
 
 struct inode {
 	umode_t i_mode;
 	unsigned long i_ino;
 	struct super_block *i_sb;
+	__u32 i_generation;
 };
 
 struct dentry {

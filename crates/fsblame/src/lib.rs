@@ -4,8 +4,10 @@
 //! lineage of the process behind it. The binary is a thin wrapper around [`main`]; the modules
 //! are public for benchmarks and fuzzing.
 //!
-//! Exit codes: 0 clean stop, 2 usage, 4 privileges, 5 kernel unsupported, 6 runtime error.
+//! Exit codes: 0 clean stop, 2 usage, 4 privileges, 5 kernel unsupported, 6 runtime error;
+//! `run` exits with the command's status unless fsblame itself fails.
 
+pub mod blame;
 pub mod btf;
 pub mod cli;
 pub mod clock;
@@ -14,11 +16,13 @@ pub mod engine;
 pub mod fail;
 pub mod filter;
 pub mod glob;
+pub mod journal;
 pub mod ops;
 pub mod record;
 pub mod render;
 pub mod report;
 pub mod roots;
+pub mod run;
 pub mod tracer;
 pub mod watch;
 
@@ -40,7 +44,7 @@ use crate::{
 /// BPF object.
 static LONG_VERSION: LazyLock<String> = LazyLock::new(|| {
     format!(
-        "{}\nBPF ABI {:#018x}\nexit codes: 0 stopped cleanly, 2 usage, 4 privileges, 5 kernel unsupported, 6 runtime error",
+        "{}\nBPF ABI {:#018x}\nexit codes: 0 stopped cleanly, 2 usage, 4 privileges, 5 kernel unsupported, 6 runtime error; run: the command's status unless fsblame fails",
         env!("CARGO_PKG_VERSION"),
         fsblame_bpf::ABI_HASH
     )
@@ -105,13 +109,16 @@ pub fn main() -> ExitCode {
     init_log();
     let cli = parse_args();
     let result = match &cli.command {
-        Some(Command::Doctor(args)) => doctor::run(args),
-        Some(Command::Watch(args)) => watch::command(args),
-        Some(Command::Completions { shell }) => completions(*shell),
-        None => watch::command(&cli.watch),
+        Some(Command::Run(args)) => run::command(args),
+        Some(Command::Doctor(args)) => doctor::run(args).map(|()| ExitCode::SUCCESS),
+        Some(Command::Watch(args)) => watch::command(args).map(|()| ExitCode::SUCCESS),
+        Some(Command::Record(args)) => journal::command(args).map(|()| ExitCode::SUCCESS),
+        Some(Command::Blame(args)) => blame::command(args).map(|()| ExitCode::SUCCESS),
+        Some(Command::Completions { shell }) => completions(*shell).map(|()| ExitCode::SUCCESS),
+        None => watch::command(&cli.watch).map(|()| ExitCode::SUCCESS),
     };
     match result {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => code,
         Err(failure) => {
             eprintln!("fsblame: {failure}");
             failure.exit_code()

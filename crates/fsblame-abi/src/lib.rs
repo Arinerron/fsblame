@@ -177,7 +177,8 @@ wire::wire! {
         pub dev: u32,
         /// Always zero.
         pub _pad: u32,
-        /// Inode number of the file; a mismatch means the `struct file` was reused.
+        /// Inode number of the file; a mismatch means the `struct file` was reused for another
+        /// file.
         pub ino: u64,
         /// Bytes requested by all writes.
         pub bytes: u64,
@@ -249,13 +250,14 @@ wire::wire_consts! {
     pub const F_PATH_TRUNC: u32 = 1;
     /// `path2` was cut short.
     pub const F_PATH2_TRUNC: u32 = 2;
-    /// `OP_WRITE`: this binding replaced one for a reused `struct file`; `aux`/`aux2` carry the
-    /// old binding's final totals.
+    /// `OP_WRITE`: this binding replaced one from an earlier open instance of its `struct file`
+    /// (reused for another file, or another open of the same one); `aux`/`aux2` carry the old
+    /// binding's final totals.
     pub const F_REPLACED: u32 = 4;
     /// `OP_WRITE`: not a write call but a shared mapping of the file that became writable
     /// (`mmap(MAP_SHARED, PROT_WRITE)`, or `mprotect(PROT_WRITE)` of a shared read-only one);
     /// stores through it change the file without a write. `aux` says how (`MAP_VIA_*`).
-    /// Reported once per `(tgid, struct file)`, outside write coalescing.
+    /// Reported once per `(tgid, struct file)` open instance, outside write coalescing.
     pub const F_MAPPED: u32 = 8;
     /// argv was longer than `ARGV_CAP`.
     pub const F_ARGV_TRUNC: u32 = 16;
@@ -282,6 +284,15 @@ wire::wire_consts! {
     /// Root flag: excluded subtree; events below it are out of scope.
     pub const ROOT_F_EXCLUDE: u32 = 1;
 
+    /// `scope` (`.rodata`): the paths below a watch root in `roots` are in scope.
+    pub const SCOPE_ROOTS: u32 = 0;
+    /// `scope`: every path is in scope, relative to its filesystem root (`ROOT_FSROOT`),
+    /// except on pseudo and kernel-internal filesystems; `roots` is empty.
+    pub const SCOPE_ALL: u32 = 1;
+    /// `scope`: as `SCOPE_ALL`, except below the excludes in `roots`, which are on the
+    /// superblocks of the device filter.
+    pub const SCOPE_ALL_EXCLUDES: u32 = 2;
+
     /// Capacity of [`DevFilter::devs`].
     pub const MAX_DEVS: u32 = 16;
     /// Path bytes after which a dentry walk stops.
@@ -303,8 +314,11 @@ wire::wire_consts! {
 
     /// `stats` slot: records lost because the ring buffer was full.
     pub const STAT_RING_DROPS: u32 = 0;
+    /// `stats` slot: new processes of tracked ones left untracked because the `tracked` map
+    /// was full; their changes are not reported.
+    pub const STAT_TRACK_FULL: u32 = 1;
     /// Number of `stats` slots.
-    pub const STAT_COUNT: u32 = 1;
+    pub const STAT_COUNT: u32 = 2;
 }
 
 #[cfg(feature = "user")]

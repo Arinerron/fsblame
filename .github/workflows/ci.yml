@@ -88,6 +88,33 @@ jobs:
           qemu-aarch64 "$bin" --version
           qemu-aarch64 "$bin" completions bash > /dev/null
 
+  fuzz:
+    name: fuzz record decoding, report lines and globs
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: fsblame
+          submodules: true
+      - uses: ./fsblame/.github/actions/setup
+      - name: Install nightly and cargo-fuzz
+        run: |
+          rustup toolchain install nightly --profile minimal
+          cargo install cargo-fuzz --locked
+      - name: Fuzz each target for 60 s
+        working-directory: fsblame/fuzz
+        run: |
+          for target in $(cargo +nightly fuzz list); do
+            cargo +nightly fuzz run "$target" -- -max_total_time=60
+          done
+      - name: Upload crashing inputs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: fsblame/fuzz/artifacts
+          retention-days: 14
+
   e2e:
     name: end-to-end suite on ${{ matrix.kernel }} (virtme-ng VM)
     needs: build-test

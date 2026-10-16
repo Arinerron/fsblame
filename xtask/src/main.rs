@@ -11,11 +11,17 @@
 //! `cargo xtask man [DIR]` writes `fsblame.1` and one page per subcommand to DIR (default
 //! `$CARGO_TARGET_DIR/man`, else `target/man`), from the binary's own clap definition.
 
+mod bench;
+
 /// The binary's CLI, compiled in from its source so the man pages cannot drift from it. It
-/// needs only clap and `ops`; including the sources avoids building the BPF object.
+/// needs only clap, `clock`, `glob` and `ops`; including the sources avoids building the BPF object.
 #[path = "../../crates/fsblame/src/cli.rs"]
 #[allow(dead_code)]
 mod cli;
+/// The RFC 3339 parser `cli` uses for `blame --since`/`--until`.
+#[path = "../../crates/fsblame/src/clock.rs"]
+#[allow(dead_code)]
+mod clock;
 /// The glob patterns `cli` takes for `--include`.
 #[path = "../../crates/fsblame/src/glob.rs"]
 #[allow(dead_code)]
@@ -53,21 +59,29 @@ const MAX_RUN: &str = "120s";
 const VERIFIER_LIMIT: u64 = 1_000_000;
 
 const USAGE: &str = "usage: cargo xtask test-e2e [--bin PATH] [--only ID,...]
+       cargo xtask bench [--bin PATH] [--quick] [--json]
        cargo xtask man [DIR]
 
   test-e2e       run the end-to-end scenarios against the running kernel
     --bin PATH   test this fsblame binary instead of building the release one
     --only IDS   run only these scenarios (comma-separated ids, see below)
+  bench          measure what watching costs: workloads timed without and with fsblame
+    --bin PATH   measure this fsblame binary instead of building the release one
+    --quick      one run per workload instead of the median of three, fewer operations
+    --json       print one JSON object instead of the table
   man            write the man pages to DIR (default $CARGO_TARGET_DIR/man, else target/man)
 
 test-e2e runs as your normal user; each scenario calls `sudo -n` itself. Its work directory is
-$FSBLAME_E2E_DIR (default ~/.cache/fsblame-e2e), on a disk filesystem without nosuid.";
+$FSBLAME_E2E_DIR (default ~/.cache/fsblame-e2e), on a disk filesystem without nosuid. bench
+likewise starts fsblame with `sudo -n`; its work directory is $FSBLAME_BENCH_DIR (default
+~/.cache/fsblame-bench).";
 
 fn main() {
     let args: Vec<OsString> = env::args_os().skip(1).collect();
     let result = match args.first().and_then(|a| a.to_str()) {
         Some("test-e2e") => test_e2e(&args[1..]),
         Some("man") => man(&args[1..]),
+        Some("bench") => bench::bench(&args[1..]),
         Some("-h" | "--help") | None => {
             println!("{USAGE}");
             print_scenarios();
@@ -305,7 +319,7 @@ fn check_work_fs(dir: &Path) -> Result<()> {
     let st = unsafe { st.assume_init() };
     ensure!(
         st.f_type != TMPFS_MAGIC,
-        "{} is on tmpfs; the e2e work dir must be on a disk filesystem",
+        "{} is on tmpfs; the work dir must be on a disk filesystem",
         dir.display()
     );
     let mut vfs = std::mem::MaybeUninit::<libc::statvfs>::uninit();
@@ -862,8 +876,24 @@ fn doctor_ops(ctx: &Ctx) -> Result<String> {
         .as_array()
         .and_then(|checks| checks.iter().find(|c| c["id"] == "probe.ops"))
         .context("no probe.ops check")?;
+    // With every op available, probe.ops may still warn about a supplementing hook this
+    // kernel lacks (security_file_post_open is Linux 6.9); any other cause fails.
+    let observed = check["observed"].as_str().unwrap_or_default();
+    let unavailable: Vec<&str> = ops::FS_HOOKS
+        .iter()
+        .map(|hook| hook.function)
+        .filter(|function| observed.contains(function))
+        .collect();
+    let btf = fs::read("/sys/kernel/btf/vmlinux").context("reading /sys/kernel/btf/vmlinux")?;
+    let in_btf = |function: &str| {
+        let name = [b"\0", function.as_bytes(), b"\0"].concat();
+        btf.windows(name.len()).any(|w| w == name)
+    };
     ensure!(
-        check["status"] == "pass",
+        check["status"] == "pass"
+            || (check["status"] == "warn"
+                && !unavailable.is_empty()
+                && unavailable.iter().all(|function| !in_btf(function))),
         "probe.ops is {}: {}",
         check["status"],
         check["observed"]
@@ -965,19 +995,32 @@ fn overlay(ctx: &Ctx) -> Result<String> {
 
     // The watched tree holds the merged view, the upper layer and the work directory. The
     // lower files were never looked up through the overlay: the append copies one up from a
-    // cold dentry cache, which must not show as a create.
+    // cold dentry cache, which shows as a create only where fsblame cannot confirm creates
+    // (no security_file_post_open before Linux 6.9).
     let watcher = ctx.watch(&[&base])?;
     sh(
         &merged,
         "echo more >> append.txt && chmod 600 mode.txt && rm gone.txt && echo new > new.txt \
          && mkdir newdir",
     )?;
-    let touches: Vec<Value> = watcher
-        .stop()?
+    let done = watcher.stop()?;
+    // fsblame warns naming each hook it could not attach.
+    let confirmed = !done.stderr.contains("security_file_post_open");
+    let touches: Vec<Value> = done
         .touches()?
         .into_iter()
         .filter(|t| t["type"] == "touch")
         .collect();
+    let append = text(&merged.join("append.txt"));
+    let phantom = touches
+        .iter()
+        .filter(|t| t["op"] == "create" && t["path"] == append.as_str())
+        .count();
+    ensure!(
+        phantom == 0 || (!confirmed && phantom == 1),
+        "{phantom} create touches for {append}, which existed; {}",
+        summary(&touches)
+    );
     let expected = [
         ("write", "append.txt"),
         ("chmod", "mode.txt"),
@@ -999,10 +1042,16 @@ fn overlay(ctx: &Ctx) -> Result<String> {
         );
     }
     ensure!(
-        touches.len() == expected.len(),
+        touches.len() == expected.len() + phantom,
         "only the {} changes made through the overlay were expected; {}",
         expected.len(),
         summary(&touches)
     );
-    Ok("each change once, at its merged path; no copy-up or upper-layer touches".to_owned())
+    Ok(if confirmed {
+        "each change once, at its merged path; no copy-up or upper-layer touches".to_owned()
+    } else {
+        "each change once, at its merged path; no copy-up or upper-layer touches (creates are \
+         not confirmed here: no security_file_post_open)"
+            .to_owned()
+    })
 }

@@ -2,8 +2,8 @@
 resolver = "3"
 members = ["crates/fsblame-abi", "crates/fsblame-bpf", "crates/fsblame", "xtask"]
 default-members = ["crates/fsblame-abi", "crates/fsblame-bpf", "crates/fsblame"]
-# The tracekit submodule is its own workspace.
-exclude = ["tracekit"]
+# The tracekit submodule is its own workspace, and so is the cargo-fuzz crate (nightly only).
+exclude = ["tracekit", "fuzz"]
 
 [workspace.package]
 version = "0.1.0"

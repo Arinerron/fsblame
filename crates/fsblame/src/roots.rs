@@ -444,6 +444,8 @@ fn watched(roots: &[Root], path: &Path) -> bool {
 pub struct Roots {
     entries: Vec<Root>,
     mounts: Vec<Mount>,
+    /// No watch paths were given: every filesystem is watched, and the entries are excludes.
+    everywhere: bool,
     /// Roots on overlays without unique inode numbers, held open so that overlayfs keeps
     /// their inode, and its number, loaded (see the module docs).
     _pins: Vec<File>,
@@ -452,8 +454,11 @@ pub struct Roots {
 impl Roots {
     /// Resolves the watch and exclude paths, adding every mount below a watch root (the
     /// kernel's `d_parent` walk does not cross mounts) and applying the overlay rules of the
-    /// module docs. Fails on paths that do not exist.
+    /// module docs. Without watch paths every filesystem is watched (`fsblame run`): the
+    /// roots are the excludes and the upper layer and work directory of every overlay, whose
+    /// changes are reported through its merged view. Fails on paths that do not exist.
     pub fn resolve(watch: &[PathBuf], exclude: &[PathBuf]) -> anyhow::Result<Self> {
+        let everywhere = watch.is_empty();
         let mounts = mounts().context("reading /proc/self/mountinfo")?;
         let overlays = overlays(&mounts);
         let mut roots: Vec<Root> = Vec::new();
@@ -517,16 +522,22 @@ impl Roots {
         }
         roots.extend(nested);
         for overlay in &overlays {
-            cover_overlay(&mut roots, &mut seen, overlay, &mounts);
+            cover_overlay(&mut roots, &mut seen, overlay, &mounts, everywhere);
         }
-        if !roots.iter().any(|r| !r.exclude) {
+        if !everywhere && !roots.iter().any(|r| !r.exclude) {
             return Err(anyhow!("every watch path is also excluded"));
         }
         Ok(Self {
             entries: roots,
             mounts,
+            everywhere,
             _pins: pins,
         })
+    }
+
+    /// Whether every filesystem is watched (no watch paths): the roots are all excludes.
+    pub fn everywhere(&self) -> bool {
+        self.everywhere
     }
 
     /// Number of roots.
@@ -534,17 +545,31 @@ impl Roots {
         self.entries.len()
     }
 
+    /// Roots made of `entries` alone, with no mounts (sides outside every root map to
+    /// `<dev …>` paths), for tests of code that rebuilds paths.
+    #[cfg(test)]
+    pub(crate) fn from_entries(entries: Vec<Root>) -> Self {
+        Self {
+            entries,
+            mounts: Vec::new(),
+            everywhere: false,
+            _pins: Vec::new(),
+        }
+    }
+
     /// Roots with their ids.
     pub fn iter(&self) -> impl Iterator<Item = (u32, &Root)> {
         (0u32..).zip(&self.entries)
     }
 
-    /// The `.rodata` device prefilter: every superblock holding a watch root.
+    /// The `.rodata` device prefilter: every superblock where the kernel's scope walk can
+    /// meet a root that decides, which is a watch root, or an exclude when watching
+    /// [`everywhere`](Self::everywhere).
     pub fn dev_filter(&self) -> DevFilter {
         let mut devs: Vec<u32> = self
             .entries
             .iter()
-            .filter(|r| !r.exclude)
+            .filter(|r| self.everywhere || !r.exclude)
             .map(|r| r.dev)
             .collect();
         devs.sort_unstable();
@@ -601,17 +626,18 @@ impl Roots {
 /// Applies the overlay rules of the module docs to one overlay, after the given roots and
 /// the nested mounts: a watched upper layer brings the merged view into scope, and the
 /// upper layer and work directory are excluded once the merged view has a root or either of
-/// them is watched.
+/// them is watched, or when watching `everywhere` (where the merged view is in scope anyway).
 fn cover_overlay(
     roots: &mut Vec<Root>,
     seen: &mut HashSet<(u32, u64)>,
     overlay: &Overlay,
     mounts: &[Mount],
+    everywhere: bool,
 ) {
     let Some(writable) = &overlay.writable else {
         return;
     };
-    let upper_watched = watched(roots, &writable.upper.path);
+    let upper_watched = !everywhere && watched(roots, &writable.upper.path);
     if upper_watched
         && let Some(point) = &overlay.point
         && let Ok((mount, ino)) = locate(point, mounts)
@@ -627,7 +653,8 @@ fn cover_overlay(
             fstype: mount.fstype.clone(),
         });
     }
-    if upper_watched
+    if everywhere
+        || upper_watched
         || watched(roots, &writable.work.path)
         || roots.iter().any(|r| r.dev == overlay.dev)
     {
@@ -669,6 +696,7 @@ mod tests {
                 fstype: "ext4".into(),
             }],
             mounts: parse_mountinfo(MOUNTINFO),
+            everywhere: false,
             _pins: Vec::new(),
         }
     }
@@ -795,6 +823,60 @@ mod tests {
         assert_eq!(merged("/u/etc/x"), Some(PathBuf::from("/merged/etc/x")));
         assert_eq!(merged("/uv/a"), None);
         assert_eq!(merged("/w/work"), None);
+    }
+
+    #[test]
+    fn everywhere_excludes_overlay_layers_and_filters_exclude_devices() {
+        let layer = |path: &str, ino| Layer {
+            path: PathBuf::from(path),
+            dev: kernel_dev(259, 2),
+            ino,
+            fstype: "ext4".into(),
+        };
+        let overlay = Overlay {
+            dev: kernel_dev(0, 52),
+            point: Some(PathBuf::from("/merged")),
+            upperdir: Some(PathBuf::from("/u")),
+            writable: Some(Writable {
+                upper: layer("/u", 2),
+                work: layer("/w", 3),
+                base: PathBuf::from("/"),
+            }),
+            super_opts: String::new(),
+        };
+        let excluded = Root {
+            dev: kernel_dev(0, 35),
+            ino: 9,
+            ..root("/tmp/cache", true)
+        };
+        let mut entries = vec![excluded];
+        let mut seen = HashSet::from([(kernel_dev(0, 35), 9)]);
+        let mounts = parse_mountinfo(MOUNTINFO);
+        cover_overlay(&mut entries, &mut seen, &overlay, &mounts, true);
+        // The merged view is in scope as part of everything; its layers never are.
+        let paths: Vec<(&Path, bool)> = entries
+            .iter()
+            .map(|r| (r.path.as_path(), r.exclude))
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                (Path::new("/tmp/cache"), true),
+                (Path::new("/u"), true),
+                (Path::new("/w"), true),
+            ]
+        );
+        let roots = Roots {
+            entries,
+            mounts,
+            everywhere: true,
+            _pins: Vec::new(),
+        };
+        let filter = roots.dev_filter();
+        assert_eq!(
+            &filter.devs[..filter.count as usize],
+            [kernel_dev(0, 35), kernel_dev(259, 2)]
+        );
     }
 
     #[test]

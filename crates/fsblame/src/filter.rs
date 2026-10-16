@@ -5,7 +5,7 @@
 
 use std::path::Path;
 
-use crate::glob::Glob;
+use crate::{cli::FilterArgs, glob::Glob};
 
 /// Bytes of a thread name the kernel keeps (`TASK_COMM_LEN` minus the NUL).
 const COMM_MAX: usize = 15;
@@ -28,6 +28,21 @@ pub struct FilterSpec {
     pub unit: Vec<String>,
     /// Report a change if the actor's process id (tgid) is one of these.
     pub pid: Vec<u32>,
+}
+
+impl From<&FilterArgs> for FilterSpec {
+    /// The criteria of the filter flags. `--op` is not among them: watching selects the
+    /// hooks to attach by it.
+    fn from(args: &FilterArgs) -> Self {
+        Self {
+            include: args.include.clone(),
+            comm: args.comm.clone(),
+            ignore_comm: args.ignore_comm.clone(),
+            uid: args.uid.clone(),
+            unit: args.unit.clone(),
+            pid: args.pid.clone(),
+        }
+    }
 }
 
 /// A compiled [`FilterSpec`].
