@@ -1,18 +1,15 @@
 //! Command-line interface.
+//!
+//! Depends only on clap and [`crate::ops`]: `cargo xtask man` compiles this file into the
+//! xtask binary to render the man pages, without building the BPF object. The `--version`
+//! text with the BPF ABI hash is added at run time by the binary's entry point.
 
-use std::{path::PathBuf, sync::LazyLock, time::Duration};
+use std::{path::PathBuf, time::Duration};
 
 use clap::{Args, Parser, Subcommand};
+use clap_complete::Shell;
 
 use crate::ops::Op;
-
-static LONG_VERSION: LazyLock<String> = LazyLock::new(|| {
-    format!(
-        "{}\nBPF ABI {:#018x}\nexit codes: 0 stopped cleanly, 2 usage, 4 privileges, 5 kernel unsupported, 6 runtime error",
-        env!("CARGO_PKG_VERSION"),
-        fsblame_bpf::ABI_HASH
-    )
-});
 
 /// Which command changed this file? Watches files and directory trees and prints every
 /// modifying operation with the full lineage of the process that made it.
@@ -20,7 +17,6 @@ static LONG_VERSION: LazyLock<String> = LazyLock::new(|| {
 #[command(
     name = "fsblame",
     version,
-    long_version = LONG_VERSION.as_str(),
     args_conflicts_with_subcommands = true,
     subcommand_negates_reqs = true,
     arg_required_else_help = true
@@ -41,6 +37,11 @@ pub enum Command {
     Watch(WatchArgs),
     /// Check whether this system can run fsblame, and how to fix it if not.
     Doctor(DoctorArgs),
+    /// Print a shell completion script to stdout.
+    Completions {
+        /// The shell to generate for.
+        shell: Shell,
+    },
 }
 
 /// `fsblame watch`.
@@ -142,5 +143,17 @@ mod tests {
         assert!(Cli::try_parse_from(["fsblame", "doctor"]).is_ok());
         assert!(Cli::try_parse_from(["fsblame", "watch"]).is_err());
         assert!(Cli::try_parse_from(["fsblame", "watch", "a", "--op", "chmode"]).is_err());
+
+        let cli = Cli::try_parse_from(["fsblame", "completions", "zsh"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Completions { shell: Shell::Zsh })
+        ));
+        assert!(Cli::try_parse_from(["fsblame", "completions", "tcsh"]).is_err());
+        let cli = Cli::try_parse_from(["fsblame", "watch", "completions"]).unwrap();
+        let Some(Command::Watch(args)) = cli.command else {
+            panic!("not watch");
+        };
+        assert_eq!(args.paths, [PathBuf::from("completions")]);
     }
 }

@@ -151,6 +151,8 @@ fn kind_label(kind: OriginKind) -> &'static str {
         OriginKind::CargoBuildScript => "cargo build script",
         OriginKind::PipBuild => "pip build",
         OriginKind::Make => "make",
+        // procctx may learn new kinds; label them generically until fsblame names them.
+        _ => "build step",
     }
 }
 
@@ -163,6 +165,7 @@ fn kind_id(kind: OriginKind) -> &'static str {
         OriginKind::CargoBuildScript => "cargo-build-script",
         OriginKind::PipBuild => "pip-build",
         OriginKind::Make => "make",
+        _ => "other",
     }
 }
 
@@ -171,6 +174,7 @@ fn confidence_id(confidence: Confidence) -> &'static str {
         Confidence::High => "high",
         Confidence::Medium => "medium",
         Confidence::Low => "low",
+        _ => "unknown",
     }
 }
 
@@ -204,6 +208,7 @@ impl<W: Write> Human<W> {
                 let plural = if calls == 1 { "" } else { "s" };
                 format!("(+{}, {calls} write{plural})", format_bytes(bytes))
             }
+            Change::Mapped { via } => format!("(mapped shared-writable via {})", via.name()),
             Change::Mode(mode) => format!("({} → {})", perms(touch.mode), perms(mode)),
             Change::Owner { uid, gid } => {
                 let parts: Vec<String> = [
@@ -414,6 +419,8 @@ struct ChangeJson {
     noreplace: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     replaced: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mapped: Option<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -450,6 +457,8 @@ struct TouchJson<'a> {
     file: FileJson,
     change: Option<ChangeJson>,
     tid: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ns_pid: Option<u32>,
     proc: ProcJson,
     ancestry: &'a [ProcJson],
     ancestry_complete: bool,
@@ -512,6 +521,7 @@ fn change_json(touch: &Touch) -> Option<ChangeJson> {
             c.replaced = Some(replaced);
         }
         Change::Node(rdev) => c.rdev = Some(dev_string(rdev)),
+        Change::Mapped { via } => c.mapped = Some(via.name()),
     }
     Some(c)
 }
@@ -561,6 +571,7 @@ impl<W: Write> Sink for Json<W> {
             },
             change: change_json(touch),
             tid: touch.actor.tid,
+            ns_pid: touch.actor.ns_tgid,
             proc,
             ancestry: &ancestry,
             ancestry_complete: lineage.complete,

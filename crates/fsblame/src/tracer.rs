@@ -11,7 +11,7 @@ use fsblame_abi::{self as abi, DevFilter, RootKey, RootVal, WriteKey, WriteVal};
 
 use crate::{
     fail::errno_of,
-    ops::{FS_HOOKS, Hook, Op, OpSet, SCHED_HOOKS},
+    ops::{EXEC_CWD_HOOK, FS_HOOKS, Hook, Op, OpSet, Role, SCHED_HOOKS},
     roots::Roots,
 };
 
@@ -191,9 +191,9 @@ impl LoadError {
     }
 
     /// One line on why `hook` is unusable, distinguishing the verifier's complexity limit, a
-    /// missing hook and a refusal.
+    /// missing hook and a refusal; for a hook that supplements another, also what is lost.
     pub fn describe(&self, hook: &Hook) -> String {
-        match self.cause() {
+        let why = match self.cause() {
             Cause::TooComplex { insns, limit } => {
                 let limit = grouped(limit.unwrap_or(VERIFIER_INSN_LIMIT));
                 match insns {
@@ -228,6 +228,10 @@ impl LoadError {
                     .unwrap_or("no verdict logged")
             ),
             Cause::Other => format!("{}: {:#}", self.what, self.source),
+        };
+        match hook.role {
+            Role::Reports => why,
+            Role::Supplements(lost) => format!("{why}; {lost}"),
         }
     }
 }
@@ -249,7 +253,8 @@ impl fmt::Display for LoadError {
 
 impl std::error::Error for LoadError {}
 
-/// An fentry hook that could not be attached; its ops are not reported.
+/// An optional program that could not be attached: its ops are not reported, or for a
+/// supplementing one, what it adds is lost.
 #[derive(Debug)]
 pub struct Missing {
     /// The hook.
@@ -258,7 +263,7 @@ pub struct Missing {
     pub error: LoadError,
 }
 
-/// Outcome of loading and attaching one fentry hook of the tracer.
+/// Outcome of loading and attaching one optional program of the tracer.
 #[derive(Debug)]
 pub struct HookOutcome {
     /// The hook.
@@ -327,7 +332,16 @@ fn open(btf: &Btf, ops: OpSet, dev_filter: &DevFilter, root_slots: u32) -> Resul
         .map_err(|e| LoadError::new("loading the BPF object", e))
 }
 
-/// Loads and attaches `hook`; returns the instructions the verifier processed.
+/// Logs how many instructions the verifier processed for `program` on `target`.
+fn log_insns(program: &str, target: &str, insns: Option<u32>) {
+    log::debug!(
+        "{program} on {target}: {} verifier insns",
+        insns.map_or_else(|| "?".to_owned(), |n| grouped(n.into()))
+    );
+}
+
+/// Loads and attaches the fentry program of `hook`; returns the instructions the verifier
+/// processed.
 fn attach_fentry(ebpf: &mut Ebpf, btf: &Btf, hook: &Hook) -> Result<Option<u32>, LoadError> {
     let what = |step: &str| format!("{step} {} on {}", hook.program, hook.function);
     let prog: &mut FEntry = program(ebpf, hook.program)?
@@ -341,33 +355,64 @@ fn attach_fentry(ebpf: &mut Ebpf, btf: &Btf, hook: &Hook) -> Result<Option<u32>,
         .and_then(|info| info.verified_instruction_count());
     prog.attach()
         .map_err(|e| LoadError::new(what("attaching"), e))?;
-    log::debug!(
-        "{} on {}: {} verifier insns",
-        hook.program,
-        hook.function,
-        insns.map_or_else(|| "?".to_owned(), |n| grouped(n.into()))
-    );
+    log_insns(hook.program, hook.function, insns);
     Ok(insns)
 }
 
-/// Loads every fentry hook of the tracer, configured for watch roots on the devices of
-/// `dev_filter`, and reports how each fared. The programs detach when this returns.
+/// Loads and attaches the `tp_btf` program `name` to `tracepoint`; returns the instructions
+/// the verifier processed.
+fn attach_tp(
+    ebpf: &mut Ebpf,
+    btf: &Btf,
+    name: &str,
+    tracepoint: &str,
+) -> Result<Option<u32>, LoadError> {
+    let what = |step: &str| format!("{step} {name} on tp_btf/{tracepoint}");
+    let prog: &mut BtfTracePoint = program(ebpf, name)?
+        .try_into()
+        .map_err(|e| LoadError::new(what("typing"), e))?;
+    prog.load(tracepoint, btf)
+        .map_err(|e| LoadError::new(what("loading"), e))?;
+    let insns = prog
+        .info()
+        .ok()
+        .and_then(|info| info.verified_instruction_count());
+    prog.attach()
+        .map_err(|e| LoadError::new(what("attaching"), e))?;
+    log_insns(name, tracepoint, insns);
+    Ok(insns)
+}
+
+/// Loads every optional program of the tracer (the fentry hooks and [`EXEC_CWD_HOOK`]),
+/// configured for watch roots on the devices of `dev_filter`, and reports how each fared.
+/// The programs detach when this returns.
 pub fn probe_hooks(dev_filter: &DevFilter) -> Result<Vec<HookOutcome>, LoadError> {
     let btf = Btf::from_sys_fs().map_err(|e| LoadError::new("reading kernel BTF", e))?;
     let mut ebpf = open(&btf, OpSet::new(&[]), dev_filter, 1)?;
-    Ok(FS_HOOKS
+    let mut outcomes: Vec<HookOutcome> = FS_HOOKS
         .iter()
         .map(|hook| HookOutcome {
             hook: *hook,
             result: attach_fentry(&mut ebpf, &btf, hook),
         })
-        .collect())
+        .collect();
+    outcomes.push(HookOutcome {
+        hook: EXEC_CWD_HOOK,
+        result: attach_tp(
+            &mut ebpf,
+            &btf,
+            EXEC_CWD_HOOK.program,
+            EXEC_CWD_HOOK.function,
+        ),
+    });
+    Ok(outcomes)
 }
 
 impl Tracer {
     /// Loads the tracer for `roots`, reporting `ops`. The sched tracepoints are required;
-    /// an fentry hook whose kernel function is missing or unattachable is skipped and
-    /// listed in [`missing`](Self::missing), unless no file hook attaches at all.
+    /// an optional program (fentry hook, cwd capture) whose kernel function is missing or
+    /// unattachable is skipped and listed in [`missing`](Self::missing), unless no file hook
+    /// attaches at all.
     pub fn load(roots: &Roots, ops: OpSet) -> Result<Self, LoadError> {
         let btf = Btf::from_sys_fs().map_err(|e| LoadError::new("reading kernel BTF", e))?;
         let root_slots = u32::try_from(roots.len()).unwrap_or(u32::MAX).max(1);
@@ -395,19 +440,28 @@ impl Tracer {
             }
         }
 
-        // Process tracking first, so lineage is complete before the first file event.
+        // on_exec reads what on_exec_cwd leaves on its CPU, and programs on one tracepoint run
+        // in attach order: the cwd capture goes first.
+        let mut missing = Vec::new();
+        match attach_tp(
+            &mut ebpf,
+            &btf,
+            EXEC_CWD_HOOK.program,
+            EXEC_CWD_HOOK.function,
+        ) {
+            Ok(_) => {}
+            Err(error) if error.class() == Class::Unsupported => missing.push(Missing {
+                hook: EXEC_CWD_HOOK,
+                error,
+            }),
+            Err(error) => return Err(error),
+        }
+        // Process tracking before file hooks, so lineage is complete before the first file
+        // event.
         for (name, tracepoint) in SCHED_HOOKS {
-            let what = |step: &str| format!("{step} {name} on tp_btf/{tracepoint}");
-            let prog: &mut BtfTracePoint = program(&mut ebpf, name)?
-                .try_into()
-                .map_err(|e| LoadError::new(what("typing"), e))?;
-            prog.load(tracepoint, &btf)
-                .map_err(|e| LoadError::new(what("loading"), e))?;
-            prog.attach()
-                .map_err(|e| LoadError::new(what("attaching"), e))?;
+            attach_tp(&mut ebpf, &btf, name, tracepoint)?;
         }
 
-        let mut missing = Vec::new();
         let mut attached = Vec::new();
         for hook in FS_HOOKS.iter().filter(|hook| hook.wanted(ops)) {
             match attach_fentry(&mut ebpf, &btf, hook) {
@@ -418,11 +472,20 @@ impl Tracer {
                 Err(error) => return Err(error),
             }
         }
-        let reportable = |op| attached.iter().any(|h| h.reports && h.ops.contains(&op));
+        let reportable = |op| {
+            attached
+                .iter()
+                .any(|h| h.role == Role::Reports && h.ops.contains(&op))
+        };
         let unavailable: Vec<Op> = ops.iter().filter(|&op| !reportable(op)).collect();
         if unavailable.len() == ops.iter().count() {
-            // Nothing selected can be traced; `wanted` hooks always include one per op.
-            let Missing { error, .. } = missing.remove(0);
+            // Nothing selected can be traced; `wanted` hooks always include one reporting hook
+            // per op, so one of them is missing: fail with its error.
+            let first = missing
+                .iter()
+                .position(|m| m.hook.role == Role::Reports)
+                .unwrap_or(0);
+            let Missing { error, .. } = missing.swap_remove(first);
             return Err(error);
         }
 

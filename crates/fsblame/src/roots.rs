@@ -213,7 +213,7 @@ impl Roots {
     }
 
     /// Number of roots.
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.roots.len()
     }
 
@@ -237,9 +237,11 @@ impl Roots {
             _pad: 0,
             devs: [0; abi::MAX_DEVS as usize],
         };
-        if devs.len() <= filter.devs.len() {
+        if let Ok(count) = u32::try_from(devs.len())
+            && count <= abi::MAX_DEVS
+        {
             filter.devs[..devs.len()].copy_from_slice(&devs);
-            filter.count = u32::try_from(devs.len()).expect("at most MAX_DEVS");
+            filter.count = count;
         }
         filter
     }

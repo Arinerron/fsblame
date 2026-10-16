@@ -5,7 +5,8 @@
  * preserve_access_index, so clang emits a CO-RE relocation for each field access and aya
  * rewrites it against /sys/kernel/btf/vmlinux at load time. Matching is by type name (minus any
  * ___flavor suffix) and field name; anonymous structs and unions in the kernel type (dentry's
- * d_name, file's f_path, iattr's ia_uid, mm_struct's arg_start on 7.x) are looked through.
+ * d_name, file's f_path, iattr's ia_uid, mm_struct's arg_start on 7.x, vm_area_struct's
+ * vm_flags since 6.3) are looked through, and const/typedef wrappers are skipped.
  */
 #ifndef __VMLINUX_MIN_H__
 #define __VMLINUX_MIN_H__
@@ -53,6 +54,7 @@ enum {
 };
 
 struct mnt_idmap;
+struct pid_namespace;
 struct pt_regs;
 
 #pragma clang attribute push(__attribute__((preserve_access_index)), apply_to = record)
@@ -106,8 +108,14 @@ struct path {
 };
 
 struct file {
+	unsigned int f_mode;
 	struct path f_path;
 	struct inode *f_inode;
+};
+
+struct vm_area_struct {
+	unsigned long vm_flags;
+	struct file *vm_file;
 };
 
 struct iattr {
@@ -119,8 +127,19 @@ struct iattr {
 };
 
 struct fs_struct {
-	struct path root;
 	struct path pwd;
+};
+
+/* `pid->numbers` is indexed at run time, which strides by this local size: both fields keep it
+ * equal to the kernel's. */
+struct upid {
+	int nr;
+	struct pid_namespace *ns;
+};
+
+struct pid {
+	unsigned int level;
+	struct upid numbers[];
 };
 
 struct mm_struct {
@@ -140,6 +159,7 @@ struct task_struct {
 	int exit_code;
 	struct task_struct *real_parent;
 	struct task_struct *group_leader;
+	struct pid *thread_pid;
 	u64 start_boottime;
 	struct mm_struct *mm;
 	struct fs_struct *fs;

@@ -1,0 +1,138 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: rustfmt and clippy
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: fsblame
+          submodules: true
+      - uses: ./fsblame/.github/actions/setup
+      - name: rustfmt
+        working-directory: fsblame
+        run: cargo fmt --all --check
+      - name: clippy
+        working-directory: fsblame
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  build-test:
+    name: x86_64 build and unit tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: fsblame
+          submodules: true
+      - uses: ./fsblame/.github/actions/setup
+      - name: Build (static, x86_64 musl)
+        working-directory: fsblame
+        run: |
+          cargo build --release -p fsblame --target x86_64-unknown-linux-musl
+          file target/x86_64-unknown-linux-musl/release/fsblame | grep -Eq 'static-pie linked|statically linked'
+      - name: Unit tests
+        working-directory: fsblame
+        run: cargo test --workspace
+      - name: Completions and man pages
+        working-directory: fsblame
+        run: |
+          for shell in bash zsh fish elvish powershell; do
+            target/x86_64-unknown-linux-musl/release/fsblame completions "$shell" > /dev/null
+          done
+          cargo xtask man target/man
+          test -s target/man/fsblame.1
+          test -s target/man/fsblame-watch.1
+      - name: Bundle the e2e binaries
+        working-directory: fsblame
+        # tar keeps the executable bits that upload-artifact drops.
+        run: tar -cf e2e-bins.tar -C target/x86_64-unknown-linux-musl/release fsblame -C ../../debug xtask
+      - uses: actions/upload-artifact@v4
+        with:
+          name: e2e-bins
+          path: fsblame/e2e-bins.tar
+          retention-days: 3
+
+  aarch64:
+    name: aarch64 check, build and qemu smoke
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: fsblame
+          submodules: true
+      - uses: ./fsblame/.github/actions/setup
+        with:
+          targets: aarch64-unknown-linux-musl
+      - name: Install qemu-user
+        run: sudo apt-get install -yq --no-install-recommends qemu-user
+      - name: Check
+        working-directory: fsblame
+        run: cargo check --target aarch64-unknown-linux-musl --workspace
+      - name: Build (static, aarch64 musl, rust-lld)
+        working-directory: fsblame
+        run: |
+          cargo build --release -p fsblame --target aarch64-unknown-linux-musl
+          bin=target/aarch64-unknown-linux-musl/release/fsblame
+          file "$bin" | grep -Eq 'ARM aarch64.*(static-pie linked|statically linked)'
+          qemu-aarch64 "$bin" --version
+          qemu-aarch64 "$bin" completions bash > /dev/null
+
+  e2e:
+    name: end-to-end suite on ${{ matrix.kernel }} (virtme-ng VM)
+    needs: build-test
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        # Ubuntu mainline builds (BTF enabled) booted by virtme-ng: the 5.17 floor (bpf_loop),
+        # the 6.1, 6.6 and 6.12 LTS lines, and the newest stable.
+        kernel: [v5.17.15, v6.1.190, v6.6.159, v6.12.113, v7.2.6]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: e2e-bins
+      - name: Unpack the binaries built by build-test
+        run: tar -xf e2e-bins.tar
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Install virtme-ng
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -yq --no-install-recommends qemu-system-x86 virtiofsd busybox-static
+          pipx install virtme-ng
+      - name: xtask test-e2e in the VM
+        env:
+          KERNEL: ${{ matrix.kernel }}
+        run: |
+          # The guest starts in this directory and sees the host's root filesystem read-only
+          # (virtiofs; writes under /home and /etc go to a RAM overlay); it runs the suite as
+          # the runner user, whose passwordless sudo works in the guest too. Scratch files go on
+          # an ext4 disk image (the guest's only virtio disk, /dev/vda): the suite refuses tmpfs
+          # and needs file capabilities (setcap). The binaries come prebuilt, so the guest needs
+          # no network or toolchain. --disable-microvm: the microvm machine hangs at ACPI init
+          # with Ubuntu mainline kernels. Keep the script short: vng passes it on the kernel
+          # command line, and an over-long one hangs the guest silently. vng returns the guest's
+          # exit code.
+          truncate -s 1G "$RUNNER_TEMP/e2e.img"
+          mkfs.ext4 -q "$RUNNER_TEMP/e2e.img"
+          # shellcheck disable=SC2016 # expanded in the guest
+          vng --run "$KERNEL" --disable-microvm --user "$USER" --memory 4G --cpus 4 \
+            --disk "$RUNNER_TEMP/e2e.img" \
+            --exec 'set -e; export FSBLAME_E2E_DIR=/tmp/e2e; uname -r;
+                    sudo mkdir -p /tmp/e2e; sudo mount /dev/vda /tmp/e2e;
+                    sudo chown $(id -u):$(id -g) /tmp/e2e; ./xtask test-e2e --bin ./fsblame' < /dev/null

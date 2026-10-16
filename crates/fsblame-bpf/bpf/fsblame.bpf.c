@@ -10,10 +10,15 @@
  *
  * Writes: rw_verify_area stashes the requested byte count per CPU; the security_file_permission
  * hook that follows consumes it and accumulates into `writes`, keyed by (tgid, struct file *).
- * Only the first write of a binding produces a record; userspace drains the totals.
+ * Only the first write of a binding produces a record; userspace drains the totals. A shared
+ * mapping that becomes writable (security_mmap_file, security_file_mprotect) is reported once
+ * per binding (`mapped`): stores through it never pass a write hook.
  *
- * Every program owns one `fs_buf` slot (its op), so programs never share scratch space: the
- * same program cannot nest on one CPU (the kernel skips recursive runs).
+ * cwd: on_exec_cwd walks the new image's working directory into `cwd_buf` and on_exec, which
+ * runs right after it on the same tracepoint and CPU, copies it into the exec record.
+ *
+ * Every fentry program that reports owns one `fs_buf` slot, so programs never share scratch
+ * space: the same program cannot nest on one CPU (the kernel skips recursive runs).
  */
 #include "vmlinux_min.h"
 #include <bpf/bpf_helpers.h>
@@ -38,6 +43,19 @@ char LICENSE[] SEC("license") = "Dual MIT/GPL";
 #define ATTR_ATIME (1U << 4)
 #define ATTR_MTIME (1U << 5)
 #define RENAME_EXCHANGE (1U << 1)
+#define PROT_WRITE 0x2
+#define MAP_SHARED 0x01
+#define MAP_SHARED_VALIDATE 0x03
+#define MAP_TYPE 0x0f
+#define FMODE_WRITE 0x2
+#define VM_WRITE 0x2
+#define VM_SHARED 0x8
+#define MAX_PID_NS_LEVEL 32
+
+/* fs_buf slots: the op programs use their op, the mapping programs the slots after them. */
+#define SLOT_MMAP OP_COUNT
+#define SLOT_MPROTECT (OP_COUNT + 1)
+#define FS_SLOTS (OP_COUNT + 2)
 
 /* Payload offsets are masked or clamped to a constant before every write so the verifier can
  * bound them; the logical offsets never reach the mask (two paths of PATH_CAP + NAME_CAP, or
@@ -47,8 +65,12 @@ char LICENSE[] SEC("license") = "Dual MIT/GPL";
 #define FS_DATA_BYTES (FS_DATA_MASK + 1 + PATH_CAP)
 #define EXEC_DATA_MASK 16383
 #define EXEC_DATA_BYTES (EXEC_DATA_MASK + 1 + ENV_CAP)
-_Static_assert(ENV_CAP >= ARGV_CAP, "the exec slack covers the larger of env and argv");
-_Static_assert(FILENAME_CAP + ENV_CAP + ARGV_CAP <= EXEC_DATA_MASK, "exec offsets never wrap");
+/* cwd names start below PATH_CAP and are at most NAME_CAP each. */
+#define CWD_BYTES (PATH_CAP + NAME_CAP)
+_Static_assert(ENV_CAP >= ARGV_CAP && ENV_CAP >= CWD_BYTES,
+	       "the exec slack covers the largest of env, argv and cwd");
+_Static_assert(FILENAME_CAP + ENV_CAP + ARGV_CAP + CWD_BYTES <= EXEC_DATA_MASK,
+	       "exec offsets never wrap");
 
 struct fs_scratch {
 	struct fs_rec rec;
@@ -67,11 +89,30 @@ struct exec_scratch {
 	u8 data[EXEC_DATA_BYTES];
 };
 
+/* The cwd on_exec_cwd walked for the exec in flight on this CPU, for on_exec. */
+struct cwd_scratch {
+	u64 bprm;  /* the exec's struct linux_binprm; 0 once on_exec consumed it */
+	u32 tgid;  /* the exec's process */
+	u32 flags; /* F_CWD (and F_CWD_TRUNC) once the walk is done */
+	u32 cur;   /* write cursor in `data`, in the map value for the reason given at fs_scratch */
+	u32 _pad;
+	u8 data[CWD_BYTES];
+};
+
 /* Byte count of the write in flight on this CPU, from rw_verify_area. */
 struct write_stash {
 	u64 file;
 	u64 count;
 	u32 tid;
+	u32 _pad;
+};
+
+/* A reported writable shared mapping of one (tgid, struct file); a mismatch means the struct
+ * file or the pid was reused, so it is a new binding. */
+struct mapping {
+	u64 ino;
+	u64 start_ns;
+	u32 dev;
 	u32 _pad;
 };
 
@@ -124,6 +165,13 @@ struct {
 } writes SEC(".maps");
 
 struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 4096);
+	__type(key, struct write_key);
+	__type(value, struct mapping);
+} mapped SEC(".maps");
+
+struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
 	__uint(max_entries, 1);
 	__type(key, u32);
@@ -132,7 +180,7 @@ struct {
 
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-	__uint(max_entries, OP_COUNT); /* one slot per program, indexed by its op */
+	__uint(max_entries, FS_SLOTS); /* one slot per fentry program that reports */
 	__type(key, u32);
 	__type(value, struct fs_scratch);
 } fs_buf SEC(".maps");
@@ -143,6 +191,13 @@ struct {
 	__type(key, u32);
 	__type(value, struct exec_scratch);
 } exec_buf SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, u32);
+	__type(value, struct cwd_scratch);
+} cwd_buf SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
@@ -327,9 +382,27 @@ static __always_inline u32 emit_path(struct fs_scratch *s, u32 slot, u32 off, st
 	return emit_names(s, slot, off, d, sc.depth, trunc);
 }
 
+/* The pid of `task` in its own pid namespace; 0 when that is the initial one. */
+static __always_inline u32 ns_pid(struct task_struct *task)
+{
+	struct pid *pid = task->thread_pid;
+	unsigned int level;
+	int nr = 0;
+
+	if (!pid)
+		return 0;
+	level = pid->level;
+	/* Namespaces nest at most MAX_PID_NS_LEVEL deep; the bound also lets the verifier accept
+	 * the variable index into `numbers`, which is read rather than dereferenced. */
+	if (level == 0 || level > MAX_PID_NS_LEVEL)
+		return 0;
+	bpf_probe_read_kernel(&nr, sizeof(nr), &pid->numbers[level].nr);
+	return nr;
+}
+
 static __always_inline void fill_task(struct fs_rec *r, u16 op, u64 now)
 {
-	struct task_struct *task = bpf_get_current_task_btf();
+	struct task_struct *leader = bpf_get_current_task_btf()->group_leader;
 	u64 id = bpf_get_current_pid_tgid();
 
 	r->hdr.kind = REC_FS;
@@ -338,7 +411,9 @@ static __always_inline void fill_task(struct fs_rec *r, u16 op, u64 now)
 	r->hdr.ts_ns = now;
 	r->tgid = id >> 32;
 	r->tid = (u32)id;
-	r->start_ns = task->group_leader->start_boottime;
+	r->ns_tgid = ns_pid(leader);
+	r->_pad = 0;
+	r->start_ns = leader->start_boottime;
 	bpf_get_current_comm(r->comm, sizeof(r->comm));
 	r->uid = (u32)bpf_get_current_uid_gid();
 	r->dev = 0;
@@ -609,6 +684,96 @@ int BPF_PROG(on_file_permission, struct file *file, int mask)
 	return 0;
 }
 
+/*
+ * Reports a shared mapping of `file` that became writable (`via` is MAP_VIA_*), once per
+ * (tgid, struct file) binding: stores through it change the file without a write call. Kept
+ * apart from `writes`, whose bindings userspace coalesces and polls.
+ */
+static __always_inline int report_mapped(u32 slot, struct file *file, u64 via)
+{
+	struct mapping *v, fresh;
+	struct write_key key;
+	struct fs_scratch *s;
+	struct inode *inode;
+	struct dentry *d;
+	struct scope sc;
+	u32 dev, tgid, trunc = 0, end;
+	u64 ino, start;
+
+	if (!(op_mask & (1U << OP_WRITE)))
+		return 0;
+	inode = file->f_inode;
+	if (!inode || (inode->i_mode & S_IFMT) != S_IFREG)
+		return 0;
+	tgid = current_tgid();
+	if (tgid == self_tgid)
+		return 0;
+	d = file->f_path.dentry;
+	dev = inode->i_sb->s_dev;
+	sc = scope_of(d, dev);
+	if (sc.root == ROOT_NONE)
+		return 0;
+
+	ino = inode->i_ino;
+	start = bpf_get_current_task_btf()->group_leader->start_boottime;
+	key.tgid = tgid;
+	key._pad = 0;
+	key.file = (u64)file;
+	v = bpf_map_lookup_elem(&mapped, &key);
+	if (v && v->ino == ino && v->dev == dev && v->start_ns == start)
+		return 0;
+	fresh.ino = ino;
+	fresh.start_ns = start;
+	fresh.dev = dev;
+	fresh._pad = 0;
+	/* A stale binding is replaced; a new one is reported by the thread that creates it. */
+	if (bpf_map_update_elem(&mapped, &key, &fresh, v ? BPF_ANY : BPF_NOEXIST))
+		return 0;
+
+	s = bpf_map_lookup_elem(&fs_buf, &slot);
+	if (!s)
+		return 0;
+	fill_task(&s->rec, OP_WRITE, bpf_ktime_get_boot_ns());
+	s->rec.hdr.flags = F_MAPPED;
+	s->rec.dev = dev;
+	s->rec.ino = ino;
+	s->rec.mode = inode->i_mode;
+	s->rec.aux = via;
+	s->rec.file = (u64)file;
+	end = emit_path(s, slot, 0, d, sc, &s->rec.root, &trunc);
+	s->rec.path_len = end;
+	if (trunc)
+		s->rec.hdr.flags |= F_PATH_TRUNC;
+	submit_fs(s, end);
+	return 0;
+}
+
+SEC("fentry/security_mmap_file")
+int BPF_PROG(on_mmap_file, struct file *file, unsigned long prot, unsigned long flags)
+{
+	unsigned long type = flags & MAP_TYPE;
+
+	/* do_mmap refuses a writable shared mapping of a file not open for writing only after
+	 * this hook, so that is checked here. */
+	if (!file || !(prot & PROT_WRITE) || (type != MAP_SHARED && type != MAP_SHARED_VALIDATE) ||
+	    !(file->f_mode & FMODE_WRITE))
+		return 0;
+	return report_mapped(SLOT_MMAP, file, MAP_VIA_MMAP);
+}
+
+SEC("fentry/security_file_mprotect")
+int BPF_PROG(on_file_mprotect, struct vm_area_struct *vma, unsigned long reqprot,
+	     unsigned long prot)
+{
+	unsigned long vm_flags = vma->vm_flags;
+	struct file *file = vma->vm_file;
+
+	/* A read-only shared mapping turning writable; mprotect checked VM_MAYWRITE before. */
+	if (!(prot & PROT_WRITE) || !(vm_flags & VM_SHARED) || (vm_flags & VM_WRITE) || !file)
+		return 0;
+	return report_mapped(SLOT_MPROTECT, file, MAP_VIA_MPROTECT);
+}
+
 SEC("tp_btf/sched_process_fork")
 int BPF_PROG(on_fork, struct task_struct *parent, struct task_struct *child)
 {
@@ -646,11 +811,113 @@ int BPF_PROG(on_exit, struct task_struct *p)
 	return 0;
 }
 
+struct cwd_walk {
+	/* Plain addresses read with bpf_probe_read_kernel, not BTF pointers: a mount is reached
+	 * from its vfsmount by container_of, which the verifier refuses on BTF pointers. */
+	u64 d;        /* the dentry whose name is next */
+	u64 mnt;      /* the struct vfsmount it is reached through */
+	u64 mnt_root; /* that mount's root dentry */
+	u32 done;     /* reached the root of the mount namespace */
+	u32 _pad;
+};
+
+/* One hop of the cwd walk: emits the name of `d` and steps to its parent or, at the root of a
+ * mount, steps to the mountpoint in the parent mount. */
+static long cwd_step(u64 index, void *data)
+{
+	struct cwd_walk *w = data;
+	struct dentry *d = (struct dentry *)w->d;
+	struct cwd_scratch *s;
+	u64 parent = 0, name = 0;
+	u32 zero = 0, pos;
+	long n;
+
+	if (w->d == w->mnt_root) {
+		struct mount *m = container_of((struct vfsmount *)w->mnt, struct mount, mnt);
+		struct mount *up = NULL;
+		u64 point = 0, root = 0;
+
+		if (bpf_core_read(&up, sizeof(up), &m->mnt_parent))
+			return 1;
+		/* The namespace root (or a detached tree) is its own parent: the path is whole. */
+		if (up == m) {
+			w->done = 1;
+			return 1;
+		}
+		if (bpf_core_read(&point, sizeof(point), &m->mnt_mountpoint) ||
+		    bpf_core_read(&root, sizeof(root), &up->mnt.mnt_root))
+			return 1;
+		w->d = point;
+		w->mnt = (u64)&up->mnt;
+		w->mnt_root = root;
+		return 0;
+	}
+	/* A directory that is its own parent below a mount root is disconnected (unreachable). */
+	if (bpf_core_read(&parent, sizeof(parent), &d->d_parent) || parent == w->d)
+		return 1;
+	s = bpf_map_lookup_elem(&cwd_buf, &zero);
+	if (!s)
+		return 1;
+	pos = s->cur;
+	/* A constant bound right before the write; CWD_BYTES leaves NAME_CAP of slack after it. */
+	if (pos >= PATH_CAP)
+		return 1;
+	if (bpf_core_read(&name, sizeof(name), &d->d_name.name))
+		return 1;
+	n = bpf_probe_read_kernel_str(&s->data[pos], NAME_CAP, (const void *)name);
+	if (n <= 0)
+		return 1;
+	s->cur = pos + n;
+	w->d = parent;
+	return 0;
+}
+
+/*
+ * Captures the cwd of an exec for on_exec, which is attached after this program: programs on
+ * one tracepoint run in attach order, back to back on one CPU. A separate program, so the
+ * walk has its own verifier budget and on_exec loads without it. The walk goes up to the root
+ * of the mount namespace, not to the process's root: the same path /proc/<pid>/cwd shows
+ * fsblame, also for a chrooted process. No string work: names are emitted leaf first.
+ */
+SEC("tp_btf/sched_process_exec")
+int BPF_PROG(on_exec_cwd, struct task_struct *p, pid_t old_pid, struct linux_binprm *bprm)
+{
+	struct fs_struct *fs = p->fs;
+	struct cwd_scratch *s;
+	struct cwd_walk w = {};
+	struct vfsmount *mnt;
+	u32 zero = 0;
+
+	s = bpf_map_lookup_elem(&cwd_buf, &zero);
+	if (!s)
+		return 0;
+	s->bprm = (u64)bprm;
+	s->tgid = p->tgid;
+	s->flags = 0;
+	s->cur = 0;
+	if (bpf_core_read(&w.d, sizeof(w.d), &fs->pwd.dentry) ||
+	    bpf_core_read(&w.mnt, sizeof(w.mnt), &fs->pwd.mnt))
+		return 0;
+	/* Every member access inside bpf_core_read's source gets a CO-RE relocation, so `w.mnt`
+	 * is read outside it: the kernel has no struct cwd_walk to relocate against. */
+	mnt = (struct vfsmount *)w.mnt;
+	if (bpf_core_read(&w.mnt_root, sizeof(w.mnt_root), &mnt->mnt_root))
+		return 0;
+	bpf_loop(WALK_MAX, cwd_step, &w, 0);
+	/* A walk cut short keeps the names it has; one that has none leaves the cwd to /proc. */
+	if (w.done)
+		s->flags = F_CWD;
+	else if (s->cur)
+		s->flags = F_CWD | F_CWD_TRUNC;
+	return 0;
+}
+
 SEC("tp_btf/sched_process_exec")
 int BPF_PROG(on_exec, struct task_struct *p, pid_t old_pid, struct linux_binprm *bprm)
 {
 	u64 uid_gid = bpf_get_current_uid_gid();
 	struct exec_scratch *s;
+	struct cwd_scratch *cwd;
 	struct exec_rec *r;
 	struct mm_struct *mm;
 	u64 arg_start, arg_end, env_start, env_end, len, size;
@@ -676,7 +943,7 @@ int BPF_PROG(on_exec, struct task_struct *p, pid_t old_pid, struct linux_binprm 
 	n = bpf_probe_read_kernel_str(s->data, FILENAME_CAP, bprm->filename);
 	off = n > 0 ? n : 0;
 	r->filename_len = off;
-	r->_pad = 0;
+	r->cwd_len = 0;
 
 	mm = p->mm;
 	/* Capture the raw environment (NUL-separated KEY=VAL) in bounded reads. procctx filters
@@ -713,6 +980,22 @@ int BPF_PROG(on_exec, struct task_struct *p, pid_t old_pid, struct linux_binprm 
 		len = 0;
 	r->argv_len = len;
 	off += len;
+
+	/* The cwd on_exec_cwd walked for this very exec, if it ran. */
+	cwd = bpf_map_lookup_elem(&cwd_buf, &zero);
+	if (cwd && cwd->bprm == (u64)bprm && cwd->tgid == r->tgid && (cwd->flags & F_CWD)) {
+		len = cwd->cur;
+		if (len > CWD_BYTES)
+			len = CWD_BYTES;
+		if (!bpf_probe_read_kernel(&s->data[off & EXEC_DATA_MASK], len, cwd->data)) {
+			r->cwd_len = len;
+			r->hdr.flags |= cwd->flags;
+			off += len;
+		}
+	}
+	/* Consumed: a later exec that on_exec_cwd misses must not inherit it. */
+	if (cwd)
+		cwd->bprm = 0;
 
 	size = sizeof(*r) + (u64)off;
 	if (size > sizeof(*s))

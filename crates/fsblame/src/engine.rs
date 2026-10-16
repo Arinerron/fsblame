@@ -63,6 +63,8 @@ pub struct Actor {
     pub tgid: u32,
     /// Thread id.
     pub tid: u32,
+    /// Process id in the actor's own pid namespace; `None` when that is the initial one.
+    pub ns_tgid: Option<u32>,
     /// Start time of the process (`CLOCK_BOOTTIME` ns), the second half of its identity.
     pub start_ns: u64,
     /// Thread `comm`.
@@ -80,6 +82,34 @@ pub struct FileId {
     pub ino: u64,
 }
 
+/// How a shared mapping of a file became writable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MapVia {
+    /// `mmap(MAP_SHARED)` with `PROT_WRITE`.
+    Mmap,
+    /// `mprotect(PROT_WRITE)` of a read-only shared mapping.
+    Mprotect,
+}
+
+impl MapVia {
+    /// The `MAP_VIA_*` code of a mapped-write record's `aux`.
+    pub const fn from_code(code: u64) -> Option<Self> {
+        match code {
+            abi::MAP_VIA_MMAP => Some(Self::Mmap),
+            abi::MAP_VIA_MPROTECT => Some(Self::Mprotect),
+            _ => None,
+        }
+    }
+
+    /// Name in output: the system call.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Mmap => "mmap",
+            Self::Mprotect => "mprotect",
+        }
+    }
+}
+
 /// What an operation changed, beyond its op.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Change {
@@ -91,6 +121,12 @@ pub enum Change {
         bytes: u64,
         /// Write calls.
         calls: u64,
+    },
+    /// A shared mapping of the file became writable: stores through it change the file
+    /// without write calls, so there is nothing to count.
+    Mapped {
+        /// How it became writable.
+        via: MapVia,
     },
     /// New mode (`chmod`).
     Mode(u32),
@@ -219,6 +255,8 @@ pub struct Engine<S> {
     sink: S,
     /// Keyed by (tgid, `struct file` address), as the kernel's `writes` map.
     bindings: HashMap<(u32, u64), Binding>,
+    /// Scratch for the cwd of an exec record, reused across execs.
+    cwd: Vec<u8>,
     last_expire_ns: u64,
     counts: Counts,
 }
@@ -251,6 +289,7 @@ impl<S: Sink> Engine<S> {
             roots,
             sink,
             bindings: HashMap::new(),
+            cwd: Vec::new(),
             last_expire_ns: 0,
             counts: Counts::default(),
         }
@@ -325,8 +364,8 @@ impl<S: Sink> Engine<S> {
             comm: Some(record::trim_nul(&r.comm)),
             filename: Some(exec.filename),
             argv: Some(exec.argv),
-            // Not in the record; procctx reads /proc/<pid>/cwd when the lineage is loaded.
-            cwd: None,
+            // Without one in the record, procctx reads /proc/<pid>/cwd when the lineage loads.
+            cwd: exec.cwd(&mut self.cwd),
             env: Some(&env),
             argv_truncated: flag(r.hdr.flags, abi::F_ARGV_TRUNC),
             cgroup_id: Some(r.cgroup_id),
@@ -344,6 +383,15 @@ impl<S: Sink> Engine<S> {
             self.counts.malformed += 1;
             return Ok(());
         };
+        let mapped = if flag(r.hdr.flags, abi::F_MAPPED) {
+            let Some(via) = MapVia::from_code(r.aux) else {
+                self.counts.malformed += 1;
+                return Ok(());
+            };
+            Some(via)
+        } else {
+            None
+        };
         let path1 = self
             .roots
             .path(r.root, r.dev, fs.path, flag(r.hdr.flags, abi::F_PATH_TRUNC));
@@ -360,11 +408,13 @@ impl<S: Sink> Engine<S> {
         let actor = Actor {
             tgid: r.tgid,
             tid: r.tid,
+            ns_tgid: (r.ns_tgid != 0).then_some(r.ns_tgid),
             start_ns: r.start_ns,
             comm: record::c_str(&r.comm),
             uid: r.uid,
         };
-        // Exec records carry no cwd: read it from /proc while the actor is still alive.
+        // An actor whose exec carried no cwd (it predates fsblame, or the kernel could not
+        // capture it): read it from /proc while the actor is still alive.
         if self
             .procs
             .get(actor.tgid)
@@ -381,7 +431,7 @@ impl<S: Sink> Engine<S> {
         };
         let truncated = flag(r.hdr.flags, abi::F_PATH_TRUNC | abi::F_PATH2_TRUNC);
 
-        if op == Op::Write {
+        if op == Op::Write && mapped.is_none() {
             let key = (r.tgid, r.file);
             if let Some(mut old) = self.bindings.remove(&key) {
                 // The kernel replaced this binding: report what the old one had left.
@@ -422,6 +472,8 @@ impl<S: Sink> Engine<S> {
             )?;
         }
         let change = match op {
+            // Coalesced writes returned above: a write here is a mapping.
+            Op::Write => mapped.map_or(Change::None, |via| Change::Mapped { via }),
             Op::Chmod => Change::Mode(u32::try_from(r.aux2).unwrap_or(0)),
             Op::Chown => Change::Owner {
                 uid: (r.aux & ATTR_UID != 0).then(|| u32::try_from(r.aux2 >> 32).unwrap_or(0)),

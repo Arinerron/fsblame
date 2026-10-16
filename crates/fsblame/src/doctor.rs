@@ -1,11 +1,10 @@
 //! `fsblame doctor`: bpfdoctor's shared checks plus fsblame's own probes.
 
 use std::{
-    cell::OnceCell,
     fs,
     io::{self, IsTerminal},
     path::PathBuf,
-    rc::Rc,
+    sync::{Arc, OnceLock},
 };
 
 use anyhow::anyhow;
@@ -23,7 +22,7 @@ use serde::Serialize;
 use crate::{
     cli::DoctorArgs,
     fail::{Failure, errno_of},
-    ops::{FS_HOOKS, Hook, Op, SCHED_HOOKS},
+    ops::{FS_HOOKS, Hook, Op, Role, SCHED_HOOKS},
     roots::{self, Roots},
     tracer::{self, Cause, Class, HookOutcome, LoadError},
 };
@@ -139,9 +138,15 @@ impl Check for FentryProbe {
                 .with_explain(explain);
         }
         let mut failed = Vec::new();
+        let mut impact =
+            String::from("operations reported only by the unavailable hooks are not seen");
         for hook in FS_HOOKS.iter().filter(|hook| hook.function != CANONICAL) {
             if let Err(why) = probe_fentry(&mut ebpf, &btf, hook.function) {
                 failed.push(format!("{} ({why})", hook.function));
+                if let Role::Supplements(lost) = hook.role {
+                    impact.push_str("; ");
+                    impact.push_str(lost);
+                }
             }
         }
         if failed.is_empty() {
@@ -157,7 +162,7 @@ impl Check for FentryProbe {
             Status::Warn,
             format!("fentry attached to {CANONICAL}; unavailable: {}", failed.join(", ")),
         )
-        .with_impact("operations reported only by the unavailable hooks are not seen (rw_verify_area: write byte counts)")
+        .with_impact(impact)
         .with_fix(Fix::new(
             "grep -wE 'security_[a-z_]+|rw_verify_area' /sys/kernel/tracing/available_filter_functions",
             "a hook missing here is inlined or not traceable on this kernel",
@@ -252,21 +257,21 @@ pub struct OpStatus {
     pub detail: Option<String>,
 }
 
-/// `probe.ops`: loads every fentry program of the real tracer, so each op is known to be
-/// reportable here, or disabled with its cause.
+/// `probe.ops`: loads every optional program of the real tracer (the fentry hooks and the cwd
+/// capture), so each op is known to be reportable here, or disabled with its cause.
 #[derive(Debug)]
 pub struct OpsProbe {
     /// Paths the user plans to watch; they shape the program like a real run.
     pub paths: Vec<PathBuf>,
     /// Per-op results of the last run, for `--json`.
-    pub ops: Rc<OnceCell<Vec<OpStatus>>>,
+    pub ops: Arc<OnceLock<Vec<OpStatus>>>,
 }
 
 /// The program that reports `op`.
 fn reporting_hook(op: Op) -> &'static Hook {
     FS_HOOKS
         .iter()
-        .find(|hook| hook.reports && hook.ops.contains(&op))
+        .find(|hook| hook.role == Role::Reports && hook.ops.contains(&op))
         .expect("every op has a reporting hook")
 }
 
@@ -401,13 +406,8 @@ fn ops_diagnostic(
     } else {
         format!("{} operations will not be reported", disabled.join(", "))
     };
-    if failed
-        .iter()
-        .any(|(o, _)| o.hook.program == "on_rw_verify_area")
-    {
-        impact.push_str("; writes are reported without byte counts");
-    }
-    if failed.iter().any(|(o, _)| o.hook.always) {
+    // What a failed supplementing hook loses is in its `describe` line.
+    if failed.iter().any(|(o, _)| o.hook.ops.contains(&Op::Rename)) {
         impact.push_str(
             "; directory renames no longer refresh the scope cache, so files moved into or out of \
              a watch root may be misjudged",
@@ -423,9 +423,9 @@ fn ops_diagnostic(
             .filter(|o| o.status == "available")
             .map(|o| o.name)
             .collect();
-        let rename = failed
-            .iter()
-            .any(|(o, e)| o.hook.always && matches!(e.cause(), Cause::TooComplex { .. }));
+        let rename = failed.iter().any(|(o, e)| {
+            o.hook.ops.contains(&Op::Rename) && matches!(e.cause(), Cause::TooComplex { .. })
+        });
         let note = if rename {
             "known limitation on this kernel, there is no reduced-complexity mode beyond this: \
              without rename in --op, on_rename loads reduced to scope-cache upkeep, which fits, \
@@ -434,10 +434,16 @@ fn ops_diagnostic(
             "known limitation on this kernel, there is no reduced-complexity mode: leaving the op \
              out of --op skips the failing program and its slow verification at start-up"
         };
-        d = d.with_fix(Fix::new(
-            format!("{} watch --op {} <PATH>", tool.name, available.join(",")),
-            note,
-        ));
+        // Leaving ops out cannot skip a program that serves none (the cwd capture).
+        if failed
+            .iter()
+            .any(|(o, e)| !o.hook.ops.is_empty() && matches!(e.cause(), Cause::TooComplex { .. }))
+        {
+            d = d.with_fix(Fix::new(
+                format!("{} watch --op {} <PATH>", tool.name, available.join(",")),
+                note,
+            ));
+        }
         explain.push(
             "verifier limit: the kernel's BPF verifier proves a program safe by walking every \
              path through it and gives up after 1,000,000 instructions; this program's dentry \
@@ -580,7 +586,7 @@ impl Check for WatchFs {
 }
 
 /// Every check, in display order. `ops` receives the per-op results of `probe.ops`.
-pub fn full(paths: Vec<PathBuf>, ops: Rc<OnceCell<Vec<OpStatus>>>) -> Doctor {
+pub fn full(paths: Vec<PathBuf>, ops: Arc<OnceLock<Vec<OpStatus>>>) -> Doctor {
     let mut doctor = Doctor::with_shared();
     doctor
         .add(Box::new(FentryProbe))
@@ -636,7 +642,7 @@ pub fn explain_load_failure(error: &LoadError, paths: &[PathBuf]) -> io::Result<
             "probe.sched_tp",
         ]);
     }
-    let report = full(paths.to_vec(), Rc::default()).run_ids(&RealEnv, &tool, &ids);
+    let report = full(paths.to_vec(), Arc::default()).run_ids(&RealEnv, &tool, &ids);
     report.render_human(&mut io::stderr(), color(&io::stderr()))
 }
 
@@ -677,8 +683,8 @@ pub fn run(args: &DoctorArgs) -> Result<(), Failure> {
         args.paths.clone()
     };
     let tool = tool();
-    let ops = Rc::<OnceCell<Vec<OpStatus>>>::default();
-    let report = full(paths, Rc::clone(&ops)).run(&RealEnv, &tool);
+    let ops = Arc::<OnceLock<Vec<OpStatus>>>::default();
+    let report = full(paths, Arc::clone(&ops)).run(&RealEnv, &tool);
     let mut out = io::stdout();
     let rendered = if args.json {
         render_json(&report, ops.get().map_or(&[][..], Vec::as_slice), &mut out)

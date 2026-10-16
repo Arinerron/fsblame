@@ -2,10 +2,24 @@
 //!
 //! `cargo xtask test-e2e [--bin PATH] [--only ID,...]` runs fsblame against the running kernel:
 //! it builds the release binary (static musl), then for each scenario starts
-//! `sudo -n fsblame watch --json` on a fresh directory under `~/.cache/fsblame-e2e`, runs a
-//! workload as the invoking user, stops the watcher with SIGINT and asserts on the NDJSON.
-//! Run it as your normal user; it needs passwordless `sudo -n`, `setcap`, and a work directory
-//! on a filesystem that honours file capabilities (not `/tmp`, which is tmpfs and nosuid).
+//! `sudo -n fsblame watch --json` on a fresh directory under the work directory
+//! (`$FSBLAME_E2E_DIR`, default `~/.cache/fsblame-e2e`), runs a workload as the invoking user,
+//! stops the watcher with SIGINT and asserts on the NDJSON. Run it as your normal user; it needs
+//! passwordless `sudo -n`, `setcap`, and a work directory on a filesystem that honours file
+//! capabilities (not `/tmp`, which is tmpfs and nosuid).
+//!
+//! `cargo xtask man [DIR]` writes `fsblame.1` and one page per subcommand to DIR (default
+//! `$CARGO_TARGET_DIR/man`, else `target/man`), from the binary's own clap definition.
+
+/// The binary's CLI, compiled in from its source so the man pages cannot drift from it. It
+/// needs only clap and `ops`; including the sources avoids building the BPF object.
+#[path = "../../crates/fsblame/src/cli.rs"]
+#[allow(dead_code)]
+mod cli;
+/// The operations `cli` takes for `--op`.
+#[path = "../../crates/fsblame/src/ops.rs"]
+#[allow(dead_code)]
+mod ops;
 
 use std::{
     env,
@@ -22,6 +36,7 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, bail, ensure};
+use clap::CommandFactory as _;
 use serde_json::Value;
 
 /// Longest wait for `fsblame: watching` (programs load and attach).
@@ -34,16 +49,21 @@ const MAX_RUN: &str = "120s";
 const VERIFIER_LIMIT: u64 = 1_000_000;
 
 const USAGE: &str = "usage: cargo xtask test-e2e [--bin PATH] [--only ID,...]
+       cargo xtask man [DIR]
 
-  --bin PATH     test this fsblame binary instead of building the release one
-  --only IDS     run only these scenarios (comma-separated ids, see below)
+  test-e2e       run the end-to-end scenarios against the running kernel
+    --bin PATH   test this fsblame binary instead of building the release one
+    --only IDS   run only these scenarios (comma-separated ids, see below)
+  man            write the man pages to DIR (default $CARGO_TARGET_DIR/man, else target/man)
 
-Runs as your normal user; each scenario calls `sudo -n` itself.";
+test-e2e runs as your normal user; each scenario calls `sudo -n` itself. Its work directory is
+$FSBLAME_E2E_DIR (default ~/.cache/fsblame-e2e), on a disk filesystem without nosuid.";
 
 fn main() {
     let args: Vec<OsString> = env::args_os().skip(1).collect();
     let result = match args.first().and_then(|a| a.to_str()) {
         Some("test-e2e") => test_e2e(&args[1..]),
+        Some("man") => man(&args[1..]),
         Some("-h" | "--help") | None => {
             println!("{USAGE}");
             print_scenarios();
@@ -133,6 +153,25 @@ fn print_scenarios() {
     }
 }
 
+/// `cargo xtask man [DIR]`: renders the man pages into DIR.
+fn man(args: &[OsString]) -> Result<bool> {
+    let dir = match args {
+        [] => env::var_os("CARGO_TARGET_DIR")
+            .map_or_else(
+                || Path::new(env!("CARGO_MANIFEST_DIR")).join("../target"),
+                PathBuf::from,
+            )
+            .join("man"),
+        [dir] => PathBuf::from(dir),
+        [_, extra, ..] => bail!("unexpected argument {}\n{USAGE}", extra.display()),
+    };
+    fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    clap_mangen::generate_to(cli::Cli::command(), &dir)
+        .with_context(|| format!("writing man pages to {}", dir.display()))?;
+    println!("{}", dir.display());
+    Ok(true)
+}
+
 fn test_e2e(args: &[OsString]) -> Result<bool> {
     let mut bin = None;
     let mut only: Option<Vec<String>> = None;
@@ -166,9 +205,15 @@ fn test_e2e(args: &[OsString]) -> Result<bool> {
         Some(bin) => fs::canonicalize(&bin).with_context(|| format!("--bin {}", bin.display()))?,
         None => build()?,
     };
-    let home = env::var_os("HOME").context("HOME is not set")?;
-    let work = Path::new(&home).join(".cache/fsblame-e2e");
+    let work = match env::var_os("FSBLAME_E2E_DIR") {
+        Some(dir) => PathBuf::from(dir),
+        None => {
+            Path::new(&env::var_os("HOME").context("HOME is not set")?).join(".cache/fsblame-e2e")
+        }
+    };
     fs::create_dir_all(&work).with_context(|| format!("creating {}", work.display()))?;
+    // fsblame reports resolved paths; a relative or symlinked work dir would not match them.
+    let work = fs::canonicalize(&work).with_context(|| format!("resolving {}", work.display()))?;
     check_work_fs(&work)?;
     let ctx = Ctx { bin, work };
     println!(

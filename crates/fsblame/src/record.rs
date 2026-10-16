@@ -28,6 +28,9 @@ pub struct Exec<'a> {
     pub env: &'a [u8],
     /// Raw argv (NUL-separated).
     pub argv: &'a [u8],
+    /// cwd names, leaf first, when the kernel captured the cwd ([`abi::F_CWD`]); see
+    /// [`Exec::cwd`].
+    pub cwd_names: Option<&'a [u8]>,
 }
 
 impl<'a> Exec<'a> {
@@ -35,11 +38,12 @@ impl<'a> Exec<'a> {
     /// its head and tail ([`abi::F_ENV_TRUNC`]), the entry cut at each end of the gap is dropped,
     /// so no fragment can pose as a variable.
     pub fn env_entries(&self) -> Cow<'a, [u8]> {
+        /// Bytes the kernel keeps from each end of a truncated environment.
+        const HALF: usize = abi::ENV_CAP as usize / 2;
         if self.rec.hdr.flags & abi::F_ENV_TRUNC == 0 {
             return Cow::Borrowed(self.env);
         }
-        let half = usize::try_from(abi::ENV_CAP / 2).expect("small");
-        let (head, tail) = self.env.split_at(half.min(self.env.len()));
+        let (head, tail) = self.env.split_at(HALF.min(self.env.len()));
         let head = head
             .iter()
             .rposition(|&b| b == 0)
@@ -49,6 +53,25 @@ impl<'a> Exec<'a> {
             .position(|&b| b == 0)
             .map_or(&[][..], |start| &tail[start + 1..]);
         Cow::Owned([head, tail].concat())
+    }
+
+    /// The cwd at exec as an absolute path, built in `buf`; `None` when the kernel did not
+    /// capture it. A cwd whose walk stopped short of the root ([`abi::F_CWD_TRUNC`]) lost its
+    /// upper components, which show as `/…`, as in truncated file paths.
+    pub fn cwd<'b>(&self, buf: &'b mut Vec<u8>) -> Option<&'b [u8]> {
+        let names = self.cwd_names?;
+        buf.clear();
+        if self.rec.hdr.flags & abi::F_CWD_TRUNC != 0 {
+            buf.extend_from_slice("/…".as_bytes());
+        }
+        for name in names.split(|&b| b == 0).rev().filter(|n| !n.is_empty()) {
+            buf.push(b'/');
+            buf.extend_from_slice(name);
+        }
+        if buf.is_empty() {
+            buf.push(b'/');
+        }
+        Some(buf.as_slice())
     }
 }
 
@@ -111,11 +134,13 @@ pub fn decode(bytes: &[u8]) -> Result<Record<'_>, Malformed> {
             let filename = trim_nul(take(&mut rest, rec.filename_len).ok_or(bad)?);
             let env = take(&mut rest, rec.env_len).ok_or(bad)?;
             let argv = take(&mut rest, rec.argv_len).ok_or(bad)?;
+            let cwd = take(&mut rest, rec.cwd_len).ok_or(bad)?;
             Ok(Record::Exec(Exec {
                 rec,
                 filename,
                 env,
                 argv,
+                cwd_names: (rec.hdr.flags & abi::F_CWD != 0).then_some(cwd),
             }))
         }
         abi::REC_FS => {
@@ -138,7 +163,7 @@ pub fn c_str(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
-    fn exec_bytes(flags: u32, filename: &[u8], env: &[u8], argv: &[u8]) -> Vec<u8> {
+    fn exec_bytes(flags: u32, filename: &[u8], env: &[u8], argv: &[u8], cwd: &[u8]) -> Vec<u8> {
         let len = |b: &[u8]| u16::try_from(b.len()).unwrap();
         let rec = ExecRec {
             hdr: RecHeader {
@@ -157,18 +182,28 @@ mod tests {
             filename_len: len(filename),
             env_len: len(env),
             argv_len: len(argv),
-            _pad: 0,
+            cwd_len: len(cwd),
         };
         let mut bytes = wire::as_bytes(&rec).to_vec();
-        for part in [filename, env, argv] {
+        for part in [filename, env, argv, cwd] {
             bytes.extend_from_slice(part);
         }
         bytes
     }
 
+    fn cwd_of(flags: u32, names: &[u8]) -> Option<String> {
+        let bytes = exec_bytes(flags, b"/bin/mv\0", b"", b"mv\0", names);
+        let Ok(Record::Exec(exec)) = decode(&bytes) else {
+            panic!("not an exec");
+        };
+        let mut buf = Vec::new();
+        exec.cwd(&mut buf)
+            .map(|cwd| String::from_utf8(cwd.to_vec()).unwrap())
+    }
+
     #[test]
     fn exec_payload_splits_at_declared_lengths() {
-        let bytes = exec_bytes(0, b"/bin/sh\0", b"TMUX_PANE=%1\0", b"sh\0-c\0x\0");
+        let bytes = exec_bytes(0, b"/bin/sh\0", b"TMUX_PANE=%1\0", b"sh\0-c\0x\0", b"");
         let Ok(Record::Exec(exec)) = decode(&bytes) else {
             panic!("not an exec");
         };
@@ -188,7 +223,7 @@ mod tests {
         // Tail: the end of an entry whose key was cut, then a whole entry.
         let tail = b"lifecycle_event=bogus\0npm_lifecycle_event=postinstall\0";
         let env = [&head[..], tail].concat();
-        let bytes = exec_bytes(abi::F_ENV_TRUNC, b"/bin/sh\0", &env, b"sh\0");
+        let bytes = exec_bytes(abi::F_ENV_TRUNC, b"/bin/sh\0", &env, b"sh\0", b"");
         let Ok(Record::Exec(exec)) = decode(&bytes) else {
             panic!("not an exec");
         };
@@ -201,8 +236,24 @@ mod tests {
     }
 
     #[test]
+    fn kernel_cwd_is_rebuilt_root_first() {
+        assert_eq!(
+            cwd_of(abi::F_CWD, b"proj\0u\0home\0").as_deref(),
+            Some("/home/u/proj")
+        );
+        // No names: the walk started at the namespace root.
+        assert_eq!(cwd_of(abi::F_CWD, b"").as_deref(), Some("/"));
+        assert_eq!(
+            cwd_of(abi::F_CWD | abi::F_CWD_TRUNC, b"b\0a\0").as_deref(),
+            Some("/…/a/b")
+        );
+        // Without F_CWD the payload is ignored and procctx falls back to /proc.
+        assert_eq!(cwd_of(0, b"stale\0"), None);
+    }
+
+    #[test]
     fn short_payload_is_malformed() {
-        let mut bytes = exec_bytes(0, b"/bin/sh\0", b"", b"sh\0");
+        let mut bytes = exec_bytes(0, b"/bin/sh\0", b"", b"sh\0", b"");
         bytes.pop();
         assert_eq!(
             decode(&bytes).unwrap_err(),

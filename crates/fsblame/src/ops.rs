@@ -148,19 +148,28 @@ impl OpSet {
     }
 }
 
-/// An fentry program of the tracer and the kernel function it attaches to.
+/// What an optional program contributes to the ops it serves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role {
+    /// Reports its ops: without it they are not reported.
+    Reports,
+    /// Adds to what another program reports; the text says what is lost without it.
+    Supplements(&'static str),
+}
+
+/// An optional program of the tracer and its attach point.
 #[derive(Clone, Copy, Debug)]
 pub struct Hook {
     /// Program name in `fsblame.bpf.c`.
     pub program: &'static str,
-    /// Kernel function.
+    /// Kernel function of an fentry program; the tracepoint of [`EXEC_CWD_HOOK`].
     pub function: &'static str,
-    /// Ops the program reports.
+    /// Ops the program serves.
     pub ops: &'static [Op],
-    /// Needed whatever ops are selected (scope-cache invalidation).
+    /// Needed whatever ops are selected (scope-cache invalidation, cwd capture).
     pub always: bool,
-    /// Produces records itself; `false` for hooks that only enrich another hook's records.
-    pub reports: bool,
+    /// What the program contributes.
+    pub role: Role,
 }
 
 impl Hook {
@@ -171,83 +180,99 @@ impl Hook {
 }
 
 /// The fentry hooks, in attach order.
-pub const FS_HOOKS: [Hook; 11] = [
+pub const FS_HOOKS: [Hook; 13] = [
     Hook {
         program: "on_rw_verify_area",
         function: "rw_verify_area",
         ops: &[Op::Write],
         always: false,
-        reports: false,
+        role: Role::Supplements("writes are reported without byte counts"),
     },
     Hook {
         program: "on_file_permission",
         function: "security_file_permission",
         ops: &[Op::Write],
         always: false,
-        reports: true,
+        role: Role::Reports,
+    },
+    Hook {
+        program: "on_mmap_file",
+        function: "security_mmap_file",
+        ops: &[Op::Write],
+        always: false,
+        role: Role::Supplements("writes through shared mmap(2) mappings are not reported"),
+    },
+    Hook {
+        program: "on_file_mprotect",
+        function: "security_file_mprotect",
+        ops: &[Op::Write],
+        always: false,
+        role: Role::Supplements(
+            "writes through shared mappings made writable by mprotect(2) are not reported",
+        ),
     },
     Hook {
         program: "on_create",
         function: "security_inode_create",
         ops: &[Op::Create],
         always: false,
-        reports: true,
+        role: Role::Reports,
     },
     Hook {
         program: "on_mkdir",
         function: "security_inode_mkdir",
         ops: &[Op::Mkdir],
         always: false,
-        reports: true,
+        role: Role::Reports,
     },
     Hook {
         program: "on_mknod",
         function: "security_inode_mknod",
         ops: &[Op::Mknod],
         always: false,
-        reports: true,
+        role: Role::Reports,
     },
     Hook {
         program: "on_symlink",
         function: "security_inode_symlink",
         ops: &[Op::Symlink],
         always: false,
-        reports: true,
+        role: Role::Reports,
     },
     Hook {
         program: "on_link",
         function: "security_inode_link",
         ops: &[Op::Link],
         always: false,
-        reports: true,
+        role: Role::Reports,
     },
     Hook {
         program: "on_unlink",
         function: "security_inode_unlink",
         ops: &[Op::Unlink],
         always: false,
-        reports: true,
+        role: Role::Reports,
     },
     Hook {
         program: "on_rmdir",
         function: "security_inode_rmdir",
         ops: &[Op::Rmdir],
         always: false,
-        reports: true,
+        role: Role::Reports,
     },
     Hook {
         program: "on_rename",
         function: "security_inode_rename",
         ops: &[Op::Rename],
         always: true,
-        reports: true,
+        role: Role::Reports,
     },
     Hook {
         program: "on_setattr",
         function: "security_inode_setattr",
         ops: &[Op::Chmod, Op::Chown, Op::Truncate, Op::Utimes, Op::Setattr],
         always: false,
-        reports: true,
+        role: Role::Reports,
     },
 ];
 
@@ -257,3 +282,13 @@ pub const SCHED_HOOKS: [(&str, &str); 3] = [
     ("on_exec", "sched_process_exec"),
     ("on_exit", "sched_process_exit"),
 ];
+
+/// The optional `tp_btf` program that captures the cwd of each exec for `on_exec`. Programs on
+/// one tracepoint run in attach order, so it is attached before the [`SCHED_HOOKS`].
+pub const EXEC_CWD_HOOK: Hook = Hook {
+    program: "on_exec_cwd",
+    function: "sched_process_exec",
+    ops: &[],
+    always: true,
+    role: Role::Supplements("cwds are read from /proc, too late for processes that exit quickly"),
+};

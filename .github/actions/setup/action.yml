@@ -1,0 +1,31 @@
+name: fsblame build setup
+description: >
+  Installs clang for the BPF objects and the toolchain from rust-toolchain.toml plus any extra
+  targets. Expects fsblame checked out at $GITHUB_WORKSPACE/fsblame with its tracekit
+  submodule (actions/checkout with `submodules: true`).
+inputs:
+  targets:
+    description: Extra rustup targets to install, space-separated (e.g. aarch64-unknown-linux-musl).
+    default: ""
+runs:
+  using: composite
+  steps:
+    - name: Install clang
+      shell: bash
+      run: |
+        sudo apt-get update -q
+        sudo apt-get install -yq --no-install-recommends clang llvm
+    - name: Install the Rust toolchain from rust-toolchain.toml
+      shell: bash
+      working-directory: fsblame
+      env:
+        TARGETS: ${{ inputs.targets }}
+      run: |
+        rustup toolchain install
+        # shellcheck disable=SC2086 # word-split on purpose: one target per word
+        if [ -n "$TARGETS" ]; then rustup target add $TARGETS; fi
+        rustc --version
+    - name: Cache cargo registry and target
+      uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: fsblame

@@ -1,0 +1,63 @@
+name: release
+
+# A `v*` tag builds static x86_64 and aarch64 binaries and publishes them, with shell
+# completions and man pages, as a GitHub release.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: fsblame
+          submodules: true
+      - uses: ./fsblame/.github/actions/setup
+        with:
+          targets: aarch64-unknown-linux-musl
+
+      - name: Build static binaries
+        working-directory: fsblame
+        run: |
+          cargo build --release -p fsblame --target x86_64-unknown-linux-musl
+          cargo build --release -p fsblame --target aarch64-unknown-linux-musl
+
+      - name: Package
+        working-directory: fsblame
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          host=target/x86_64-unknown-linux-musl/release/fsblame
+          mkdir -p dist/share/completions
+          "$host" completions bash > dist/share/completions/fsblame.bash
+          "$host" completions zsh > dist/share/completions/_fsblame
+          "$host" completions fish > dist/share/completions/fsblame.fish
+          "$host" completions elvish > dist/share/completions/fsblame.elv
+          "$host" completions powershell > dist/share/completions/_fsblame.ps1
+          cargo xtask man dist/share/man
+          for arch in x86_64 aarch64; do
+            name="fsblame-$TAG-$arch-linux-musl"
+            mkdir -p "dist/$name"
+            cp "target/$arch-unknown-linux-musl/release/fsblame" LICENSE README.md "dist/$name/"
+            cp -r dist/share/completions dist/share/man "dist/$name/"
+            tar -C dist -czf "dist/$name.tar.gz" "$name"
+            (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
+          done
+          file target/*-unknown-linux-musl/release/fsblame
+
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            fsblame/dist/*.tar.gz
+            fsblame/dist/*.tar.gz.sha256
+          generate_release_notes: true

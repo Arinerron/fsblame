@@ -2,6 +2,8 @@
 resolver = "3"
 members = ["crates/fsblame-abi", "crates/fsblame-bpf", "crates/fsblame", "xtask"]
 default-members = ["crates/fsblame-abi", "crates/fsblame-bpf", "crates/fsblame"]
+# The tracekit submodule is its own workspace.
+exclude = ["tracekit"]
 
 [workspace.package]
 version = "0.1.0"
@@ -13,13 +15,16 @@ license = "MIT"
 fsblame-abi = { path = "crates/fsblame-abi" }
 fsblame-bpf = { path = "crates/fsblame-bpf" }
 
-wire = { path = "../tracekit/crates/wire" }
-procctx = { path = "../tracekit/crates/procctx" }
-bpfdoctor = { path = "../tracekit/crates/bpfdoctor" }
+# tracekit v0.1.0, pinned as the `tracekit` git submodule (`git submodule update --init`).
+wire = { path = "tracekit/crates/wire", package = "tracekit-wire" }
+procctx = { path = "tracekit/crates/procctx" }
+bpfdoctor = { path = "tracekit/crates/bpfdoctor" }
 
 aya = { version = "0.14.0", default-features = false }
 anyhow = "1"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4.6", features = ["derive"] }
+clap_complete = "4.6"
+clap_mangen = "0.3"
 libc = "0.2"
 log = "0.4"
 serde = { version = "1", features = ["derive"] }

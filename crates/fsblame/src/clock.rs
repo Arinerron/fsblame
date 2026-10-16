@@ -23,12 +23,15 @@ pub fn boot_now_ns() -> u64 {
     u64::try_from(clock_ns(libc::CLOCK_BOOTTIME)).unwrap_or(0)
 }
 
+/// `USER_HZ` on every architecture Linux runs on, for kernels without `AT_CLKTCK`.
+const DEFAULT_USER_HZ: NonZeroU64 = NonZeroU64::new(100).unwrap();
+
 /// Kernel `USER_HZ` from the auxiliary vector, for `/proc` start times.
 pub fn clock_ticks_per_sec() -> NonZeroU64 {
     // SAFETY: getauxval only reads the process's auxiliary vector.
     let hz = unsafe { libc::getauxval(libc::AT_CLKTCK) };
-    // Linux has exported AT_CLKTCK since 2.6; USER_HZ is 100 on every architecture it runs on.
-    NonZeroU64::new(hz).unwrap_or(NonZeroU64::new(100).expect("non-zero"))
+    // Linux has exported AT_CLKTCK since 2.6; the fallback only guards a zero.
+    NonZeroU64::new(hz).unwrap_or(DEFAULT_USER_HZ)
 }
 
 /// Converts event timestamps to wall-clock time, using the offset between
@@ -69,6 +72,13 @@ impl Clock {
     /// RFC 3339 UTC time with microseconds, e.g. `2026-10-16T14:02:11.123456Z`.
     pub fn rfc3339(self, boot_ns: u64) -> String {
         rfc3339(self.unix_ns(boot_ns))
+    }
+}
+
+impl Default for Clock {
+    /// Samples the clock offset now, as [`Clock::new`].
+    fn default() -> Self {
+        Self::new()
     }
 }
 

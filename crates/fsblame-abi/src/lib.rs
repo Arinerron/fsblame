@@ -58,10 +58,13 @@ wire::wire! {
 
     /// A successful exec. Followed by `filename_len` bytes of the execve filename (NUL
     /// included), `env_len` bytes of the raw environment block (`KEY=VALUE\0` entries; see
-    /// [`F_ENV_TRUNC`]) and `argv_len` bytes of raw argv. The cwd is not captured: an in-kernel
-    /// dentry walk here cost too much verifier budget, so userspace reads `/proc/<pid>/cwd`.
+    /// [`F_ENV_TRUNC`]), `argv_len` bytes of raw argv and `cwd_len` bytes of the working
+    /// directory. The cwd is a sequence of NUL-terminated dentry names, leaf first, up to the
+    /// root of the process's mount namespace; it is present only with [`F_CWD`] (no names:
+    /// `/`) and its upper part is missing with [`F_CWD_TRUNC`].
     pub struct ExecRec {
-        /// Common header, `kind == REC_EXEC`; flags `F_ENV_TRUNC`, `F_ARGV_TRUNC`.
+        /// Common header, `kind == REC_EXEC`; flags `F_ENV_TRUNC`, `F_ARGV_TRUNC`, `F_CWD`,
+        /// `F_CWD_TRUNC`.
         pub hdr: RecHeader,
         /// Pid.
         pub tgid: u32,
@@ -83,8 +86,8 @@ wire::wire! {
         pub env_len: u16,
         /// Bytes of argv.
         pub argv_len: u16,
-        /// Always zero.
-        pub _pad: u16,
+        /// Bytes of cwd names.
+        pub cwd_len: u16,
     }
 
     /// A modifying file operation on a watched path. Followed by `path_len` bytes of the
@@ -93,17 +96,23 @@ wire::wire! {
     /// | op | path | path2 | aux | aux2 |
     /// |----|------|-------|-----|------|
     /// | `OP_WRITE` | file | – | replaced binding's bytes (`F_REPLACED`) | replaced binding's calls |
+    /// | `OP_WRITE` + `F_MAPPED` | file | – | `MAP_VIA_*` | – |
     /// | `OP_RENAME` | new name | old name | rename flags | inode replaced at the new name |
     /// | `OP_LINK` | new link | existing name | – | – |
     /// | `OP_SYMLINK` | new link | target (`ROOT_RAW`) | – | – |
     /// | `OP_CHMOD`… | file | – | `ia_valid` | new mode, size, or `uid << 32 \| gid` |
     pub struct FsRec {
-        /// Common header, `kind == REC_FS`; flags `F_PATH_TRUNC`, `F_PATH2_TRUNC`, `F_REPLACED`.
+        /// Common header, `kind == REC_FS`; flags `F_PATH_TRUNC`, `F_PATH2_TRUNC`, `F_REPLACED`,
+        /// `F_MAPPED`.
         pub hdr: RecHeader,
         /// Pid of the acting process.
         pub tgid: u32,
         /// Thread id of the acting thread.
         pub tid: u32,
+        /// Pid of the acting process in its own pid namespace; 0 when that is the initial one.
+        pub ns_tgid: u32,
+        /// Always zero.
+        pub _pad: u32,
         /// `start_boottime` of the acting process's group leader.
         pub start_ns: u64,
         /// `comm` of the acting thread.
@@ -128,7 +137,7 @@ wire::wire! {
         pub aux: u64,
         /// Op-specific, see the table.
         pub aux2: u64,
-        /// `OP_WRITE`: bytes requested by the first write.
+        /// `OP_WRITE`: bytes requested by the first write; 0 with `F_MAPPED`.
         pub bytes: u64,
         /// `OP_WRITE`: `struct file` address, the second half of the [`WriteKey`].
         pub file: u64,
@@ -233,7 +242,7 @@ wire::wire_consts! {
     pub const OP_UTIMES: u16 = 13;
     /// Other attribute change (privilege stripping).
     pub const OP_SETATTR: u16 = 14;
-    /// One past the largest op; also the number of per-CPU scratch slots.
+    /// One past the largest op.
     pub const OP_COUNT: u16 = 15;
 
     /// `path` was cut at `PATH_CAP` bytes or `WALK_MAX` components; its upper part is missing.
@@ -243,11 +252,26 @@ wire::wire_consts! {
     /// `OP_WRITE`: this binding replaced one for a reused `struct file`; `aux`/`aux2` carry the
     /// old binding's final totals.
     pub const F_REPLACED: u32 = 4;
+    /// `OP_WRITE`: not a write call but a shared mapping of the file that became writable
+    /// (`mmap(MAP_SHARED, PROT_WRITE)`, or `mprotect(PROT_WRITE)` of a shared read-only one);
+    /// stores through it change the file without a write. `aux` says how (`MAP_VIA_*`).
+    /// Reported once per `(tgid, struct file)`, outside write coalescing.
+    pub const F_MAPPED: u32 = 8;
     /// argv was longer than `ARGV_CAP`.
     pub const F_ARGV_TRUNC: u32 = 16;
     /// The environment was longer than `ENV_CAP`: the payload is its first and last
     /// `ENV_CAP / 2` bytes, so the entries in between (and the two cut ones) are missing.
     pub const F_ENV_TRUNC: u32 = 32;
+    /// The exec record carries the cwd.
+    pub const F_CWD: u32 = 64;
+    /// The cwd walk stopped short of the mount namespace root (`PATH_CAP` bytes, `WALK_MAX`
+    /// hops, or a disconnected directory); the upper part of the cwd is missing.
+    pub const F_CWD_TRUNC: u32 = 128;
+
+    /// `F_MAPPED` `aux`: `mmap` of the file, shared and writable.
+    pub const MAP_VIA_MMAP: u64 = 1;
+    /// `F_MAPPED` `aux`: `mprotect` made a shared mapping of the file writable.
+    pub const MAP_VIA_MPROTECT: u64 = 2;
 
     /// The side of an operation that is outside every watch root: no path captured.
     pub const ROOT_NONE: u32 = 0xffff_ffff;
@@ -264,7 +288,8 @@ wire::wire_consts! {
     pub const PATH_CAP: u32 = 1024;
     /// Longest dentry name read (`NAME_MAX` plus NUL).
     pub const NAME_CAP: u32 = 256;
-    /// Most `d_parent` hops of a scope check or path walk.
+    /// Most `d_parent` hops of a scope check or path walk; the cwd walk also counts each
+    /// mount it crosses.
     pub const WALK_MAX: u32 = 64;
     /// Longest execve filename captured.
     pub const FILENAME_CAP: u32 = 256;
