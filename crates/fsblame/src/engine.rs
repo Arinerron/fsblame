@@ -335,6 +335,9 @@ impl<S: Sink> Engine<S> {
         });
     }
 
+    // One linear per-event pipeline: decode, scope, coalesce, resolve, emit. Splitting it would
+    // scatter shared locals without clarifying the flow.
+    #[allow(clippy::too_many_lines)]
     fn on_fs(&mut self, fs: &Fs<'_>, totals: &mut impl Totals) -> io::Result<()> {
         let r = fs.rec;
         let Some(op) = Op::from_code(r.hdr.op) else {

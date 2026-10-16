@@ -357,6 +357,8 @@ impl Check for OpsProbe {
 }
 
 /// The `probe.ops` verdict: pass, or one finding per cause, each with its own explanation.
+// One cohesive verdict builder: one finding per distinct cause, each with tailored text.
+#[allow(clippy::too_many_lines)]
 fn ops_diagnostic(
     diag: impl Fn(Status, String) -> Diagnostic,
     outcomes: &[HookOutcome],

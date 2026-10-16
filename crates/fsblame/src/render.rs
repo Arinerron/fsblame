@@ -253,6 +253,8 @@ impl<W: Write> Human<W> {
 }
 
 impl<W: Write> Sink for Human<W> {
+    // One linear renderer: path header plus the indented ancestry tree and origin tag.
+    #[allow(clippy::too_many_lines)]
     fn touch(&mut self, touch: &Touch, lineage: &Lineage) -> io::Result<()> {
         let path = match &touch.old_path {
             Some(old) => format!("{} → {}", self.path(old), self.path(&touch.path)),

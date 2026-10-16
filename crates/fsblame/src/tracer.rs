@@ -413,7 +413,7 @@ impl Tracer {
             match attach_fentry(&mut ebpf, &btf, hook) {
                 Ok(_) => attached.push(*hook),
                 Err(error) if error.class() == Class::Unsupported => {
-                    missing.push(Missing { hook: *hook, error })
+                    missing.push(Missing { hook: *hook, error });
                 }
                 Err(error) => return Err(error),
             }
