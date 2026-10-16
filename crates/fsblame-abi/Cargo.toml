@@ -1,0 +1,20 @@
+[package]
+name = "fsblame-abi"
+description = "Kernel/user ABI of fsblame: ring buffer records, map keys and values, shared constants"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+# `aya::Pod` impls, for the loader.
+user = ["dep:aya"]
+# C header generation (`header()`), for the BPF build script.
+std = ["wire/std"]
+
+[dependencies]
+wire.workspace = true
+aya = { workspace = true, optional = true }
+
+[lints]
+workspace = true
