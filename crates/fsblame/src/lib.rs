@@ -21,6 +21,7 @@ pub mod ops;
 pub mod record;
 pub mod render;
 pub mod report;
+pub mod ring;
 pub mod roots;
 pub mod run;
 pub mod tracer;

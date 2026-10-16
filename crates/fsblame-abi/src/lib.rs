@@ -299,8 +299,9 @@ wire::wire_consts! {
     pub const PATH_CAP: u32 = 1024;
     /// Longest dentry name read (`NAME_MAX` plus NUL).
     pub const NAME_CAP: u32 = 256;
-    /// Most `d_parent` hops of a scope check or path walk; the cwd walk also counts each
-    /// mount it crosses.
+    /// Most names a path walk emits (deeper paths are cut at the top and marked truncated);
+    /// the cwd walk also counts each mount it crosses. The scope check walks further
+    /// (`SCOPE_WALK_MAX` in the BPF source) so a deep change is still matched to its root.
     pub const WALK_MAX: u32 = 64;
     /// Longest execve filename captured.
     pub const FILENAME_CAP: u32 = 256;
@@ -309,7 +310,7 @@ wire::wire_consts! {
     /// Bytes of environment captured; a longer one keeps its first and last halves, since
     /// tools append their own variables (npm's lifecycle variables follow the inherited ones).
     pub const ENV_CAP: u32 = 8192;
-    /// Ring buffer size.
+    /// Default ring buffer size; `--ring-size` overrides it.
     pub const RINGBUF_BYTES: u32 = 16 << 20;
 
     /// `stats` slot: records lost because the ring buffer was full.

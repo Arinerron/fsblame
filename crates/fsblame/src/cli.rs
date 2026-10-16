@@ -213,7 +213,9 @@ pub struct RunArgs {
     /// The command and its arguments, after `--`.
     #[arg(last = true, required = true, value_name = "CMD")]
     pub command: Vec<OsString>,
-    /// Write the report to this file instead of stderr.
+    /// Write the report to this file instead of stderr. A new file gets mode 0600 and, under
+    /// sudo, the invoking user as owner; an existing one is truncated and must then belong
+    /// to the invoking user. A symbolic link is refused.
     #[arg(long, short, value_name = "FILE")]
     pub output: Option<PathBuf>,
     /// What to trace and report.

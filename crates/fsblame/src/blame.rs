@@ -245,6 +245,10 @@ fn loss_note(lost: &LostReport) -> String {
             "{} left untracked around {when}; their changes are missing",
             counted(lost.count, "new process", "new processes")
         ),
+        LossReason::Unread => format!(
+            "{} left unread when recording stopped around {when}; the history may be incomplete",
+            counted(lost.count, "kernel record", "kernel records")
+        ),
     }
 }
 

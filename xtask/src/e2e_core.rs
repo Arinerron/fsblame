@@ -337,18 +337,84 @@ fn kept_tail<'a>(reported: &'a Value, root: &Path, real: &Path) -> Result<&'a Pa
     Ok(tail)
 }
 
+/// `real` as reported when its path is cut to its lowest `keep` names below `root`:
+/// `root/…/tail`.
+fn cut_path(root: &Path, real: &Path, keep: usize) -> Result<PathBuf> {
+    let below = real.strip_prefix(root)?;
+    let skip = below.components().count().saturating_sub(keep);
+    Ok(root
+        .join("…")
+        .join(below.components().skip(skip).collect::<PathBuf>()))
+}
+
 pub fn truncation(ctx: &Ctx) -> Result<String> {
+    /// Depth of the files cut by `WALK_MAX`.
+    const FAR: usize = 100;
     let base = ctx.dir("p-truncation")?;
     // Eight directories of 200-byte names: 1.6 KB below the root, past the PATH_CAP bytes
     // the kernel walk emits per path.
-    let deep = (0..8).fold(base.clone(), |path, i| {
+    let wide = (0..8).fold(base.clone(), |path, i| {
         path.join(format!("{i}{}", "d".repeat(199)))
     });
-    fs::create_dir_all(&deep).with_context(|| format!("creating {}", deep.display()))?;
+    // A chain of short names past WALK_MAX components but far from PATH_CAP bytes: files
+    // in `mid` lie exactly WALK_MAX components below the root, those in `far` FAR.
+    let walk_max = usize::try_from(fsblame_abi::WALK_MAX)?;
+    let path_cap = usize::try_from(fsblame_abi::PATH_CAP)?;
+    let chain = |depth: usize| (0..depth).fold(base.clone(), |path, i| path.join(i.to_string()));
+    let (mid, far) = (chain(walk_max - 1), chain(FAR - 1));
+    ensure!(
+        FAR > walk_max && far.strip_prefix(&base)?.as_os_str().len() + 16 < path_cap,
+        "the short chain must pass WALK_MAX components within PATH_CAP bytes"
+    );
+    for dir in [&wide, &far] {
+        fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
     let watcher = ctx.watch(&[&base])?;
-    sh(&deep, "echo x > leaf.txt && mv leaf.txt renamed.txt")?;
+    sh(&wide, "echo x > leaf.txt && mv leaf.txt renamed.txt")?;
+    sh(&mid, "echo x > whole.txt")?;
+    sh(&far, "echo x > far.txt && mv far.txt moved.txt")?;
     let touches = touches(&watcher.stop()?)?;
-    let (leaf, renamed) = (deep.join("leaf.txt"), deep.join("renamed.txt"));
+    let (leaf, renamed) = (wide.join("leaf.txt"), wide.join("renamed.txt"));
+    let (by_bytes, by_names): (Vec<Value>, Vec<Value>) = touches.into_iter().partition(|t| {
+        t["path"].as_str().is_some_and(|p| {
+            Path::new(p)
+                .file_name()
+                .is_some_and(|n| n == "leaf.txt" || n == "renamed.txt")
+        })
+    });
+
+    // WALK_MAX: exactly WALK_MAX names are whole; deeper paths keep their lowest WALK_MAX.
+    let whole = mid.join("whole.txt");
+    let far_cut = cut_path(&base, &far.join("far.txt"), walk_max)?;
+    let moved_cut = cut_path(&base, &far.join("moved.txt"), walk_max)?;
+    exactly(
+        &by_names,
+        &[
+            ("create", &whole),
+            ("write", &whole),
+            ("create", &far_cut),
+            ("write", &far_cut),
+            ("rename", &moved_cut),
+        ],
+    )?;
+    for t in &by_names {
+        let cut = t["path"] != text(&whole).as_str();
+        ensure!(
+            t["truncated"] == cut,
+            "{} {}: truncated is {}, expected {cut}",
+            t["op"],
+            t["path"],
+            t["truncated"]
+        );
+    }
+    ensure_path(
+        touch(&by_names, "rename", &moved_cut)?,
+        "old_path",
+        &far_cut,
+    )?;
+
+    // PATH_CAP.
+    let touches = by_bytes;
     let mut ops: Vec<&str> = touches.iter().filter_map(|t| t["op"].as_str()).collect();
     ops.sort_unstable();
     ensure!(
@@ -356,7 +422,6 @@ pub fn truncation(ctx: &Ctx) -> Result<String> {
         "expected a create, a write and a rename; {}",
         summary(&touches)
     );
-    let path_cap = usize::try_from(fsblame_abi::PATH_CAP)?;
     let name_cap = usize::try_from(fsblame_abi::NAME_CAP)?;
     let mut kept = 0;
     for t in &touches {
@@ -385,8 +450,9 @@ pub fn truncation(ctx: &Ctx) -> Result<String> {
         }
     }
     Ok(format!(
-        "root/…/ plus the last {kept} of {} names",
-        deep.strip_prefix(&base)?.components().count() + 1
+        "{path_cap} bytes: root/…/ plus the last {kept} of {} names; {walk_max} names whole, \
+         {FAR} cut to the last {walk_max}",
+        wide.strip_prefix(&base)?.components().count() + 1
     ))
 }
 

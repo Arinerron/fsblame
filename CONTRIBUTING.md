@@ -91,9 +91,10 @@ cargo xtask --help                                                        # usag
 ```
 
 The suite runs fsblame against the running kernel. Run it as your normal user: it refuses to
-run as root and calls `sudo -n` for each scenario. Each scenario starts
+run as root and calls `sudo -n` for each scenario. A typical scenario starts
 `sudo -n fsblame watch --json` on a fresh directory, waits until every probe is attached, runs
-a workload as you, stops the watcher with SIGINT and checks the NDJSON it printed. The work
+a workload as you, stops the watcher with SIGINT and checks the NDJSON it printed; others run
+`run`, `record` and `blame`, `doctor` or the completions the same way. The work
 directory is `$FSBLAME_E2E_DIR` (default `~/.cache/fsblame-e2e`); it must be on a disk
 filesystem that honours file capabilities, so tmpfs and `nosuid` mounts are refused.
 

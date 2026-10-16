@@ -1,10 +1,13 @@
-//! Facts from the running kernel's BTF that aya does not expose: function prototypes.
+//! The running kernel's BTF, read once: aya's parse, to load programs against, and the facts
+//! aya does not expose (function prototypes).
 //!
 //! Raw BTF (`include/uapi/linux/btf.h`) is a header, then type records numbered from 1, each a
 //! `{name_off, info, size_or_type}` triple followed by kind-specific data, then a string table.
 //! The kernel publishes it in host byte order.
 
-use std::{fs, io};
+use std::{fmt, fs, path::PathBuf, sync::OnceLock};
+
+use aya::{Btf, BtfError, EbpfLoader, Endianness};
 
 /// The running kernel's BTF.
 const VMLINUX: &str = "/sys/kernel/btf/vmlinux";
@@ -13,10 +16,51 @@ const MAGIC: u16 = 0xeb9f;
 const KIND_FUNC: u32 = 12;
 const KIND_FUNC_PROTO: u32 = 13;
 
-/// Parameters of the kernel function `name`, from the running kernel's BTF; `None` when it is
-/// not there.
-pub fn kernel_func_params(name: &str) -> io::Result<Option<usize>> {
-    Ok(func_params(&fs::read(VMLINUX)?, name))
+/// What loading the tracer needs from the running kernel's BTF.
+pub struct KernelBtf {
+    /// aya's parse, for CO-RE relocations and attach targets: 16 MiB on Linux 7.2, so it is
+    /// dropped once the programs are attached.
+    pub btf: Btf,
+    /// Parameters of `security_inode_setattr`; `None` when it is not there.
+    pub setattr_params: Option<usize>,
+}
+
+impl KernelBtf {
+    /// Reads `/sys/kernel/btf/vmlinux` once, for both.
+    pub fn read() -> Result<Self, BtfError> {
+        let raw = fs::read(VMLINUX).map_err(|error| BtfError::FileError {
+            path: PathBuf::from(VMLINUX),
+            error,
+        })?;
+        Ok(Self {
+            setattr_params: func_params(&raw, "security_inode_setattr"),
+            btf: Btf::parse(&raw, Endianness::default())?,
+        })
+    }
+}
+
+impl fmt::Debug for KernelBtf {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("KernelBtf")
+            .field("setattr_params", &self.setattr_params)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A program loader set up with the kernel BTF in `cache`, read into it unless there, and
+/// that BTF, to attach the programs against. [`EbpfLoader::new`] parses the kernel BTF for
+/// itself; that copy is dropped before `cache` is filled, so a load holds one parse at a time.
+pub fn loader(cache: &OnceLock<KernelBtf>) -> Result<(EbpfLoader<'_>, &KernelBtf), BtfError> {
+    let mut loader = EbpfLoader::new();
+    loader.btf(None);
+    let kernel = if let Some(kernel) = cache.get() {
+        kernel
+    } else {
+        let kernel = KernelBtf::read()?;
+        cache.get_or_init(|| kernel)
+    };
+    loader.btf(Some(&kernel.btf));
+    Ok((loader, kernel))
 }
 
 /// Parameters of function `name` in raw BTF; `None` when it is not there or the BTF does not

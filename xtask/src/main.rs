@@ -14,6 +14,7 @@
 mod bench;
 mod e2e_core;
 mod e2e_features;
+mod e2e_startup;
 
 /// The binary's CLI, compiled in from its source so the man pages cannot drift from it. It
 /// needs only clap, `clock`, `glob` and `ops`; including the sources avoids building the BPF object.
@@ -186,7 +187,7 @@ const SCENARIOS: &[Scenario] = &[
     },
     Scenario {
         id: "p",
-        name: "a path longer than PATH_CAP is cut at the top and marked truncated",
+        name: "a path longer than PATH_CAP or WALK_MAX components is cut at the top and marked truncated",
         run: e2e_core::truncation,
     },
     Scenario {
@@ -253,6 +254,11 @@ const SCENARIOS: &[Scenario] = &[
         id: "ac",
         name: "confirmed creates: appending to a cold existing file is no create",
         run: e2e_features::confirmed_creates,
+    },
+    Scenario {
+        id: "ad",
+        name: "a churn from the watching line to the stop: every change reported or counted lost",
+        run: e2e_startup::startup_churn,
     },
 ];
 
@@ -1020,8 +1026,10 @@ fn duration(ctx: &Ctx) -> Result<String> {
         done.status,
         done.stderr
     );
+    // The upper bound includes teardown: detaching the BPF trampolines waits for RCU grace
+    // periods, which takes seconds on a loaded VM.
     ensure!(
-        elapsed >= Duration::from_millis(1500) && elapsed <= Duration::from_secs(4),
+        elapsed >= Duration::from_millis(1500) && elapsed <= Duration::from_secs(6),
         "stopped {elapsed:?} after attaching, expected about 2s"
     );
     Ok(format!(

@@ -15,6 +15,7 @@ use std::{
         unix::ffi::OsStrExt as _,
     },
     path::PathBuf,
+    thread,
     time::{Duration, Instant},
 };
 
@@ -29,7 +30,7 @@ use crate::{
     fail::Failure,
     filter::{Filter, FilterSpec},
     ops::{Op, OpSet},
-    render::{Human, Json},
+    render::{Human, Json, counted},
     report::{Line, LossReason, LossTotals, LostReport, Sink, Summary, Timestamp, Version},
     roots::Roots,
     tracer::{Class, Processes, Tracer},
@@ -37,8 +38,10 @@ use crate::{
 
 /// Longest wait for events, so pending writes are polled in time.
 const TICK_MS: u64 = 100;
-/// Longest final drain once stopping, so records already in the ring are still reported.
-const STOP_DRAIN_MS: u64 = 1000;
+/// Longest final drain once stopping. The records of the changes made before the stop are
+/// still reported; ones left unread then (a backlog that takes longer, or another stop
+/// signal) are counted lost.
+const STOP_DRAIN: Duration = Duration::from_secs(10);
 /// Least time between two `lost` lines of the same reason.
 const LOSS_EVERY: Duration = Duration::from_secs(1);
 /// Output buffered between two flushes (every loop pass): a burst of NDJSON lines, a few KiB
@@ -536,7 +539,8 @@ fn watch(
                 .collect();
             let nested = roots.iter().filter(|(_, r)| r.nested).count();
             if nested > 0 {
-                format!("{} (+{nested} mounts below)", watched.join(", "))
+                let mounts = if nested == 1 { "mount" } else { "mounts" };
+                format!("{} (+{nested} {mounts} below)", watched.join(", "))
             } else {
                 watched.join(", ")
             }
@@ -636,13 +640,18 @@ impl LossMeter {
 /// Writes the `lost` lines due for `totals`; `all` writes every unreported loss.
 fn report_losses(
     engine: &mut Engine<Output<'_>>,
-    meters: &mut [LossMeter; 3],
+    meters: &mut [LossMeter; 4],
     totals: LossTotals,
     clock: Clock,
     all: bool,
 ) -> io::Result<()> {
     let now = Instant::now();
-    let totals = [totals.ring_full, totals.write_evicted, totals.track_full];
+    let totals = [
+        totals.ring_full,
+        totals.write_evicted,
+        totals.track_full,
+        totals.unread,
+    ];
     for (meter, total) in meters.iter_mut().zip(totals) {
         if let Some(count) = meter.due(total, now, all) {
             engine.sink_mut().line(&Line::Lost(LostReport {
@@ -656,8 +665,8 @@ fn report_losses(
     Ok(())
 }
 
-/// The totals so far.
-fn outcome(engine: &Engine<Output<'_>>, tracer: &Tracer) -> Outcome {
+/// The totals so far, with `unread` records left in the ring at the stop.
+fn outcome(engine: &Engine<Output<'_>>, tracer: &Tracer, unread: u64) -> Outcome {
     let counts = engine.counts();
     Outcome {
         changes: counts.touches,
@@ -665,12 +674,47 @@ fn outcome(engine: &Engine<Output<'_>>, tracer: &Tracer) -> Outcome {
             ring_full: tracer.ring_drops(),
             write_evicted: counts.evicted,
             track_full: tracer.track_full(),
+            unread,
         },
         malformed: counts.malformed,
     }
 }
 
-// One linear loop: wait, drain, poll, report losses; then the end-of-run output.
+/// Reads the records reserved until the stop, the run's last: changes made after it are not
+/// reported, like those made before the start. Gives up after [`STOP_DRAIN`] or at another
+/// stop signal. Returns how many records it left unread, or `None` once the output is closed.
+fn drain_to_stop(
+    engine: &mut Engine<Output<'_>>,
+    tracer: &mut Tracer,
+    signals: &Signals,
+) -> Result<Option<u64>, Failure> {
+    let stop = tracer.ring.mark();
+    let give_up = Instant::now() + STOP_DRAIN;
+    // The time and the signals are checked once a tick, not per record.
+    let mut check = Instant::now();
+    while !tracer.ring.passed(stop) {
+        match tracer.ring.next() {
+            Some(item) => {
+                if !output_result(engine.handle(&item, &mut tracer.writes))? {
+                    return Ok(None);
+                }
+            }
+            // A record before the mark is still being written.
+            None => thread::yield_now(),
+        }
+        let now = Instant::now();
+        if now >= check {
+            if now >= give_up || signals.pop().is_some() {
+                break;
+            }
+            check = now + Duration::from_millis(TICK_MS);
+        }
+    }
+    Ok(Some(tracer.ring.unread(stop)))
+}
+
+// One linear loop: wait, drain, poll, report losses; then the final drain and the end-of-run
+// output.
 #[allow(clippy::too_many_lines)]
 fn stream(
     mut engine: Engine<Output<'_>>,
@@ -686,6 +730,7 @@ fn stream(
         LossMeter::new(LossReason::RingFull),
         LossMeter::new(LossReason::WriteEvicted),
         LossMeter::new(LossReason::TrackFull),
+        LossMeter::new(LossReason::Unread),
     ];
     let mut fds = vec![tracer.ring.as_raw_fd(), signals.fd.as_raw_fd()];
     fds.extend(
@@ -703,28 +748,26 @@ fn stream(
     // for `lost` lines, which come at most once a second, but under a stream of single
     // records every wakeup would read them.
     let mut losses_due = Instant::now();
-    let mut open = true;
-    while open {
+    loop {
         let left = deadline.map_or(TICK_MS, |d| {
             u64::try_from(d.saturating_duration_since(Instant::now()).as_millis())
                 .unwrap_or(u64::MAX)
         });
         let ready = epoll.wait(i32::try_from(left.min(TICK_MS)).expect("at most TICK_MS"))?;
+        let mut stop = ready.contains(END) || deadline.is_some_and(|d| Instant::now() >= d);
         if ready.contains(SIGNALS) {
             while let Some(signal) = signals.pop() {
                 if follower.as_deref_mut().is_none_or(|f| f.signal(signal)) {
-                    open = false;
+                    stop = true;
                 }
             }
         }
-        if ready.contains(END) || deadline.is_some_and(|d| Instant::now() >= d) {
-            open = false;
+        if stop {
+            break;
         }
-        // Drain for at most one tick (longer when stopping): under a flood of records (a busy
-        // build forks and execs without pause) the ring never runs dry, and the stop checks
-        // above must still run.
-        let budget =
-            Instant::now() + Duration::from_millis(if open { TICK_MS } else { STOP_DRAIN_MS });
+        // Drain for at most one tick: under a flood of records (a busy build forks and execs
+        // without pause) the ring never runs dry, and the stop checks above must still run.
+        let budget = Instant::now() + Duration::from_millis(TICK_MS);
         let mut closed = false;
         while let Some(item) = tracer.ring.next() {
             if !output_result(engine.handle(&item, &mut tracer.writes))? {
@@ -736,12 +779,12 @@ fn stream(
             }
         }
         if closed {
-            return Ok(outcome(&engine, tracer));
+            return Ok(outcome(&engine, tracer, 0));
         }
         let now = Instant::now();
         if now >= losses_due {
             losses_due = now + Duration::from_millis(TICK_MS);
-            let totals = outcome(&engine, tracer).lost;
+            let totals = outcome(&engine, tracer, 0).lost;
             if !output_result(report_losses(
                 &mut engine,
                 &mut meters,
@@ -749,17 +792,20 @@ fn stream(
                 clock,
                 false,
             ))? {
-                return Ok(outcome(&engine, tracer));
+                return Ok(outcome(&engine, tracer, 0));
             }
         }
         if !output_result(engine.poll(clock::boot_now_ns(), &mut tracer.writes))? {
-            return Ok(outcome(&engine, tracer));
+            return Ok(outcome(&engine, tracer, 0));
         }
     }
+    let Some(unread) = drain_to_stop(&mut engine, tracer, signals)? else {
+        return Ok(outcome(&engine, tracer, 0));
+    };
     if !output_result(engine.finish(&mut tracer.writes))? {
-        return Ok(outcome(&engine, tracer));
+        return Ok(outcome(&engine, tracer, unread));
     }
-    let result = outcome(&engine, tracer);
+    let result = outcome(&engine, tracer, unread);
     let ended = report_losses(&mut engine, &mut meters, result.lost, clock, true).and_then(|()| {
         let output = engine.sink_mut();
         if let Some(summary) = output.summary.take() {
@@ -774,36 +820,58 @@ fn stream(
         return Ok(result);
     }
 
+    let were = |n: u64| if n == 1 { "was" } else { "were" };
     if result.lost.ring_full > 0 {
+        let n = result.lost.ring_full;
         eprintln!(
-            "fsblame: warning: {} kernel records were lost because the ring buffer was full; \
-             a larger --ring-size helps",
-            result.lost.ring_full
+            "fsblame: warning: {} {} lost because the ring buffer was full; a larger \
+             --ring-size helps",
+            counted(n, "kernel record", "kernel records"),
+            were(n)
         );
     }
     if result.lost.write_evicted > 0 {
+        let n = result.lost.write_evicted;
         eprintln!(
-            "fsblame: warning: the latest byte counts of {} open files were lost because the \
-             kernel write table was full",
-            result.lost.write_evicted
+            "fsblame: warning: the latest byte counts of {} {} lost because the kernel write \
+             table was full",
+            counted(n, "open file", "open files"),
+            were(n)
         );
     }
     if result.lost.track_full > 0 {
+        let n = result.lost.track_full;
         eprintln!(
-            "fsblame: warning: {} new processes were not followed because {} processes were \
-             tracked; their changes are missing",
-            result.lost.track_full,
+            "fsblame: warning: {} {} not followed because {} processes were tracked; their \
+             changes are missing",
+            counted(n, "new process", "new processes"),
+            were(n),
             crate::tracer::TRACKED_MAX
         );
     }
-    if result.malformed > 0 {
+    if result.lost.unread > 0 {
+        let n = result.lost.unread;
         eprintln!(
-            "fsblame: warning: {} malformed records were ignored",
-            result.malformed
+            "fsblame: warning: {} {} left unread: after the stop, fsblame reads the records \
+             of the changes before it for at most {} s, or until it is told to stop again",
+            counted(n, "kernel record", "kernel records"),
+            were(n),
+            STOP_DRAIN.as_secs()
+        );
+    }
+    if result.malformed > 0 {
+        let n = result.malformed;
+        eprintln!(
+            "fsblame: warning: {} {} ignored",
+            counted(n, "malformed record", "malformed records"),
+            were(n)
         );
     }
     if !opts.quiet {
-        eprintln!("fsblame: {} changes reported", result.changes);
+        eprintln!(
+            "fsblame: {} reported",
+            counted(result.changes, "change", "changes")
+        );
     }
     Ok(result)
 }

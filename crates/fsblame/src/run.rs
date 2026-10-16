@@ -11,13 +11,16 @@
 use std::{
     env,
     ffi::{CString, OsStr, OsString},
-    fs::File,
+    fs::{File, OpenOptions},
     io::{self, BufWriter, IsTerminal, Write},
     os::{
         fd::{AsFd as _, AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd, RawFd},
-        unix::ffi::{OsStrExt as _, OsStringExt as _},
+        unix::{
+            ffi::{OsStrExt as _, OsStringExt as _},
+            fs::{MetadataExt as _, OpenOptionsExt as _, fchown},
+        },
     },
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::ExitCode,
     ptr,
 };
@@ -39,8 +42,8 @@ pub fn command(args: &RunArgs) -> Result<ExitCode, Failure> {
     let mut cmd = Command::new(&args.command)?;
     let outcome = match &args.output {
         Some(path) => {
-            let file = File::create(path)
-                .with_context(|| format!("cannot create --output {}", path.display()))
+            let file = open_output(path, cmd.creds.as_ref())
+                .with_context(|| format!("cannot write --output {}", path.display()))
                 .map_err(Failure::Usage)?;
             report(file, args, &opts, &mut cmd)
         }
@@ -54,6 +57,54 @@ pub fn command(args: &RunArgs) -> Result<ExitCode, Failure> {
         .ok_or_else(|| anyhow!("the command did not start"))?
         .context("waiting for the command")?;
     Ok(ExitCode::from(code))
+}
+
+/// Opens the `--output` file. The report holds the argv, cwd and environment-derived facts
+/// of the command's processes, so a new file gets mode 0600 and, under sudo, the invoking
+/// user (`owner`) as its owner. An existing file is truncated; under sudo it must belong to
+/// the invoking user. A symbolic link is refused, so that one planted by another user cannot
+/// redirect fsblame's privileged write.
+fn open_output(path: &Path, owner: Option<&Credentials>) -> io::Result<File> {
+    let open = |create: bool| {
+        OpenOptions::new()
+            .write(true)
+            .create_new(create)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+    };
+    match open(true) {
+        Ok(file) => {
+            if let Some(owner) = owner {
+                fchown(&file, Some(owner.uid), Some(owner.gid))?;
+            }
+            Ok(file)
+        }
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            let file = open(false).map_err(|e| {
+                if e.raw_os_error() == Some(libc::ELOOP) {
+                    io::Error::other("it is a symbolic link")
+                } else {
+                    e
+                }
+            })?;
+            let meta = file.metadata()?;
+            if let Some(owner) = owner
+                && meta.uid() != owner.uid
+            {
+                return Err(io::Error::other(format!(
+                    "it belongs to uid {}, not to the invoking user (uid {})",
+                    meta.uid(),
+                    owner.uid
+                )));
+            }
+            if meta.is_file() {
+                file.set_len(0)?;
+            }
+            Ok(file)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Follows `cmd`, writing the report to `out`.

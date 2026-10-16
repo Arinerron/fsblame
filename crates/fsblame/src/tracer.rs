@@ -1,17 +1,19 @@
 //! Loading the BPF object, filling the roots map and attaching programs.
 
-use std::fmt;
+use std::{fmt, sync::OnceLock};
 
 use aya::{
-    Btf, BtfError, Ebpf, EbpfLoader, VerifierLogLevel,
-    maps::{Array, HashMap, MapData, MapError, PerCpuArray, RingBuf},
-    programs::{BtfTracePoint, Program, ProgramError},
+    Btf, BtfError, Ebpf, VerifierLogLevel,
+    maps::{Array, HashMap, MapData, MapError, PerCpuArray},
+    programs::{BtfTracePoint, Program, ProgramError, links::FdLink},
 };
 use fsblame_abi::{self as abi, DevFilter, RootKey, RootVal, WriteKey, WriteVal};
 
 use crate::{
+    btf::{self, KernelBtf},
     fail::errno_of,
     ops::{EXEC_CWD_HOOK, FS_HOOKS, Hook, Op, OpSet, Role, SCHED_HOOKS},
+    ring::Ring,
     roots::Roots,
 };
 
@@ -290,10 +292,11 @@ pub enum Processes {
 
 /// The loaded, attached tracer.
 pub struct Tracer {
-    /// Keeps the programs and their links alive.
-    _ebpf: Ebpf,
+    /// Keep the programs attached, and through them their maps; the rest of the BPF object
+    /// is dropped once loaded.
+    _links: Vec<FdLink>,
     /// Event records.
-    pub ring: RingBuf<MapData>,
+    pub ring: Ring,
     /// Write coalescing totals.
     pub writes: HashMap<MapData, WriteKey, WriteVal>,
     tracked: HashMap<MapData, u32, u8>,
@@ -335,29 +338,27 @@ fn log_level() -> VerifierLogLevel {
 }
 
 /// The tracer object for `ops`, with its maps created (the `events` ring buffer of
-/// `ring_bytes`) and no program loaded yet. `scope` is the `SCOPE_*` of the roots; the
-/// `tracked` map has room only when following `processes`.
-fn open(
-    btf: &Btf,
+/// `ring_bytes`) and no program loaded yet, and the kernel BTF to load its programs against,
+/// read into `btf` unless it is there. `scope` is the `SCOPE_*` of the roots; the `tracked`
+/// map has room only when following `processes`.
+fn open<'b>(
+    btf: &'b OnceLock<KernelBtf>,
     ops: OpSet,
     dev_filter: &DevFilter,
     root_slots: u32,
     ring_bytes: u32,
     scope: u32,
     processes: Processes,
-) -> Result<Ebpf, LoadError> {
+) -> Result<(Ebpf, &'b KernelBtf), LoadError> {
     let self_tgid = std::process::id();
     let op_mask = ops.mask();
     let track = u32::from(processes == Processes::Tracked);
+    let (mut loader, kernel) =
+        btf::loader(btf).map_err(|e| LoadError::new("reading kernel BTF", e))?;
     // security_inode_setattr gained a leading idmap in 6.0 and distributions backport it, so
     // its arity comes from the prototype, not the kernel version.
-    let setattr_idmap = u32::from(
-        crate::btf::kernel_func_params("security_inode_setattr")
-            .map_err(|e| LoadError::new("reading kernel BTF", e))?
-            != Some(2),
-    );
-    EbpfLoader::new()
-        .btf(Some(btf))
+    let setattr_idmap = u32::from(kernel.setattr_params != Some(2));
+    let ebpf = loader
         .verifier_log_level(log_level())
         .override_global("self_tgid", &self_tgid, true)
         .override_global("op_mask", &op_mask, true)
@@ -369,7 +370,16 @@ fn open(
         .map_max_entries("tracked", if track == 0 { 1 } else { TRACKED_MAX })
         .map_max_entries("events", ring_bytes)
         .load(fsblame_bpf::OBJECT)
-        .map_err(|e| LoadError::new("loading the BPF object", e))
+        .map_err(|e| LoadError::new("loading the BPF object", e))?;
+    Ok((ebpf, kernel))
+}
+
+/// A loaded and attached program.
+struct Attached {
+    /// Instructions the verifier processed.
+    insns: Option<u32>,
+    /// Detaches the program when dropped.
+    link: FdLink,
 }
 
 /// Logs how many instructions the verifier processed for `program` on `target`.
@@ -380,9 +390,8 @@ fn log_insns(program: &str, target: &str, insns: Option<u32>) {
     );
 }
 
-/// Loads and attaches the fentry or fexit program of `hook`; returns the instructions the
-/// verifier processed.
-fn attach_hook(ebpf: &mut Ebpf, btf: &Btf, hook: &Hook) -> Result<Option<u32>, LoadError> {
+/// Loads and attaches the fentry or fexit program of `hook`.
+fn attach_hook(ebpf: &mut Ebpf, btf: &Btf, hook: &Hook) -> Result<Attached, LoadError> {
     let what = |step: &str| format!("{step} {} on {}", hook.program, hook.function);
     // FEntry and FExit share no trait; their load, info and attach are the same calls.
     macro_rules! load_and_attach {
@@ -394,12 +403,17 @@ fn attach_hook(ebpf: &mut Ebpf, btf: &Btf, hook: &Hook) -> Result<Option<u32>, L
                 .info()
                 .ok()
                 .and_then(|info| info.verified_instruction_count());
-            prog.attach()
+            let link = prog
+                .attach()
+                .and_then(|id| prog.take_link(id))
                 .map_err(|e| LoadError::new(what("attaching"), e))?;
-            insns
+            Attached {
+                insns,
+                link: link.into(),
+            }
         }};
     }
-    let insns = match program(ebpf, hook.program)? {
+    let attached = match program(ebpf, hook.program)? {
         Program::FEntry(prog) => load_and_attach!(prog),
         Program::FExit(prog) => load_and_attach!(prog),
         _ => {
@@ -409,18 +423,17 @@ fn attach_hook(ebpf: &mut Ebpf, btf: &Btf, hook: &Hook) -> Result<Option<u32>, L
             ));
         }
     };
-    log_insns(hook.program, hook.function, insns);
-    Ok(insns)
+    log_insns(hook.program, hook.function, attached.insns);
+    Ok(attached)
 }
 
-/// Loads and attaches the `tp_btf` program `name` to `tracepoint`; returns the instructions
-/// the verifier processed.
+/// Loads and attaches the `tp_btf` program `name` to `tracepoint`.
 fn attach_tp(
     ebpf: &mut Ebpf,
     btf: &Btf,
     name: &str,
     tracepoint: &str,
-) -> Result<Option<u32>, LoadError> {
+) -> Result<Attached, LoadError> {
     let what = |step: &str| format!("{step} {name} on tp_btf/{tracepoint}");
     let prog: &mut BtfTracePoint = program(ebpf, name)?
         .try_into()
@@ -431,19 +444,27 @@ fn attach_tp(
         .info()
         .ok()
         .and_then(|info| info.verified_instruction_count());
-    prog.attach()
+    let link = prog
+        .attach()
+        .and_then(|id| prog.take_link(id))
         .map_err(|e| LoadError::new(what("attaching"), e))?;
     log_insns(name, tracepoint, insns);
-    Ok(insns)
+    Ok(Attached {
+        insns,
+        link: link.into(),
+    })
 }
 
 /// Loads every optional program of the tracer (the fentry and fexit hooks and
 /// [`EXEC_CWD_HOOK`]), configured for watch roots on the devices of `dev_filter` and every
-/// process, and reports how each fared. The programs detach when this returns.
-pub fn probe_hooks(dev_filter: &DevFilter) -> Result<Vec<HookOutcome>, LoadError> {
-    let btf = Btf::from_sys_fs().map_err(|e| LoadError::new("reading kernel BTF", e))?;
-    let mut ebpf = open(
-        &btf,
+/// process, against the kernel BTF in `btf` (read into it unless there), and reports how
+/// each fared. Each program detaches as soon as it has attached.
+pub fn probe_hooks(
+    btf: &OnceLock<KernelBtf>,
+    dev_filter: &DevFilter,
+) -> Result<Vec<HookOutcome>, LoadError> {
+    let (mut ebpf, kernel) = open(
+        btf,
         OpSet::new(&[]),
         dev_filter,
         1,
@@ -455,17 +476,18 @@ pub fn probe_hooks(dev_filter: &DevFilter) -> Result<Vec<HookOutcome>, LoadError
         .iter()
         .map(|hook| HookOutcome {
             hook: *hook,
-            result: attach_hook(&mut ebpf, &btf, hook),
+            result: attach_hook(&mut ebpf, &kernel.btf, hook).map(|attached| attached.insns),
         })
         .collect();
     outcomes.push(HookOutcome {
         hook: EXEC_CWD_HOOK,
         result: attach_tp(
             &mut ebpf,
-            &btf,
+            &kernel.btf,
             EXEC_CWD_HOOK.program,
             EXEC_CWD_HOOK.function,
-        ),
+        )
+        .map(|attached| attached.insns),
     });
     Ok(outcomes)
 }
@@ -505,14 +527,14 @@ impl Tracer {
         ring_bytes: u32,
         processes: Processes,
     ) -> Result<Self, LoadError> {
-        let btf = Btf::from_sys_fs().map_err(|e| LoadError::new("reading kernel BTF", e))?;
         let root_slots = u32::try_from(roots.len()).unwrap_or(u32::MAX).max(1);
         let scope = match (roots.everywhere(), roots.len()) {
             (false, _) => abi::SCOPE_ROOTS,
             (true, 0) => abi::SCOPE_ALL,
             (true, _) => abi::SCOPE_ALL_EXCLUDES,
         };
-        let mut ebpf = open(
+        let btf = OnceLock::new();
+        let (mut ebpf, kernel) = open(
             &btf,
             ops,
             &roots.dev_filter(),
@@ -525,14 +547,15 @@ impl Tracer {
 
         // on_exec reads what on_exec_cwd leaves on its CPU, and programs on one tracepoint run
         // in attach order: the cwd capture goes first.
+        let mut links = Vec::new();
         let mut missing = Vec::new();
         match attach_tp(
             &mut ebpf,
-            &btf,
+            &kernel.btf,
             EXEC_CWD_HOOK.program,
             EXEC_CWD_HOOK.function,
         ) {
-            Ok(_) => {}
+            Ok(cwd) => links.push(cwd.link),
             Err(error) if error.class() == Class::Unsupported => missing.push(Missing {
                 hook: EXEC_CWD_HOOK,
                 error,
@@ -542,19 +565,24 @@ impl Tracer {
         // Process tracking before file hooks, so lineage is complete before the first file
         // event.
         for (name, tracepoint) in SCHED_HOOKS {
-            attach_tp(&mut ebpf, &btf, name, tracepoint)?;
+            links.push(attach_tp(&mut ebpf, &kernel.btf, name, tracepoint)?.link);
         }
 
         let mut attached = Vec::new();
         for hook in FS_HOOKS.iter().filter(|hook| hook.wanted(ops)) {
-            match attach_hook(&mut ebpf, &btf, hook) {
-                Ok(_) => attached.push(*hook),
+            match attach_hook(&mut ebpf, &kernel.btf, hook) {
+                Ok(program) => {
+                    links.push(program.link);
+                    attached.push(*hook);
+                }
                 Err(error) if error.class() == Class::Unsupported => {
                     missing.push(Missing { hook: *hook, error });
                 }
                 Err(error) => return Err(error),
             }
         }
+        // Free the parsed BTF before the ring buffer is mapped, so the two never add up.
+        drop(btf);
         let reportable = |op| {
             attached
                 .iter()
@@ -591,8 +619,8 @@ impl Tracer {
                 )
             })
         };
-        let ring = RingBuf::try_from(take("events")?)
-            .map_err(|e| LoadError::new("opening map events", e))?;
+        let ring =
+            Ring::new(take("events")?).map_err(|e| LoadError::new("opening map events", e))?;
         let writes = HashMap::try_from(take("writes")?)
             .map_err(|e| LoadError::new("opening map writes", e))?;
         let tracked = HashMap::try_from(take("tracked")?)
@@ -600,7 +628,7 @@ impl Tracer {
         let stats = PerCpuArray::try_from(take("stats")?)
             .map_err(|e| LoadError::new("opening map stats", e))?;
         Ok(Self {
-            _ebpf: ebpf,
+            _links: links,
             ring,
             writes,
             tracked,

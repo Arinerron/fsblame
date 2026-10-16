@@ -386,7 +386,8 @@ fn check_summary(summary: &Value, touches: &[Value]) -> Result<()> {
         touches.len()
     );
     ensure!(
-        summary["lost"] == json!({ "ring_full": 0, "write_evicted": 0, "track_full": 0 }),
+        summary["lost"]
+            == json!({ "ring_full": 0, "write_evicted": 0, "track_full": 0, "unread": 0 }),
         "the summary reports losses: {}",
         summary["lost"]
     );

@@ -8,7 +8,7 @@ use std::{
 
 use anyhow::anyhow;
 use aya::{
-    Btf, Ebpf, EbpfLoader,
+    Btf, Ebpf,
     programs::{BtfTracePoint, FEntry},
 };
 use bpfdoctor::{
@@ -19,6 +19,7 @@ use fsblame_abi::{self as abi, DevFilter};
 use serde::Serialize;
 
 use crate::{
+    btf::{self, KernelBtf},
     cli::DoctorArgs,
     fail::{Failure, errno_of},
     ops::{FS_HOOKS, Hook, Op, Role, SCHED_HOOKS},
@@ -71,13 +72,17 @@ fn brief(e: &(dyn std::error::Error + 'static)) -> String {
     format!("{label}: {e}")
 }
 
-fn load_probes() -> Result<(Btf, Ebpf), String> {
-    let btf = Btf::from_sys_fs().map_err(|e| format!("kernel BTF unreadable: {e}"))?;
-    let ebpf = EbpfLoader::new()
-        .btf(Some(&btf))
+/// The kernel BTF the probes load against, read by the first one that runs.
+pub type SharedBtf = Arc<OnceLock<KernelBtf>>;
+
+/// Loads the probe object against the kernel BTF in `btf` (read into it unless there).
+fn load_probes(btf: &OnceLock<KernelBtf>) -> Result<(&KernelBtf, Ebpf), String> {
+    let (mut loader, kernel) =
+        btf::loader(btf).map_err(|e| format!("kernel BTF unreadable: {e}"))?;
+    let ebpf = loader
         .load(fsblame_bpf::PROBE_OBJECT)
         .map_err(|e| format!("probe object did not load: {}", brief(&e)))?;
-    Ok((btf, ebpf))
+    Ok((kernel, ebpf))
 }
 
 /// Loads and attaches `probe_<function>`; the link is dropped with `ebpf`.
@@ -95,7 +100,10 @@ fn probe_fentry(ebpf: &mut Ebpf, btf: &Btf, function: &str) -> Result<(), String
 
 /// `probe.fentry_security`: fentry trampolines on the security hooks.
 #[derive(Debug)]
-pub struct FentryProbe;
+pub struct FentryProbe {
+    /// The kernel BTF, shared with the other probes.
+    pub btf: SharedBtf,
+}
 
 impl Check for FentryProbe {
     fn id(&self) -> &'static str {
@@ -119,7 +127,7 @@ impl Check for FentryProbe {
         if !privileged(env, tool) {
             return diag(Status::Skip, SKIPPED.to_owned());
         }
-        let (btf, mut ebpf) = match load_probes() {
+        let (kernel, mut ebpf) = match load_probes(&self.btf) {
             Ok(loaded) => loaded,
             Err(why) => {
                 return diag(Status::Fail, why)
@@ -127,7 +135,7 @@ impl Check for FentryProbe {
                     .with_explain(explain);
             }
         };
-        if let Err(why) = probe_fentry(&mut ebpf, &btf, CANONICAL) {
+        if let Err(why) = probe_fentry(&mut ebpf, &kernel.btf, CANONICAL) {
             return diag(Status::Fail, format!("fentry on {CANONICAL} failed: {why}"))
                 .with_impact("fsblame sees no file operations")
                 .with_fix(Fix::new(
@@ -140,7 +148,7 @@ impl Check for FentryProbe {
         let mut impact =
             String::from("operations reported only by the unavailable hooks are not seen");
         for hook in FS_HOOKS.iter().filter(|hook| hook.function != CANONICAL) {
-            if let Err(why) = probe_fentry(&mut ebpf, &btf, hook.function) {
+            if let Err(why) = probe_fentry(&mut ebpf, &kernel.btf, hook.function) {
                 failed.push(format!("{} ({why})", hook.function));
                 if let Role::Supplements(lost) = hook.role {
                     impact.push_str("; ");
@@ -172,7 +180,10 @@ impl Check for FentryProbe {
 
 /// `probe.sched_tp`: the three sched `tp_btf` tracepoints that feed lineage.
 #[derive(Debug)]
-pub struct SchedProbe;
+pub struct SchedProbe {
+    /// The kernel BTF, shared with the other probes.
+    pub btf: SharedBtf,
+}
 
 impl Check for SchedProbe {
     fn id(&self) -> &'static str {
@@ -192,7 +203,7 @@ impl Check for SchedProbe {
         if !privileged(env, tool) {
             return diag(Status::Skip, SKIPPED.to_owned());
         }
-        let (btf, mut ebpf) = match load_probes() {
+        let (kernel, mut ebpf) = match load_probes(&self.btf) {
             Ok(loaded) => loaded,
             Err(why) => {
                 return diag(Status::Fail, why).with_impact("fsblame cannot load its BPF programs");
@@ -207,7 +218,7 @@ impl Check for SchedProbe {
                     .ok_or_else(|| format!("{name} missing from the probe object"))?
                     .try_into()
                     .map_err(|e| format!("{e}"))?;
-                prog.load(tracepoint, &btf).map_err(|e| brief(&e))?;
+                prog.load(tracepoint, &kernel.btf).map_err(|e| brief(&e))?;
                 prog.attach().map_err(|e| brief(&e))?;
                 Ok(())
             })();
@@ -264,6 +275,8 @@ pub struct OpsProbe {
     pub paths: Vec<PathBuf>,
     /// Per-op results of the last run, for `--json`.
     pub ops: Arc<OnceLock<Vec<OpStatus>>>,
+    /// The kernel BTF, shared with the other probes.
+    pub btf: SharedBtf,
 }
 
 /// The program that reports `op`.
@@ -342,7 +355,7 @@ impl Check for OpsProbe {
             },
             |roots| roots.dev_filter(),
         );
-        let outcomes = match tracer::probe_hooks(&filter) {
+        let outcomes = match tracer::probe_hooks(&self.btf, &filter) {
             Ok(outcomes) => outcomes,
             Err(error) => {
                 let _ = self.ops.set(unprobed());
@@ -747,13 +760,19 @@ impl Check for WatchFs {
 
 /// Every check, in display order. `ops` receives the per-op results of `probe.ops`.
 pub fn full(paths: Vec<PathBuf>, ops: Arc<OnceLock<Vec<OpStatus>>>) -> Doctor {
+    let btf = SharedBtf::default();
     let mut doctor = Doctor::with_shared();
     doctor
-        .add(Box::new(FentryProbe))
-        .add(Box::new(SchedProbe))
+        .add(Box::new(FentryProbe {
+            btf: Arc::clone(&btf),
+        }))
+        .add(Box::new(SchedProbe {
+            btf: Arc::clone(&btf),
+        }))
         .add(Box::new(OpsProbe {
             paths: paths.clone(),
             ops,
+            btf,
         }))
         .add(Box::new(WatchFs { paths }));
     doctor

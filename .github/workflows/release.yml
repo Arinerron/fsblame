@@ -1,7 +1,7 @@
 name: release
 
 # A `v*` tag builds static x86_64 and aarch64 binaries and publishes them, with shell
-# completions and man pages, as a GitHub release.
+# completions, man pages and the systemd unit, as a GitHub release.
 on:
   push:
     tags: ["v*"]
@@ -48,7 +48,7 @@ jobs:
             name="fsblame-$TAG-$arch-linux-musl"
             mkdir -p "dist/$name"
             cp "target/$arch-unknown-linux-musl/release/fsblame" LICENSE README.md "dist/$name/"
-            cp -r dist/share/completions dist/share/man "dist/$name/"
+            cp -r dist/share/completions dist/share/man contrib/systemd "dist/$name/"
             tar -C dist -czf "dist/$name.tar.gz" "$name"
             (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
           done

@@ -769,6 +769,10 @@ pub enum LossReason {
     /// The kernel's tracked-process table was full (`fsblame run`, `watch --tree`): new
     /// processes of tracked ones were left untracked, and their changes are missing.
     TrackFull,
+    /// Records of the changes made before the stop were still in the ring buffer when
+    /// fsblame stopped reading it (a backlog it could not read in time, or another stop
+    /// signal): changes or process events are missing.
+    Unread,
 }
 
 /// Losses since the previous `lost` line of the same reason: `{"type":"lost",...}`.
@@ -780,8 +784,8 @@ pub struct LostReport {
     pub ts: Timestamp,
     /// What was lost.
     pub reason: LossReason,
-    /// Records ([`LossReason::RingFull`]), write bindings ([`LossReason::WriteEvicted`]) or
-    /// processes ([`LossReason::TrackFull`]).
+    /// Records ([`LossReason::RingFull`], [`LossReason::Unread`]), write bindings
+    /// ([`LossReason::WriteEvicted`]) or processes ([`LossReason::TrackFull`]).
     pub count: u64,
 }
 
@@ -795,12 +799,15 @@ pub struct LossTotals {
     /// Processes left untracked because the tracked-process table was full.
     #[serde(default)]
     pub track_full: u64,
+    /// Records left in the ring buffer when fsblame stopped reading it.
+    #[serde(default)]
+    pub unread: u64,
 }
 
 impl LossTotals {
     /// Whether nothing was lost.
     pub fn is_empty(&self) -> bool {
-        self.ring_full == 0 && self.write_evicted == 0 && self.track_full == 0
+        self.ring_full == 0 && self.write_evicted == 0 && self.track_full == 0 && self.unread == 0
     }
 }
 
@@ -1190,12 +1197,19 @@ pub(crate) mod tests {
                 reason: LossReason::RingFull,
                 count: 12,
             }),
+            Line::Lost(LostReport {
+                v: Version,
+                ts: Timestamp(1_791_986_539_000_000_000),
+                reason: LossReason::Unread,
+                count: 4,
+            }),
             Line::Summary(summary.report(
                 Timestamp(1_791_986_540_000_000_000),
                 LossTotals {
                     ring_full: 12,
                     write_evicted: 1,
                     track_full: 2,
+                    unread: 4,
                 },
             )),
         ];

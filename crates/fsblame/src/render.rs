@@ -124,7 +124,7 @@ pub fn format_bytes(bytes: u64) -> String {
 }
 
 /// `1 change`, `2 changes`.
-fn counted(n: u64, one: &str, many: &str) -> String {
+pub(crate) fn counted(n: u64, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
 }
 
@@ -454,6 +454,10 @@ impl<W: Write> Human<W> {
                 "changes of {} lost (tracked-process table full)",
                 counted(lost.count, "new process", "new processes")
             ),
+            LossReason::Unread => format!(
+                "{} lost (still unread when fsblame stopped)",
+                counted(lost.count, "kernel record", "kernel records")
+            ),
         };
         writeln!(
             io::stderr().lock(),
@@ -555,6 +559,12 @@ impl<W: Write> Human<W> {
                 parts.push(format!(
                     "changes of {} (tracked-process table full)",
                     counted(s.lost.track_full, "new process", "new processes")
+                ));
+            }
+            if s.lost.unread > 0 {
+                parts.push(format!(
+                    "{} (unread at the stop)",
+                    counted(s.lost.unread, "kernel record", "kernel records")
                 ));
             }
             writeln!(self.out, "  lost: {}", parts.join(", "))?;
