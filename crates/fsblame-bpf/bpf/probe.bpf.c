@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: (MIT OR GPL-2.0)
 /*
  * Feature probes for `fsblame doctor`: one program per attach point fsblame uses, named
- * `probe_<function>` for fentry and `probe_<tracepoint>` for tp_btf. The sched probes make the
- * CO-RE accesses the tracer relies on; nothing is output.
+ * `probe_<function>` for fentry and fexit (a trampoline attaches to a function either way) and
+ * `probe_<tracepoint>` for tp_btf. The sched probes make the CO-RE accesses the tracer relies
+ * on; nothing is output.
  */
 #include "vmlinux_min.h"
 #include <bpf/bpf_helpers.h>
@@ -35,6 +36,7 @@ PROBE_FENTRY(security_inode_symlink)
 PROBE_FENTRY(security_inode_link)
 PROBE_FENTRY(security_inode_rmdir)
 PROBE_FENTRY(security_inode_rename)
+PROBE_FENTRY(vfs_rename)
 PROBE_FENTRY(security_inode_setattr)
 
 SEC("fentry/security_inode_unlink")

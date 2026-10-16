@@ -1,0 +1,33 @@
+version: 2
+updates:
+  # The main workspace (crates/ and xtask/).
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      cargo-minor-patch:
+        update-types: [minor, patch]
+    commit-message:
+      prefix: deps
+
+  # The cargo-fuzz crate, a workspace of its own with its own Cargo.lock.
+  - package-ecosystem: cargo
+    directory: /fuzz
+    schedule:
+      interval: weekly
+    groups:
+      fuzz-minor-patch:
+        update-types: [minor, patch]
+    commit-message:
+      prefix: "deps(fuzz)"
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions-minor-patch:
+        update-types: [minor, patch]
+    commit-message:
+      prefix: ci

@@ -163,7 +163,7 @@ impl Check for FentryProbe {
         )
         .with_impact(impact)
         .with_fix(Fix::new(
-            "grep -wE 'security_[a-z_]+|rw_verify_area' /sys/kernel/tracing/available_filter_functions",
+            "grep -wE 'security_[a-z_]+|rw_verify_area|vfs_rename' /sys/kernel/tracing/available_filter_functions",
             "a hook missing here is inlined or not traceable on this kernel",
         ))
         .with_explain(explain)
@@ -256,8 +256,8 @@ pub struct OpStatus {
     pub detail: Option<String>,
 }
 
-/// `probe.ops`: loads every optional program of the real tracer (the fentry hooks and the cwd
-/// capture), so each op is known to be reportable here, or disabled with its cause.
+/// `probe.ops`: loads every optional program of the real tracer (the fentry and fexit hooks
+/// and the cwd capture), so each op is known to be reportable here, or disabled with its cause.
 #[derive(Debug)]
 pub struct OpsProbe {
     /// Paths the user plans to watch; they shape the program like a real run.
@@ -452,7 +452,7 @@ fn ops_diagnostic(
     }
     if has(|c| c == Cause::Missing) {
         d = d.with_fix(Fix::new(
-            "grep -wE 'security_[a-z_]+|rw_verify_area' /sys/kernel/tracing/available_filter_functions",
+            "grep -wE 'security_[a-z_]+|rw_verify_area|vfs_rename' /sys/kernel/tracing/available_filter_functions",
             "a hook missing here is inlined or not traceable on this kernel; no workaround",
         ));
         explain.push(

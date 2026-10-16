@@ -1,7 +1,7 @@
 //! Event processing: feeds process events to procctx, coalesces writes, selects changes and
 //! emits them, with their lineage, as report lines.
 
-use std::{collections::HashMap, io, path::PathBuf, sync::Arc};
+use std::{collections::HashMap, io, path::PathBuf, rc::Rc, sync::Arc};
 
 use aya::maps::{HashMap as BpfHashMap, MapData};
 use fsblame_abi::{self as abi, WriteKey, WriteVal};
@@ -16,7 +16,7 @@ use crate::{
     filter::{Candidate, Filter},
     ops::Op,
     record::{self, Exec, Fs, Record},
-    report::{ChangeReport, Line, Sink},
+    report::{ChangeReport, Line, LineageId, Sink},
     roots::Roots,
 };
 
@@ -208,6 +208,8 @@ pub struct Lineage {
     pub context: Context,
     /// Build step the actor runs under.
     pub origin: Option<Origin>,
+    /// Identity of this lineage, `None` for an unknown process.
+    pub id: Option<LineageId>,
 }
 
 /// One open instance of a file in one process, as the kernel's `writes` map counts it.
@@ -330,6 +332,13 @@ pub struct Engine<S> {
     windows: HashMap<WindowKey, Window>,
     /// Scratch for the cwd of an exec record, reused across execs.
     cwd: Vec<u8>,
+    /// Scratch for the environment entries of an exec record that procctx reads.
+    env: Vec<u8>,
+    /// The lineage last reported for each live process, reused while its chain is the same
+    /// records: reports keep their lineage id, and sinks what they made of it.
+    lineages: HashMap<u32, Rc<Lineage>>,
+    /// The lineage of an unknown process.
+    unknown: Rc<Lineage>,
     last_expire_ns: u64,
     counts: Counts,
 }
@@ -367,6 +376,9 @@ impl<S: Sink> Engine<S> {
             bindings: HashMap::new(),
             windows: HashMap::new(),
             cwd: Vec::new(),
+            env: Vec::new(),
+            lineages: HashMap::new(),
+            unknown: Rc::default(),
             last_expire_ns: 0,
             counts: Counts::default(),
         }
@@ -410,6 +422,7 @@ impl<S: Sink> Engine<S> {
                 // arrives while the task is still in do_exit, so a lookup after on_exit would
                 // rebuild it from a half-torn-down /proc entry (no exe, argv, cwd or env).
                 self.finish_process(r.tgid, totals)?;
+                self.lineages.remove(&r.tgid);
                 self.procs.on_exit(ExitEvent {
                     ts_ns: r.hdr.ts_ns,
                     key: ProcKey {
@@ -431,7 +444,6 @@ impl<S: Sink> Engine<S> {
 
     fn on_exec(&mut self, exec: &Exec<'_>) {
         let r = exec.rec;
-        let env = exec.env_entries();
         let key = ProcKey {
             pid: r.tgid,
             start: r.start_ns,
@@ -452,7 +464,7 @@ impl<S: Sink> Engine<S> {
             argv: Some(exec.argv),
             // Without one in the record, procctx reads /proc/<pid>/cwd when the lineage loads.
             cwd: exec.cwd(&mut self.cwd),
-            env: Some(&env),
+            env: Some(exec.env_entries(&mut self.env)),
             argv_truncated: flag(r.hdr.flags, abi::F_ARGV_TRUNC),
             cgroup_id: Some(r.cgroup_id),
             uid: Some(r.uid),
@@ -509,8 +521,6 @@ impl<S: Sink> Engine<S> {
             // A process that is already gone keeps its record as it is.
             let _ = self.procs.enrich(actor.tgid);
         }
-        // Load the lineage while the processes are alive; it is rendered later.
-        self.procs.ancestry(actor.tgid, Stop::Root);
         let file = FileId {
             dev: r.dev,
             ino: r.ino,
@@ -518,6 +528,8 @@ impl<S: Sink> Engine<S> {
         let truncated = flag(r.hdr.flags, abi::F_PATH_TRUNC | abi::F_PATH2_TRUNC);
 
         if op == Op::Write && mapped.is_none() {
+            // Load the lineage while the processes are alive; the window is reported later.
+            self.procs.ancestry(actor.tgid, Stop::Root);
             let key = (r.tgid, r.file);
             if let Some(mut old) = self.bindings.remove(&key) {
                 if flag(r.hdr.flags, abi::F_REPLACED) {
@@ -636,6 +648,10 @@ impl<S: Sink> Engine<S> {
         }
         if now_ns.saturating_sub(self.last_expire_ns) >= EXPIRE_EVERY_NS {
             self.procs.expire(now_ns);
+            // Exits drop their process's lineage; this catches the exits that were lost.
+            let procs = &self.procs;
+            self.lineages
+                .retain(|&tgid, _| procs.get(tgid).is_some_and(|info| info.exit.is_none()));
             self.last_expire_ns = now_ns;
         }
         self.sink.flush()
@@ -799,8 +815,11 @@ impl<S: Sink> Engine<S> {
         self.sink.line(&Line::Touch(report))
     }
 
-    /// The actor's ancestry, if the table's record for its pid is the same process.
-    fn lineage(&mut self, actor: &Actor) -> Lineage {
+    /// The actor's ancestry, if the table's record for its pid is the same process. The
+    /// lineage last made for the process is reused while its chain holds the same records:
+    /// procctx replaces a record it changes (copy on write, as the lineage holds it), so equal
+    /// pointers mean equal contents.
+    fn lineage(&mut self, actor: &Actor) -> Rc<Lineage> {
         let ancestry = self.procs.ancestry(actor.tgid, Stop::Root);
         let ticks = |start| self.start_clock.start_to_ticks(start);
         let same = ancestry
@@ -808,7 +827,18 @@ impl<S: Sink> Engine<S> {
             .first()
             .is_some_and(|info| ticks(info.key.start) == ticks(actor.start_ns));
         if !same {
-            return Lineage::default();
+            return Rc::clone(&self.unknown);
+        }
+        if let Some(known) = self.lineages.get(&actor.tgid)
+            && known.complete == ancestry.complete
+            && known.chain.len() == ancestry.chain.len()
+            && known
+                .chain
+                .iter()
+                .zip(&ancestry.chain)
+                .all(|(known, now)| Arc::ptr_eq(known, now))
+        {
+            return Rc::clone(known);
         }
         let chain = ancestry.chain;
         let context = Context {
@@ -823,12 +853,15 @@ impl<S: Sink> Engine<S> {
                 .iter()
                 .find_map(|info| info.env.as_ref()?.tmux.clone()),
         };
-        Lineage {
+        let lineage = Rc::new(Lineage {
             origin: classify_origin(&chain),
             complete: ancestry.complete,
             context,
             chain,
-        }
+            id: Some(LineageId::fresh()),
+        });
+        self.lineages.insert(actor.tgid, Rc::clone(&lineage));
+        lineage
     }
 }
 

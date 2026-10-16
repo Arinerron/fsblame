@@ -162,7 +162,7 @@ pub enum Role {
 pub struct Hook {
     /// Program name in `fsblame.bpf.c`.
     pub program: &'static str,
-    /// Kernel function of an fentry program; the tracepoint of [`EXEC_CWD_HOOK`].
+    /// Kernel function of an fentry or fexit program; the tracepoint of [`EXEC_CWD_HOOK`].
     pub function: &'static str,
     /// Ops the program serves.
     pub ops: &'static [Op],
@@ -179,8 +179,8 @@ impl Hook {
     }
 }
 
-/// The fentry hooks, in attach order.
-pub const FS_HOOKS: [Hook; 15] = [
+/// The fentry and fexit hooks, in attach order.
+pub const FS_HOOKS: [Hook; 16] = [
     Hook {
         program: "on_rw_verify_area",
         function: "rw_verify_area",
@@ -286,6 +286,16 @@ pub const FS_HOOKS: [Hook; 15] = [
         ops: &[Op::Rename],
         always: true,
         role: Role::Reports,
+    },
+    Hook {
+        program: "on_renamed",
+        function: "vfs_rename",
+        ops: &[],
+        always: true,
+        role: Role::Supplements(
+            "a change below a directory being renamed may be judged by where the directory \
+             was until the next directory rename",
+        ),
     },
     Hook {
         program: "on_setattr",

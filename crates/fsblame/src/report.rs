@@ -14,6 +14,7 @@ use std::{
     collections::{BTreeMap, HashSet},
     fmt, io,
     path::Path,
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use procctx::{Confidence, OriginKind, ProcInfo};
@@ -297,6 +298,23 @@ pub struct ChangeReport<'a> {
     pub context: ContextReport<'a>,
     /// The build step the actor runs under.
     pub origin: Option<OriginReport<'a>>,
+    /// Which lineage the fields from `proc` to `origin` describe, for sinks that reuse what
+    /// they made of it; not part of the line. `None` for a parsed line or an unknown actor.
+    #[serde(skip)]
+    pub lineage: Option<LineageId>,
+}
+
+/// Identifies a lineage: touch reports with the same id ([`ChangeReport::lineage`]) have the
+/// same fields from `proc` to `origin`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct LineageId(u64);
+
+impl LineageId {
+    /// An id no lineage of this process has had before.
+    pub fn fresh() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        Self(NEXT.fetch_add(1, Ordering::Relaxed))
+    }
 }
 
 impl<'a> ChangeReport<'a> {
@@ -356,6 +374,7 @@ impl<'a> ChangeReport<'a> {
                 via_pid: o.via.pid,
                 evidence: o.evidence.iter().map(|e| Cow::Borrowed(&**e)).collect(),
             }),
+            lineage: lineage.id,
         }
     }
 
@@ -377,6 +396,133 @@ impl<'a> ChangeReport<'a> {
     /// The acting process, then its ancestors.
     pub fn chain(&self) -> impl Iterator<Item = &ProcReport<'a>> {
         std::iter::once(&self.proc).chain(&self.ancestry)
+    }
+}
+
+/// Encoded lineages a [`LineEncoder`] keeps, by [`LineageId`].
+const LINEAGE_SLOTS: usize = 64;
+
+/// Encodes lines as NDJSON, newline included. The fields from `proc` to `origin`, most of a
+/// touch line, are encoded once per [`LineageId`] and reused while kept: changes come in runs
+/// by one process. The bytes are those of `serde_json` on the [`Line`].
+#[derive(Debug)]
+pub struct LineEncoder {
+    /// The line being encoded, reused.
+    line: Vec<u8>,
+    /// Encoded lineage fields as a JSON object, `{"proc":…}`, in slot `id % LINEAGE_SLOTS`.
+    lineages: Vec<Option<(LineageId, Vec<u8>)>>,
+}
+
+impl Default for LineEncoder {
+    fn default() -> Self {
+        Self {
+            line: Vec::new(),
+            lineages: vec![None; LINEAGE_SLOTS],
+        }
+    }
+}
+
+impl LineEncoder {
+    /// `line` as one line of JSON.
+    pub fn encode(&mut self, line: &Line<'_>) -> serde_json::Result<&[u8]> {
+        self.line.clear();
+        match line {
+            Line::Touch(change) => match change.lineage {
+                Some(id) => self.touch(change, id)?,
+                None => serde_json::to_writer(&mut self.line, line)?,
+            },
+            _ => serde_json::to_writer(&mut self.line, line)?,
+        }
+        self.line.push(b'\n');
+        Ok(&self.line)
+    }
+
+    /// Splices the object of the head fields and the (kept) object of the lineage fields.
+    fn touch(&mut self, change: &ChangeReport<'_>, id: LineageId) -> serde_json::Result<()> {
+        serde_json::to_writer(&mut self.line, &TouchHead::of(change))?;
+        // Both objects have fields: `{"type":…,"ns_pid":7}` + `{"proc":…}` is one object
+        // once the head's `}` and the lineage's `{` become a `,`.
+        self.line.pop();
+        self.line.push(b',');
+        let slot = &mut self.lineages[usize::try_from(id.0).unwrap_or(0) % LINEAGE_SLOTS];
+        let lineage = match slot {
+            Some((kept, encoded)) if *kept == id => encoded,
+            _ => {
+                let mut encoded = slot.take().map(|(_, bytes)| bytes).unwrap_or_default();
+                encoded.clear();
+                serde_json::to_writer(&mut encoded, &TouchLineage::of(change))?;
+                &mut slot.insert((id, encoded)).1
+            }
+        };
+        self.line.extend_from_slice(&lineage[1..]);
+        Ok(())
+    }
+}
+
+/// The fields of a touch line before its lineage, `type` first: as [`Line`] writes them.
+#[derive(Serialize)]
+#[serde(tag = "type", rename = "touch")]
+struct TouchHead<'r> {
+    v: Version,
+    ts: Timestamp,
+    #[serde(with = "op_name")]
+    op: Op,
+    path: &'r str,
+    old_path: Option<&'r str>,
+    target: Option<&'r str>,
+    truncated: bool,
+    bytes: Option<u64>,
+    calls: Option<u64>,
+    file: FileReport,
+    change: Option<ChangeDetail>,
+    tid: u32,
+    comm: &'r str,
+    uid: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ns_pid: Option<u32>,
+}
+
+impl<'r> TouchHead<'r> {
+    fn of(change: &'r ChangeReport<'_>) -> Self {
+        Self {
+            v: change.v,
+            ts: change.ts,
+            op: change.op,
+            path: &change.path,
+            old_path: change.old_path.as_deref(),
+            target: change.target.as_deref(),
+            truncated: change.truncated,
+            bytes: change.bytes,
+            calls: change.calls,
+            file: change.file,
+            change: change.change,
+            tid: change.tid,
+            comm: &change.comm,
+            uid: change.uid,
+            ns_pid: change.ns_pid,
+        }
+    }
+}
+
+/// The lineage fields of a touch line, `proc` to `origin`.
+#[derive(Serialize)]
+struct TouchLineage<'r, 'a> {
+    proc: &'r ProcReport<'a>,
+    ancestry: &'r [ProcReport<'a>],
+    ancestry_complete: bool,
+    context: &'r ContextReport<'a>,
+    origin: Option<&'r OriginReport<'a>>,
+}
+
+impl<'r, 'a> TouchLineage<'r, 'a> {
+    fn of(change: &'r ChangeReport<'a>) -> Self {
+        Self {
+            proc: &change.proc,
+            ancestry: &change.ancestry,
+            ancestry_complete: change.ancestry_complete,
+            context: &change.context,
+            origin: change.origin.as_ref(),
+        }
     }
 }
 
@@ -983,6 +1129,52 @@ pub(crate) mod tests {
                 via_pid: 4000,
                 evidence: vec![text("npm_lifecycle_event=postinstall")],
             }),
+            lineage: None,
+        }
+    }
+
+    #[test]
+    fn encoded_lines_are_serde_json_also_with_kept_lineages() {
+        let id = LineageId::fresh();
+        let tracked = ChangeReport {
+            lineage: Some(id),
+            ..chmod()
+        };
+        let renamed = ChangeReport {
+            op: Op::Rename,
+            old_path: Some(text("/home/u/proj/old.sh")),
+            ns_pid: None,
+            lineage: Some(id),
+            ..chmod()
+        };
+        // Another lineage in the same slot.
+        let other = ChangeReport {
+            ancestry: Vec::new(),
+            origin: None,
+            lineage: Some(LineageId(id.0 + LINEAGE_SLOTS as u64)),
+            ..chmod()
+        };
+        let lines = [
+            Line::Touch(tracked.clone()),
+            Line::Touch(renamed),
+            Line::Touch(other),
+            Line::Touch(tracked),
+            Line::Touch(chmod()),
+            Line::Lost(LostReport {
+                v: Version,
+                ts: Timestamp(1_791_986_531_000_000_000),
+                reason: LossReason::RingFull,
+                count: 12,
+            }),
+        ];
+        let mut encoder = LineEncoder::default();
+        for line in &lines {
+            let mut json = serde_json::to_vec(line).unwrap();
+            json.push(b'\n');
+            assert_eq!(
+                String::from_utf8_lossy(encoder.encode(line).unwrap()),
+                String::from_utf8_lossy(&json)
+            );
         }
     }
 

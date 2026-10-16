@@ -5,7 +5,7 @@ use std::fmt;
 use aya::{
     Btf, BtfError, Ebpf, EbpfLoader, VerifierLogLevel,
     maps::{Array, HashMap, MapData, MapError, PerCpuArray, RingBuf},
-    programs::{BtfTracePoint, FEntry, Program, ProgramError},
+    programs::{BtfTracePoint, Program, ProgramError},
 };
 use fsblame_abi::{self as abi, DevFilter, RootKey, RootVal, WriteKey, WriteVal};
 
@@ -380,21 +380,35 @@ fn log_insns(program: &str, target: &str, insns: Option<u32>) {
     );
 }
 
-/// Loads and attaches the fentry program of `hook`; returns the instructions the verifier
-/// processed.
-fn attach_fentry(ebpf: &mut Ebpf, btf: &Btf, hook: &Hook) -> Result<Option<u32>, LoadError> {
+/// Loads and attaches the fentry or fexit program of `hook`; returns the instructions the
+/// verifier processed.
+fn attach_hook(ebpf: &mut Ebpf, btf: &Btf, hook: &Hook) -> Result<Option<u32>, LoadError> {
     let what = |step: &str| format!("{step} {} on {}", hook.program, hook.function);
-    let prog: &mut FEntry = program(ebpf, hook.program)?
-        .try_into()
-        .map_err(|e| LoadError::new(what("typing"), e))?;
-    prog.load(hook.function, btf)
-        .map_err(|e| LoadError::new(what("loading"), e))?;
-    let insns = prog
-        .info()
-        .ok()
-        .and_then(|info| info.verified_instruction_count());
-    prog.attach()
-        .map_err(|e| LoadError::new(what("attaching"), e))?;
+    // FEntry and FExit share no trait; their load, info and attach are the same calls.
+    macro_rules! load_and_attach {
+        ($prog:expr) => {{
+            let prog = $prog;
+            prog.load(hook.function, btf)
+                .map_err(|e| LoadError::new(what("loading"), e))?;
+            let insns = prog
+                .info()
+                .ok()
+                .and_then(|info| info.verified_instruction_count());
+            prog.attach()
+                .map_err(|e| LoadError::new(what("attaching"), e))?;
+            insns
+        }};
+    }
+    let insns = match program(ebpf, hook.program)? {
+        Program::FEntry(prog) => load_and_attach!(prog),
+        Program::FExit(prog) => load_and_attach!(prog),
+        _ => {
+            return Err(LoadError::new(
+                what("typing"),
+                ProgramError::UnexpectedProgramType,
+            ));
+        }
+    };
     log_insns(hook.program, hook.function, insns);
     Ok(insns)
 }
@@ -423,9 +437,9 @@ fn attach_tp(
     Ok(insns)
 }
 
-/// Loads every optional program of the tracer (the fentry hooks and [`EXEC_CWD_HOOK`]),
-/// configured for watch roots on the devices of `dev_filter` and every process, and reports
-/// how each fared. The programs detach when this returns.
+/// Loads every optional program of the tracer (the fentry and fexit hooks and
+/// [`EXEC_CWD_HOOK`]), configured for watch roots on the devices of `dev_filter` and every
+/// process, and reports how each fared. The programs detach when this returns.
 pub fn probe_hooks(dev_filter: &DevFilter) -> Result<Vec<HookOutcome>, LoadError> {
     let btf = Btf::from_sys_fs().map_err(|e| LoadError::new("reading kernel BTF", e))?;
     let mut ebpf = open(
@@ -441,7 +455,7 @@ pub fn probe_hooks(dev_filter: &DevFilter) -> Result<Vec<HookOutcome>, LoadError
         .iter()
         .map(|hook| HookOutcome {
             hook: *hook,
-            result: attach_fentry(&mut ebpf, &btf, hook),
+            result: attach_hook(&mut ebpf, &btf, hook),
         })
         .collect();
     outcomes.push(HookOutcome {
@@ -482,9 +496,9 @@ fn fill_roots(ebpf: &mut Ebpf, roots: &Roots) -> Result<(), LoadError> {
 impl Tracer {
     /// Loads the tracer for `roots`, reporting `ops` of `processes` through a ring buffer of
     /// `ring_bytes` (a power of two and a multiple of the page size). The sched tracepoints
-    /// are required; an optional program (fentry hook, cwd capture) whose kernel function is
-    /// missing or unattachable is skipped and listed in [`missing`](Self::missing), unless no
-    /// file hook attaches at all.
+    /// are required; an optional program (fentry or fexit hook, cwd capture) whose kernel
+    /// function is missing or unattachable is skipped and listed in
+    /// [`missing`](Self::missing), unless no file hook attaches at all.
     pub fn load(
         roots: &Roots,
         ops: OpSet,
@@ -533,7 +547,7 @@ impl Tracer {
 
         let mut attached = Vec::new();
         for hook in FS_HOOKS.iter().filter(|hook| hook.wanted(ops)) {
-            match attach_fentry(&mut ebpf, &btf, hook) {
+            match attach_hook(&mut ebpf, &btf, hook) {
                 Ok(_) => attached.push(*hook),
                 Err(error) if error.class() == Class::Unsupported => {
                     missing.push(Missing { hook: *hook, error });

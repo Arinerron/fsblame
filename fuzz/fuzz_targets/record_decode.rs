@@ -9,7 +9,7 @@ use libfuzzer_sys::fuzz_target;
 fuzz_target!(|item: &[u8]| {
     match record::decode(item) {
         Ok(Record::Exec(exec)) => {
-            let _ = exec.env_entries();
+            let _ = exec.env_entries(&mut Vec::new());
             let _ = exec.cwd(&mut Vec::new());
             let _ = record::c_str(&exec.rec.comm);
         }

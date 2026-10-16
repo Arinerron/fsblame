@@ -12,6 +12,8 @@
 //! `$CARGO_TARGET_DIR/man`, else `target/man`), from the binary's own clap definition.
 
 mod bench;
+mod e2e_core;
+mod e2e_features;
 
 /// The binary's CLI, compiled in from its source so the man pages cannot drift from it. It
 /// needs only clap, `clock`, `glob` and `ops`; including the sources avoids building the BPF object.
@@ -167,12 +169,97 @@ const SCENARIOS: &[Scenario] = &[
         name: "overlay: each change once, at its merged path, with the upper layer watched too",
         run: overlay,
     },
+    Scenario {
+        id: "m",
+        name: "--exclude hides the excluded subtree, not its siblings or a root inside it",
+        run: e2e_core::exclude,
+    },
+    Scenario {
+        id: "n",
+        name: "nested mounts below the watch root are watched, with full paths",
+        run: e2e_core::nested_mount,
+    },
+    Scenario {
+        id: "o",
+        name: "a directory move invalidates the cached verdicts below it",
+        run: e2e_core::rename_epoch,
+    },
+    Scenario {
+        id: "p",
+        name: "a path longer than PATH_CAP is cut at the top and marked truncated",
+        run: e2e_core::truncation,
+    },
+    Scenario {
+        id: "q",
+        name: "hard links across roots, into one and out of one name both paths",
+        run: e2e_core::hardlinks,
+    },
+    Scenario {
+        id: "r",
+        name: "ring overflow under an exec storm: live lost lines, totals agree, exit 0",
+        run: e2e_core::ring_overflow,
+    },
+    Scenario {
+        id: "s",
+        name: "shared writable mappings are writes: mmap once per open file, mprotect",
+        run: e2e_features::mapped_writes,
+    },
+    Scenario {
+        id: "t",
+        name: "the cwd is captured at exec: a quick `cd sub && exec mv` has it",
+        run: e2e_features::exec_cwd,
+    },
+    Scenario {
+        id: "u",
+        name: "run: the command's changes anywhere, as the invoking user; its exit code",
+        run: e2e_features::run_command,
+    },
+    Scenario {
+        id: "v",
+        name: "watch --tree: only the process tree's changes; a missing pid exits 2",
+        run: e2e_features::tree,
+    },
+    Scenario {
+        id: "w",
+        name: "--include, --ignore-comm, --comm, --pid select changes and their summary",
+        run: e2e_features::filters,
+    },
+    Scenario {
+        id: "x",
+        name: "record and blame: private journal, exact matches, --limit, --since, same tree",
+        run: e2e_features::record_blame,
+    },
+    Scenario {
+        id: "y",
+        name: "completions for bash, zsh and fish offer every subcommand",
+        run: e2e_features::completions,
+    },
+    Scenario {
+        id: "z",
+        name: "output: v in every line, --summary, -q with --ready-fd, --color and NO_COLOR",
+        run: e2e_features::output_options,
+    },
+    Scenario {
+        id: "aa",
+        name: "write identity: recycled inodes stay apart, reopened appends coalesce",
+        run: e2e_features::write_identity,
+    },
+    Scenario {
+        id: "ab",
+        name: "a write before exec is the old image's: sh's, not mkdir's",
+        run: e2e_features::exec_attribution,
+    },
+    Scenario {
+        id: "ac",
+        name: "confirmed creates: appending to a cold existing file is no create",
+        run: e2e_features::confirmed_creates,
+    },
 ];
 
 fn print_scenarios() {
     println!("\nscenarios:");
     for s in SCENARIOS {
-        println!("  {}  {}", s.id, s.name);
+        println!("  {:<2}  {}", s.id, s.name);
     }
 }
 

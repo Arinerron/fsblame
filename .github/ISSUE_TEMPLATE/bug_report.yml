@@ -1,0 +1,117 @@
+name: Bug report
+description: fsblame misreports, misses a change, fails to start, or crashes.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. The details below let us reproduce it on the same kernel and
+        filesystem. For a security problem, do not open an issue: follow
+        [SECURITY.md](https://github.com/Arinerron/fsblame/security/policy) instead.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before you start
+      options:
+        - label: I searched the existing issues, open and closed, and this has not been reported.
+          required: true
+        - label: I am using the latest release, or I said below which commit I built.
+          required: false
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What fsblame did. Paste the relevant output, error messages and the exit code.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+      description: What you expected fsblame to report or do instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: |
+        The exact commands: how you started fsblame (subcommand and options) and the commands
+        that made the changes. A minimal shell script is ideal.
+      placeholder: |
+        sudo fsblame watch ~/proj --json > out.ndjson &
+        cd ~/proj && mv a b
+      render: shell
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: fsblame version
+      description: Output of `fsblame --version`.
+    validations:
+      required: true
+
+  - type: input
+    id: kernel
+    attributes:
+      label: Kernel version
+      description: Output of `uname -r`.
+      placeholder: 6.12.48-1-lts
+    validations:
+      required: true
+
+  - type: input
+    id: distro
+    attributes:
+      label: Distribution and architecture
+      placeholder: Debian 13, x86_64
+    validations:
+      required: true
+
+  - type: dropdown
+    id: privileges
+    attributes:
+      label: How fsblame was run
+      options:
+        - sudo (as root)
+        - File capabilities (setcap) as a normal user
+        - systemd service (contrib/systemd)
+        - Other (describe below)
+    validations:
+      required: true
+
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Doctor output
+      description: |
+        Output of `sudo fsblame doctor --json PATH...`, run with the paths you watched. It shows
+        which probes attach on your kernel and why the others do not.
+      render: json
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Filesystem and container context
+      description: |
+        The filesystem of the watched paths (ext4, btrfs, xfs, tmpfs, NFS, FUSE, ...), whether
+        they are inside an overlay or a container (Docker, Podman, rootless), and anything else
+        unusual about the setup. `findmnt -T PATH` output helps.
+    validations:
+      required: false
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: Logs from `FSBLAME_LOG=debug`, workarounds you found, or other context.
+    validations:
+      required: false

@@ -135,6 +135,13 @@ struct iattr {
 	loff_t ia_size;
 };
 
+/* vfs_rename's argument since Linux 5.12. */
+struct renamedata {
+	struct dentry *old_dentry;
+	struct dentry *new_dentry;
+	unsigned int flags;
+};
+
 struct fs_struct {
 	struct path pwd;
 };

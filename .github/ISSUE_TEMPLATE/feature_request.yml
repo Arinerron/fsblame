@@ -1,0 +1,52 @@
+name: Feature request
+description: Suggest a new capability or an improvement to an existing one.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the suggestion. Describing the problem you want solved, rather than only the
+        solution, helps find the design that fits fsblame best.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before you start
+      options:
+        - label: I searched the existing issues, open and closed, and this has not been suggested.
+          required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to find out or do, and what gets in the way today?
+      placeholder: When a file in /etc changes during a package upgrade, I want to know ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: |
+        How fsblame could solve it: new options, output fields, subcommands or behaviour.
+        Example commands and output are welcome.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other tools, workarounds or designs you considered, and why they fall short.
+    validations:
+      required: false
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: Kernel or platform constraints, related issues, or whether you would like to implement it.
+    validations:
+      required: false

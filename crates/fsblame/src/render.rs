@@ -8,8 +8,8 @@ use std::{
 use crate::{
     ops::Op,
     report::{
-        ChangeReport, Group, GroupReport, Line, LossReason, LostReport, Perms, ProcReport, Sink,
-        SummaryReport,
+        ChangeReport, Group, GroupReport, Line, LineEncoder, LossReason, LostReport, Perms,
+        ProcReport, Sink, SummaryReport,
     },
 };
 
@@ -581,19 +581,23 @@ impl<W: Write> Sink for Human<W> {
 #[derive(Debug)]
 pub struct Json<W> {
     out: W,
+    encoder: LineEncoder,
 }
 
 impl<W: Write> Json<W> {
     /// Writes to `out`.
     pub fn new(out: W) -> Self {
-        Self { out }
+        Self {
+            out,
+            encoder: LineEncoder::default(),
+        }
     }
 }
 
 impl<W: Write> Sink for Json<W> {
     fn line(&mut self, line: &Line<'_>) -> io::Result<()> {
-        serde_json::to_writer(&mut self.out, line)?;
-        self.out.write_all(b"\n")
+        let line = self.encoder.encode(line)?;
+        self.out.write_all(line)
     }
 
     fn flush(&mut self) -> io::Result<()> {

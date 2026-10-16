@@ -1,8 +1,9 @@
 //! Decoding of ring buffer records (layouts in `fsblame-abi`).
 
-use std::borrow::Cow;
+use std::iter;
 
 use fsblame_abi::{self as abi, ExecRec, ExitRec, ForkRec, FsRec, RecHeader};
+use procctx::ENV_KEYS;
 
 /// A decoded record. Payload slices borrow from the ring buffer item.
 #[derive(Clone, Copy, Debug)]
@@ -33,26 +34,29 @@ pub struct Exec<'a> {
     pub cwd_names: Option<&'a [u8]>,
 }
 
-impl<'a> Exec<'a> {
-    /// The whole `KEY=VALUE\0` entries of the captured environment. When the kernel kept only
-    /// its head and tail ([`abi::F_ENV_TRUNC`]), the entry cut at each end of the gap is dropped,
-    /// so no fragment can pose as a variable.
-    pub fn env_entries(&self) -> Cow<'a, [u8]> {
+impl Exec<'_> {
+    /// The whole `KEY=VALUE\0` entries of the captured environment that set a variable
+    /// procctx reads ([`ENV_KEYS`]), in order, built in `buf`: everything
+    /// [`parse_env_facts`](procctx::parse_env_facts) looks at, found without scanning the
+    /// rest of the block byte by byte. When the kernel kept only its head and tail
+    /// ([`abi::F_ENV_TRUNC`]), the entry cut at each end of the gap is dropped, so no fragment
+    /// can pose as a variable.
+    pub fn env_entries<'b>(&self, buf: &'b mut Vec<u8>) -> &'b [u8] {
         /// Bytes the kernel keeps from each end of a truncated environment.
         const HALF: usize = abi::ENV_CAP as usize / 2;
+        buf.clear();
         if self.rec.hdr.flags & abi::F_ENV_TRUNC == 0 {
-            return Cow::Borrowed(self.env);
+            keep_read(self.env, buf);
+        } else {
+            let (head, tail) = self.env.split_at(HALF.min(self.env.len()));
+            if let Some(end) = memchr::memrchr(0, head) {
+                keep_read(&head[..end], buf);
+            }
+            if let Some(start) = memchr::memchr(0, tail) {
+                keep_read(&tail[start + 1..], buf);
+            }
         }
-        let (head, tail) = self.env.split_at(HALF.min(self.env.len()));
-        let head = head
-            .iter()
-            .rposition(|&b| b == 0)
-            .map_or(&[][..], |end| &head[..=end]);
-        let tail = tail
-            .iter()
-            .position(|&b| b == 0)
-            .map_or(&[][..], |start| &tail[start + 1..]);
-        Cow::Owned([head, tail].concat())
+        buf
     }
 
     /// The cwd at exec as an absolute path, built in `buf`; `None` when the kernel did not
@@ -109,6 +113,36 @@ fn take<'a>(rest: &mut &'a [u8], len: u16) -> Option<&'a [u8]> {
     let (head, tail) = rest.split_at_checked(usize::from(len))?;
     *rest = tail;
     Some(head)
+}
+
+/// Whether a byte starts a variable of [`ENV_KEYS`].
+const KEY_STARTS: [bool; 256] = {
+    let mut starts = [false; 256];
+    let mut i = 0;
+    while i < ENV_KEYS.len() {
+        starts[ENV_KEYS[i].as_bytes()[0] as usize] = true;
+        i += 1;
+    }
+    starts
+};
+
+/// Appends each entry of the NUL-separated `KEY=VALUE` `block` that sets a variable in
+/// [`ENV_KEYS`] to `buf`, with its NUL. The entry ends are found with SIMD (`memchr`), and
+/// most entries are passed over on their first byte.
+fn keep_read(block: &[u8], buf: &mut Vec<u8>) {
+    let mut start = 0;
+    for end in memchr::memchr_iter(0, block).chain(iter::once(block.len())) {
+        let entry = &block[start..end];
+        start = end + 1;
+        if entry.first().is_some_and(|&b| KEY_STARTS[usize::from(b)])
+            && ENV_KEYS
+                .iter()
+                .any(|key| entry.get(key.len()) == Some(&b'=') && entry.starts_with(key.as_bytes()))
+        {
+            buf.extend_from_slice(entry);
+            buf.push(0);
+        }
+    }
 }
 
 /// `bytes` up to the first NUL.
@@ -203,21 +237,38 @@ mod tests {
 
     #[test]
     fn exec_payload_splits_at_declared_lengths() {
-        let bytes = exec_bytes(0, b"/bin/sh\0", b"TMUX_PANE=%1\0", b"sh\0-c\0x\0", b"");
+        let bytes = exec_bytes(0, b"/bin/sh\0", b"A=1\0TMUX_PANE=%1\0", b"sh\0-c\0x\0", b"");
         let Ok(Record::Exec(exec)) = decode(&bytes) else {
             panic!("not an exec");
         };
         assert_eq!(exec.filename, b"/bin/sh");
-        assert_eq!(&*exec.env_entries(), b"TMUX_PANE=%1\0");
+        assert_eq!(exec.env_entries(&mut Vec::new()), b"TMUX_PANE=%1\0");
         assert_eq!(exec.argv, b"sh\0-c\0x\0");
         assert_eq!(c_str(&exec.rec.comm), "sh");
+    }
+
+    #[test]
+    fn kept_entries_give_the_facts_of_the_whole_environment() {
+        let env = b"PATH=/bin\0npm_package_name=first\0MAKELEVEL=\0TMUX_PANE\0OUT_DIR=/o\0\
+                    npm_package_name=second\0npm_lifecycle_event=install\0TMUX_PANE=%3\0\
+                    LS_COLORS=npm_package_name=x\0CARGO_PKG_NAME=c";
+        let bytes = exec_bytes(0, b"/bin/sh\0", env, b"sh\0", b"");
+        let Ok(Record::Exec(exec)) = decode(&bytes) else {
+            panic!("not an exec");
+        };
+        let facts = procctx::parse_env_facts(env);
+        assert!(!facts.is_empty());
+        assert_eq!(
+            procctx::parse_env_facts(exec.env_entries(&mut Vec::new())),
+            facts
+        );
     }
 
     #[test]
     fn truncated_env_drops_the_entries_cut_at_the_gap() {
         let half = usize::try_from(abi::ENV_CAP / 2).unwrap();
         // Head: a whole entry, filler, then the start of an entry cut by the gap.
-        let mut head = b"A=1\0".to_vec();
+        let mut head = b"TMUX_PANE=%1\0".to_vec();
         head.resize(half - b"\0npm_package_name=cu".len(), b'x');
         head.extend_from_slice(b"\0npm_package_name=cu");
         // Tail: the end of an entry whose key was cut, then a whole entry.
@@ -227,12 +278,10 @@ mod tests {
         let Ok(Record::Exec(exec)) = decode(&bytes) else {
             panic!("not an exec");
         };
-        let entries = exec.env_entries();
-        let kept: Vec<&[u8]> = entries
-            .split(|&b| b == 0)
-            .filter(|e| e.contains(&b'='))
-            .collect();
-        assert_eq!(kept, [&b"A=1"[..], b"npm_lifecycle_event=postinstall"]);
+        assert_eq!(
+            exec.env_entries(&mut Vec::new()),
+            b"TMUX_PANE=%1\0npm_lifecycle_event=postinstall\0"
+        );
     }
 
     #[test]

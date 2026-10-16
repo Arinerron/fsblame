@@ -5,8 +5,10 @@
  *
  * Scope: a dentry is in scope when it, or its nearest ancestor found in `roots`, is a watch
  * root (not an exclude). The verdict is cached per dentry in `verdicts`, validated against the
- * dentry's parent, inode number and `dir_epoch` (bumped whenever a directory is renamed on a
- * watched filesystem), so an unwatched path costs one device check and one LRU lookup.
+ * dentry's parent, inode number and `dir_epoch`, so an unwatched path costs one device check
+ * and one LRU lookup. `dir_epoch` is bumped when a directory on a watched filesystem is about
+ * to move (on_rename) and again once it has moved (on_renamed): a walk in between still sees
+ * the old tree.
  *
  * Writes: rw_verify_area stashes the requested byte count per CPU; the security_file_permission
  * hook that follows consumes it and accumulates into `writes`, keyed by (tgid, struct file *).
@@ -95,6 +97,12 @@ char LICENSE[] SEC("license") = "Dual MIT/GPL";
 #define SLOT_POST_OPEN (OP_COUNT + 2)
 #define FS_SLOTS (OP_COUNT + 3)
 
+/* d_parent hops of the scope walk. A record carries at most WALK_MAX names, but the walk has
+ * to reach the root above a deeper change to tell whether it is watched: this covers any path
+ * the kernel resolves in one call (PATH_MAX bytes hold at most 2048 names). bpf_loop's count
+ * costs no verifier budget, and the verdict is walked once per dentry. */
+#define SCOPE_WALK_MAX 4096
+
 /* Payload offsets are masked or clamped to a constant before every write so the verifier can
  * bound them; the logical offsets never reach the mask (two paths of PATH_CAP + NAME_CAP, or
  * one exec record), so the masking never wraps. The slack after the mask covers the largest
@@ -119,6 +127,10 @@ struct fs_scratch {
 	 * Tracked on the stack, each iteration's cursor range is a new state; two walks in one
 	 * program (rename, link) multiplied past the 1M-instruction limit. */
 	u32 cur;
+	/* How the walk ended, here for the same reason: on the stack, each way the walk can stop
+	 * is a state of its own that the rest of the program is verified from. */
+	u32 cut; /* names left out: past the path's end, or past WALK_MAX */
+	u32 top; /* got to the filesystem root */
 	u32 _pad;
 };
 
@@ -457,7 +469,7 @@ static __always_inline struct scope scope_of(struct dentry *d, u32 dev)
 	m.depth = 0;
 	m.root = s.root; /* what a walk that meets no root or exclude yields */
 	m._pad = 0;
-	bpf_loop(WALK_MAX, match_step, &m, 0);
+	bpf_loop(SCOPE_WALK_MAX, match_step, &m, 0);
 	fresh.parent = (u64)parent;
 	fresh.ino = ino;
 	fresh.epoch = epoch;
@@ -473,8 +485,8 @@ struct walk {
 	struct dentry *d;
 	u32 end;  /* no name starts at or beyond this offset */
 	u32 left; /* names still to emit */
-	u32 slot; /* fs_buf slot; its `cur` is the write cursor */
-	u32 trunc;
+	u32 slot; /* fs_buf slot; its `cur`, `cut` and `top` are the walk's state */
+	u32 _pad;
 };
 
 /* Emits the name of one dentry, leaf first, and steps to its parent. */
@@ -482,22 +494,25 @@ static long walk_step(u64 index, void *data)
 {
 	struct walk *w = data;
 	struct dentry *d = w->d;
-	struct dentry *parent;
+	struct dentry *parent = d->d_parent;
 	struct fs_scratch *s;
 	u32 slot = w->slot, pos;
 	long n;
 
-	if (w->left == 0)
-		return 1;
-	parent = d->d_parent;
-	if (!parent || parent == d) /* the filesystem root has no name */
-		return 1;
 	s = bpf_map_lookup_elem(&fs_buf, &slot);
 	if (!s)
 		return 1;
+	/* The filesystem root has no name. Tested first, so the hop after the last name tells
+	 * whether the path is whole. */
+	if (!parent || parent == d) {
+		s->top = 1;
+		return 1;
+	}
+	if (w->left == 0)
+		return 1;
 	pos = s->cur;
-	if (pos >= w->end) {
-		w->trunc = 1;
+	if (index == WALK_MAX || pos >= w->end) {
+		s->cut = 1;
 		return 1;
 	}
 	/* Bound the write against a constant, never against the running cursor: the logical
@@ -513,33 +528,35 @@ static long walk_step(u64 index, void *data)
 	return 0;
 }
 
-/* Writes up to `left` names of `d` and its ancestors at `off` in `s`, the scratch of `slot`;
- * returns the new offset. */
+/* Writes up to `left` names of `d` and its ancestors, at most WALK_MAX, at `off` in `s`, the
+ * scratch of `slot`, and returns the new offset. Sets `trunc` when names are left out, or when
+ * `whole` asks for every name up to the filesystem root and the walk did not get there. */
 static __always_inline u32 emit_names(struct fs_scratch *s, u32 slot, u32 off, struct dentry *d,
-				      u32 left, u32 *trunc)
+				      u32 left, u32 whole, u32 *trunc)
 {
-	struct walk w = {
-		.d = d, .end = off + PATH_CAP, .left = left, .slot = slot, .trunc = 0,
-	};
+	struct walk w = { .d = d, .end = off + PATH_CAP, .left = left, .slot = slot, ._pad = 0 };
 
 	s->cur = off;
-	bpf_loop(WALK_MAX, walk_step, &w, 0);
-	/* A walk to the fs root that used every hop may have stopped short of it. */
-	if (w.trunc || (left == WALK_MAX && w.left == 0))
-		*trunc = 1;
+	s->cut = 0;
+	s->top = 0;
+	/* One hop more than names, for the root test after the last one. The flags are combined
+	 * without branches: a branch on them would split every verifier state after the walk. */
+	bpf_loop(WALK_MAX + 1, walk_step, &w, 0);
+	*trunc |= s->cut | (whole & (s->top ^ 1));
 	return s->cur;
 }
 
-/* The path of `d`: relative to its watch root when in one, else to its filesystem root. */
+/* The path of `d`: relative to its watch root when in one, else to its filesystem root. Either
+ * keeps its lowest WALK_MAX names, marked truncated when there are more. */
 static __always_inline u32 emit_path(struct fs_scratch *s, u32 slot, u32 off, struct dentry *d,
 				     struct scope sc, u32 *root, u32 *trunc)
 {
 	if (sc.root == ROOT_NONE || sc.root == ROOT_FSROOT) {
 		*root = ROOT_FSROOT;
-		return emit_names(s, slot, off, d, WALK_MAX, trunc);
+		return emit_names(s, slot, off, d, WALK_MAX, 1, trunc);
 	}
 	*root = sc.root;
-	return emit_names(s, slot, off, d, sc.depth, trunc);
+	return emit_names(s, slot, off, d, sc.depth, 0, trunc);
 }
 
 /* The pid of `task` in its own pid namespace; 0 when that is the initial one. */
@@ -766,20 +783,39 @@ int BPF_PROG(on_rmdir, struct inode *dir, struct dentry *dentry)
 	return report(OP_RMDIR, OP_RMDIR, dentry, NULL, NULL, NULL, 0, 0, 0);
 }
 
+/* Bumps dir_epoch if renaming `old` onto `new` (`flags` RENAME_*) moves a directory on a
+ * watched filesystem: every dentry below it may change scope, whoever moves it. */
+static __always_inline void bump_dir_epoch(struct dentry *old, struct dentry *new, u32 flags)
+{
+	struct inode *src = old->d_inode;
+	struct inode *dst = new->d_inode;
+	bool moves_dir = (src && S_ISDIR(src->i_mode)) ||
+			 ((flags & RENAME_EXCHANGE) && dst && S_ISDIR(dst->i_mode));
+
+	if (moves_dir && dev_walked(old->d_sb->s_dev))
+		__sync_fetch_and_add(&dir_epoch, 1);
+}
+
 SEC("fentry/security_inode_rename")
 int BPF_PROG(on_rename, struct inode *old_dir, struct dentry *old_dentry, struct inode *new_dir,
 	     struct dentry *new_dentry, unsigned int flags)
 {
 	struct inode *src = old_dentry->d_inode;
 	struct inode *dst = new_dentry->d_inode;
-	bool moves_dir = (src && S_ISDIR(src->i_mode)) ||
-			 ((flags & RENAME_EXCHANGE) && dst && S_ISDIR(dst->i_mode));
 
-	/* Every dentry below a moved directory may change scope, whoever moved it. */
-	if (moves_dir && dev_walked(old_dentry->d_sb->s_dev))
-		__sync_fetch_and_add(&dir_epoch, 1);
+	bump_dir_epoch(old_dentry, new_dentry, flags);
 	return report(OP_RENAME, OP_RENAME, new_dentry, old_dentry, NULL, src, 0, flags,
 		      dst ? dst->i_ino : 0);
+}
+
+/* The second bump of a directory move, once vfs_rename has made it (see the top comment). The
+ * dentries keep their inodes across the move, so the test is on_rename's. */
+SEC("fexit/vfs_rename")
+int BPF_PROG(on_renamed, struct renamedata *rd, int ret)
+{
+	if (ret == 0)
+		bump_dir_epoch(rd->old_dentry, rd->new_dentry, rd->flags);
+	return 0;
 }
 
 /* security_inode_setattr is (dentry, attr) upstream before 6.0 and (idmap, dentry, attr) since,
@@ -897,20 +933,24 @@ int BPF_PROG(on_file_permission, struct file *file, int mask)
 	inode = file->f_inode;
 	if (!inode || (inode->i_mode & S_IFMT) != S_IFREG || layer_file(file))
 		return 0;
-	id = bpf_get_current_pid_tgid();
-	st = bpf_map_lookup_elem(&stash, &zero);
-	if (st && st->file == (u64)file && st->tid == (u32)id) {
-		bytes = st->count;
-		st->file = 0;
-	}
-	tgid = id >> 32;
-	if (tgid == self_tgid || untracked(tgid))
+	/* Most writes are out of scope: turned away before the process and the stash are looked
+	 * at. The tracked set, when tracking, turns away more at once. */
+	if (track && untracked(current_tgid()))
 		return 0;
 	d = file->f_path.dentry;
 	dev = inode->i_sb->s_dev;
 	sc = scope_of(d, dev);
 	if (sc.root == ROOT_NONE)
 		return 0;
+	id = bpf_get_current_pid_tgid();
+	tgid = id >> 32;
+	if (tgid == self_tgid)
+		return 0;
+	st = bpf_map_lookup_elem(&stash, &zero);
+	if (st && st->file == (u64)file && st->tid == (u32)id) {
+		bytes = st->count;
+		st->file = 0;
+	}
 
 	now = bpf_ktime_get_boot_ns();
 	/* Another CPU may have started the instance a moment "later". */

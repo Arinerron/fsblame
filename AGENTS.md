@@ -63,6 +63,7 @@ flowchart LR
 | `on_create`, `on_mkdir`, `on_mknod`, `on_symlink`, `on_link`, `on_unlink`, `on_rmdir` | `fentry/security_inode_<op>` | that op | op skipped with a warning |
 | `on_file_post_open` | `fentry/security_file_post_open` (Linux ≥ 6.9) | create by an `open(O_CREAT)` whose name was not in the dentry cache: `may_o_create` calls `security_inode_create` before the lookup (the dentry is still `d_in_lookup`), so `on_create` leaves it to this hook, which reports it only if the open set `FMODE_CREATED`; `creating` carries the dentry per thread (matched by dentry, since an overlay's create runs its own upper-layer create in between) | such an open of an existing file is reported as a create |
 | `on_rename` | `fentry/security_inode_rename` | rename (old + new path); bumps `dir_epoch` on directory moves | always loaded, even without `--op rename` (then only the epoch bump survives dead-code elimination) |
+| `on_renamed` | `fexit/vfs_rename` | bumps `dir_epoch` again once a directory has moved: a scope walk between `on_rename`'s bump and the move cached a verdict from the old tree | always loaded; without it such a verdict lasts until the next directory rename |
 | `on_setattr` | `fentry/security_inode_setattr` | chmod, chown, truncate, utimes, setattr (by `ia_valid`) | ops skipped |
 | `on_rw_verify_area` | `fentry/rw_verify_area` | stashes the write's byte count per CPU | writes still reported, without byte counts |
 | `on_file_permission` | `fentry/security_file_permission` (`MAY_WRITE`, regular files) | write (first write per `(tgid, struct file)` binding) | write skipped |
@@ -119,9 +120,11 @@ host side of a volume. In the kernel, `scope_of(dentry)`:
 1. `dev_filter`: one compare per watched superblock; other filesystems cost nothing more.
 2. `verdicts` LRU keyed by dentry pointer, valid while the dentry's parent, inode number and
    the global `dir_epoch` match. `on_rename` bumps `dir_epoch` whenever a directory moves on a
-   watched filesystem, invalidating every cached verdict.
-3. Otherwise a `bpf_loop(WALK_MAX = 64)` `d_parent` walk looking each ancestor's inode up in
-   `roots`; the first root or exclude wins. The verdict records the root id and the depth.
+   watched filesystem, and `on_renamed` again after the move, invalidating every cached verdict.
+3. Otherwise a `bpf_loop(SCOPE_WALK_MAX = 4096)` `d_parent` walk looking each ancestor's inode
+   up in `roots`; the first root or exclude wins. The verdict records the root id and the
+   depth. The walk reaches the root of any path the kernel resolves in one call, so a change
+   deeper than the `WALK_MAX` (64) names a record carries is still reported, truncated.
 
 Overlays (module docs of `roots.rs`): a change made through an overlay's merged view reaches the
 hooks twice in the same process, as the overlay's operation and as overlayfs's operations on the
@@ -187,9 +190,12 @@ Rules that keep every program small:
 - Size arguments are constants or clamped (`ENV_CAP / 2`, `ARGV_CAP`, `PATH_CAP`).
 
 Verified instruction counts on 7.2.6 (from `sudo fsblame doctor --json | jq '.ops'`):
-`on_rename` 5,413, `on_link` 5,305, `on_file_permission` 1,469, `on_setattr` 1,206,
-`on_symlink` 1,172, `on_mknod` 1,138, `on_unlink`/`on_rmdir` 1,101, `on_create`/`on_mkdir` 1,079
-(before the cursor fix: single-walk programs ~95k–392k, rename/link > 1,000,000).
+`on_rename` 3,208, `on_link` 3,126, `on_file_permission` 1,606, `on_mmap_file` 1,295,
+`on_setattr` 1,036, `on_create` 1,030, `on_symlink` 1,011, `on_mknod` 976, `on_mkdir` 968,
+`on_unlink`/`on_rmdir` 950, `on_renamed` 62 (before the cursor fix: single-walk programs
+~95k–392k, rename/link > 1,000,000). The path walk's end state (`cut`, `top`) lives in the
+scratch map value like its cursor: on the stack, each way a walk can stop was a verifier state
+of its own for the rest of the program (2x the instructions, 6x for rename/link).
 
 The loader asks for verifier statistics only (`VerifierLogLevel::STATS`); `FSBLAME_LOG=debug`
 requests the full instruction trace. A full trace of a program at the limit is hundreds of

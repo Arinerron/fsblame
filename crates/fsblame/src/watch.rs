@@ -41,6 +41,9 @@ const TICK_MS: u64 = 100;
 const STOP_DRAIN_MS: u64 = 1000;
 /// Least time between two `lost` lines of the same reason.
 const LOSS_EVERY: Duration = Duration::from_secs(1);
+/// Output buffered between two flushes (every loop pass): a burst of NDJSON lines, a few KiB
+/// each, goes out in a few writes.
+const OUTPUT_BUFFER: usize = 1 << 16;
 
 /// What [`run`] watches and how.
 #[derive(Clone, Debug)]
@@ -185,7 +188,7 @@ impl Epoll {
     }
 
     /// Waits up to `timeout_ms`; returns the tokens that became ready.
-    fn wait(&self, timeout_ms: i32) -> anyhow::Result<Vec<u64>> {
+    fn wait(&self, timeout_ms: i32) -> anyhow::Result<Ready> {
         let mut events = [libc::epoll_event { events: 0, u64: 0 }; 4];
         // SAFETY: `events` is writable for its length.
         let n = unsafe {
@@ -199,12 +202,26 @@ impl Epoll {
         if n < 0 {
             let err = io::Error::last_os_error();
             if err.kind() == io::ErrorKind::Interrupted {
-                return Ok(Vec::new());
+                return Ok(Ready(0));
             }
             return Err(anyhow::Error::new(err).context("epoll_wait"));
         }
         let n = usize::try_from(n).expect("non-negative");
-        Ok(events[..n].iter().map(|e| e.u64).collect())
+        Ok(Ready(
+            events[..n]
+                .iter()
+                .fold(0, |set, e| set | (1 << (e.u64 & 63))),
+        ))
+    }
+}
+
+/// The tokens (below 64) an [`Epoll::wait`] found ready.
+#[derive(Clone, Copy)]
+struct Ready(u64);
+
+impl Ready {
+    fn contains(self, token: u64) -> bool {
+        self.0 & (1 << token) != 0
     }
 }
 
@@ -326,7 +343,7 @@ pub fn command(args: &WatchArgs) -> Result<(), Failure> {
         Some(Tree::new(&args.tree)?)
     };
     let follower = tree.as_mut().map(|tree| tree as &mut dyn Follow);
-    let out = BufWriter::new(io::stdout().lock());
+    let out = BufWriter::with_capacity(OUTPUT_BUFFER, io::stdout().lock());
     if args.view.json {
         watch(&opts, follower, &mut Json::new(out))?;
     } else {
@@ -682,6 +699,10 @@ fn stream(
         signal_ready(fd).with_context(|| format!("writing to --ready-fd {fd}"))?;
     }
     let deadline = opts.duration.map(|d| Instant::now() + d);
+    // The loss counters are kernel maps, each read with a system call: once a tick is enough
+    // for `lost` lines, which come at most once a second, but under a stream of single
+    // records every wakeup would read them.
+    let mut losses_due = Instant::now();
     let mut open = true;
     while open {
         let left = deadline.map_or(TICK_MS, |d| {
@@ -689,17 +710,14 @@ fn stream(
                 .unwrap_or(u64::MAX)
         });
         let ready = epoll.wait(i32::try_from(left.min(TICK_MS)).expect("at most TICK_MS"))?;
-        if ready.contains(&SIGNALS) {
+        if ready.contains(SIGNALS) {
             while let Some(signal) = signals.pop() {
                 if follower.as_deref_mut().is_none_or(|f| f.signal(signal)) {
                     open = false;
                 }
             }
         }
-        if ready.contains(&END) || deadline.is_some_and(|d| Instant::now() >= d) {
-            open = false;
-        }
-        if deadline.is_some_and(|d| Instant::now() >= d) {
+        if ready.contains(END) || deadline.is_some_and(|d| Instant::now() >= d) {
             open = false;
         }
         // Drain for at most one tick (longer when stopping): under a flood of records (a busy
@@ -717,17 +735,24 @@ fn stream(
                 break;
             }
         }
-        let totals = outcome(&engine, tracer).lost;
-        if closed
-            || !output_result(report_losses(
+        if closed {
+            return Ok(outcome(&engine, tracer));
+        }
+        let now = Instant::now();
+        if now >= losses_due {
+            losses_due = now + Duration::from_millis(TICK_MS);
+            let totals = outcome(&engine, tracer).lost;
+            if !output_result(report_losses(
                 &mut engine,
                 &mut meters,
                 totals,
                 clock,
                 false,
-            ))?
-            || !output_result(engine.poll(clock::boot_now_ns(), &mut tracer.writes))?
-        {
+            ))? {
+                return Ok(outcome(&engine, tracer));
+            }
+        }
+        if !output_result(engine.poll(clock::boot_now_ns(), &mut tracer.writes))? {
             return Ok(outcome(&engine, tracer));
         }
     }
