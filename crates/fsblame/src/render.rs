@@ -458,6 +458,10 @@ impl<W: Write> Human<W> {
                 "{} lost (still unread when fsblame stopped)",
                 counted(lost.count, "kernel record", "kernel records")
             ),
+            LossReason::Other => format!(
+                "{} lost (a reason this version of fsblame does not know)",
+                counted(lost.count, "item", "items")
+            ),
         };
         writeln!(
             io::stderr().lock(),

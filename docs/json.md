@@ -15,7 +15,7 @@ There are three line types:
 | `type` | When |
 |--------|------|
 | [`touch`](#touch-one-change) | One change to a watched path. |
-| [`lost`](#lost-data-the-kernel-side-could-not-deliver) | The kernel side lost data: at most one line per reason per second while running, and a final one at the end for anything not yet reported. |
+| [`lost`](#lost-data-that-did-not-reach-the-report) | Data was lost on the way from the kernel: at most one line per reason per second while running, and a final one at the end for anything not yet reported. |
 | [`summary`](#summary-the-whole-run) | Once, as the last line, when `--summary` is given. |
 
 Paths and command lines are Linux byte strings; bytes that are not valid UTF-8 are replaced
@@ -29,6 +29,11 @@ with U+FFFD. Times are RFC 3339 in UTC with microseconds, such as
   type.
 - Readers must ignore fields they do not know. fsblame itself does, so a newer journal stays
   readable by `fsblame blame` as long as `v` matches.
+- New `reason` values of `lost` lines, and with them new keys of the summary's `lost` object,
+  may appear within version 1. Readers must tolerate a reason they do not know; its `count`
+  still says how many of something were lost. fsblame shows such a loss as one of "a reason
+  this version of fsblame does not know", and `fsblame blame --json` writes it back with
+  `reason` `other`.
 - A change that would break existing readers bumps `v`. fsblame refuses to read a line of
   another version: `report version 2 is not supported (this fsblame reads version 1)`.
 
@@ -246,11 +251,14 @@ absolute path resolved through the mount table fsblame read at start. So does `f
 without paths, which watches every filesystem. A change on a filesystem mounted after
 fsblame started has no entry in that table and reads `<dev MAJOR:MINOR>/path/below/its/root`.
 
-## `lost`: data the kernel side could not deliver
+## `lost`: data that did not reach the report
 
 ```json
 {"type":"lost","v":1,"ts":"2026-10-16T22:11:46.612758Z","reason":"ring-full","count":3092}
+{"type":"lost","v":1,"ts":"2026-10-16T22:58:46.362099Z","reason":"unread","count":91954}
 ```
+
+The second line is from a run stopped with two quick Ctrl-C while it was far behind.
 
 | Field | Type | Meaning |
 |-------|------|---------|
@@ -265,6 +273,7 @@ fsblame started has no entry in that table and reads `<dev MAJOR:MINOR>/path/bel
 | `ring-full` | records | The kernel ring buffer was full: changes, or the process events lineage is built from, were dropped. Raise `--ring-size`. |
 | `write-evicted` | write bindings | The kernel's write table evicted open files before fsblame read their latest totals: their `bytes` and `calls` since the previous read are missing. |
 | `track-full` | processes | `fsblame run` and `watch --tree` only: the table of followed processes was full (65,536 entries), so new processes started by followed ones were not followed, and their changes are missing. |
+| `unread` | records | fsblame stopped before it had read the records of every change made before the stop. After a stop (SIGINT, SIGTERM, SIGHUP, the `--duration` deadline, or the end of `run`'s command) it keeps reading them for up to 10 s, and a second stop signal ends that at once; the changes or process events still in the ring then are missing. |
 
 The counts of all `lost` lines of a run add up to the run's totals in the `summary` line and
 in the warning fsblame prints on stderr when it stops. In human output, losses go to stderr
@@ -280,7 +289,7 @@ Written last when `--summary` is given (from a real run, shortened to two groups
   "v": 1,
   "ts": "2026-10-16T22:11:12.662355Z",
   "changes": 18,
-  "lost": { "ring_full": 0, "write_evicted": 0, "track_full": 0 },
+  "lost": { "ring_full": 0, "write_evicted": 0, "track_full": 0, "unread": 0 },
   "groups": [
     {
       "group": { "comm": "bash" },
@@ -312,7 +321,7 @@ Written last when `--summary` is given (from a real run, shortened to two groups
 | `v` | integer | `1`. |
 | `ts` | string | When the run stopped. |
 | `changes` | integer | Changes reported (after the filters). |
-| `lost` | object | The run's losses: `ring_full` (records), `write_evicted` (write bindings), `track_full` (processes); see [`lost`](#lost-data-the-kernel-side-could-not-deliver). |
+| `lost` | object | The run's losses: `ring_full` (records), `write_evicted` (write bindings), `track_full` (processes), `unread` (records); see [`lost`](#lost-data-that-did-not-reach-the-report). fsblame reads a missing `track_full` or `unread` as 0. |
 | `groups` | array | Changes grouped by build step, or by the acting process's `comm` when there is none. Most changes first, ties in the order they first changed something. |
 
 Each group:

@@ -249,6 +249,11 @@ fn loss_note(lost: &LostReport) -> String {
             "{} left unread when recording stopped around {when}; the history may be incomplete",
             counted(lost.count, "kernel record", "kernel records")
         ),
+        LossReason::Other => format!(
+            "{} lost around {when}, for a reason this version of fsblame does not know; the \
+             history may be incomplete",
+            counted(lost.count, "item", "items")
+        ),
     }
 }
 

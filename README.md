@@ -235,11 +235,14 @@ sudo fsblame run --json -o changes.ndjson -- ./install.sh
 `run` starts the command and reports every change made by it and by every process it starts.
 Without paths it watches every filesystem except the pseudo ones (proc, sysfs, cgroup,
 debugfs and the like). Under `sudo`, the command runs as you, with your `HOME`, `USER`,
-`LOGNAME` and `SHELL`. The report goes to stderr, or to the file given with `-o` (owned by
-you, not root), because the command owns stdout; Ctrl-C goes to the command, and fsblame
-stops when the command exits.
+`LOGNAME` and `SHELL`. The report goes to stderr, or to the file given with `-o`, because the
+command owns stdout; Ctrl-C goes to the command, and fsblame stops when the command exits.
 `run` takes the filters and output options of `watch`, but not `--duration`, `--tree` or
 `--ready-fd`.
+
+The `-o` file holds every command line the run saw, so a new one is created with mode 0600
+and, under `sudo`, owned by you. fsblame refuses (status 2) to write through a symbolic link,
+or into an existing file that belongs to another user.
 
 Here it shows that `npm run build` also writes and prunes npm's log files in your home
 directory (an excerpt; npm's own messages are interleaved on the same terminal):
@@ -365,12 +368,17 @@ data, and a `summary` with `--summary`. Every line carries the schema version `v
 sudo fsblame watch ~/proj --json | jq --unbuffered -r 'select(.type == "touch") | "\(.op) \(.path) by \(.proc.comm)"'
 ```
 
-### Losses
+### Stopping and losses
+
+When fsblame stops (Ctrl-C, SIGTERM, SIGHUP, `--duration`, or the end of `run`'s command), it
+reports every change made before that moment, including the write windows still open, and
+nothing made after it. If it is behind, it keeps reading for up to 10 s before it exits; a
+second Ctrl-C ends that at once.
 
 If changes arrive faster than fsblame can read them, the kernel drops records rather than
-slowing the system down. fsblame never hides this: it prints a warning on stderr (or a
-`lost` line in JSON) at most once per second while it happens, and a total when it stops. A
-larger `--ring-size` helps.
+slowing the system down. fsblame never hides a loss: it prints a warning on stderr (a `lost`
+line in JSON) at most once per second while it happens, and the totals when it stops,
+including records it had not read yet when it stopped. A larger `--ring-size` helps.
 
 ## Running as a service
 
@@ -506,8 +514,9 @@ Numbers vary by about plus or minus four points between runs on a busy machine.
 
 ## Limitations
 
-- **Only what happens while fsblame runs.** Changes before the `fsblame: watching` line are
-  not reported. For history, keep [`record`](#running-as-a-service) running.
+- **Only what happens while fsblame runs.** Changes before the `fsblame: watching` line, or
+  after it is told to stop, are not reported. For history, keep
+  [`record`](#running-as-a-service) running.
 - **Local filesystems.** On NFS, SMB and other network filesystems, changes made by other
   machines are never seen. On FUSE filesystems, the daemon's writes to its backing store are
   attributed to the daemon. `doctor` warns about both.

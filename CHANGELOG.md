@@ -30,7 +30,8 @@ The first public release.
   number of calls, and reported in causal order with the other changes to the same file.
 - `fsblame run [PATH...] -- CMD`: runs a command (as the invoking user under sudo) and reports
   every change it and its descendants make, on every filesystem or below the given paths, and
-  exits with the command's status.
+  exits with the command's status. `-o FILE` writes the report to a private file (mode 0600,
+  owned by the invoking user; symbolic links and other users' files are refused).
 - `fsblame watch --tree PID`: only the changes of a process and its descendants.
 - `fsblame record` and `fsblame blame`: a rotating, private NDJSON journal of changes, and
   queries over it by path (any of a change's paths, including files that no longer exist),
@@ -42,9 +43,12 @@ The first public release.
 - Output: a colored tree view (`--depth`, `--color`, `NO_COLOR`), versioned NDJSON (`--json`,
   schema version 1, documented in `docs/json.md`), an end-of-run summary grouped by build step
   or command (`--summary`), `--quiet`, `--duration` and `--ready-fd`.
-- Loss reporting: records dropped with the ring buffer full, evicted write counts and
-  untracked processes are reported live as `lost` lines or warnings and in the totals, never
-  silently; `--ring-size` sets the kernel ring buffer.
+- Stopping (Ctrl-C, SIGTERM, SIGHUP, `--duration`, or the end of `run`'s command) reports
+  every change made before the stop, reading for up to 10 s if fsblame is behind; a second
+  stop signal cuts that short.
+- Loss reporting: records dropped with the ring buffer full, evicted write counts, untracked
+  processes and records still unread when fsblame stopped are reported live as `lost` lines
+  or warnings and in the totals, never silently; `--ring-size` sets the kernel ring buffer.
 - Overlay filesystems (container root filesystems) are watched through their merged view, and
   each change is reported once, at its merged path.
 - `fsblame doctor [--json] [PATH...]`: checks the kernel, BTF, privileges, lockdown and the

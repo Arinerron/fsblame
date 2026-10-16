@@ -756,7 +756,8 @@ fn confidence_id(confidence: Confidence) -> &'static str {
     }
 }
 
-/// Why kernel-side information was lost.
+/// Why kernel-side information was lost. Later revisions of schema version 1 may add
+/// reasons; a reason this version does not know reads as [`LossReason::Other`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum LossReason {
@@ -773,6 +774,10 @@ pub enum LossReason {
     /// fsblame stopped reading it (a backlog it could not read in time, or another stop
     /// signal): changes or process events are missing.
     Unread,
+    /// A reason a later fsblame wrote that this one does not know; what `count` counts is
+    /// unknown too. Never produced live; written back as `other`.
+    #[serde(other)]
+    Other,
 }
 
 /// Losses since the previous `lost` line of the same reason: `{"type":"lost",...}`.
@@ -785,11 +790,12 @@ pub struct LostReport {
     /// What was lost.
     pub reason: LossReason,
     /// Records ([`LossReason::RingFull`], [`LossReason::Unread`]), write bindings
-    /// ([`LossReason::WriteEvicted`]) or processes ([`LossReason::TrackFull`]).
+    /// ([`LossReason::WriteEvicted`]), processes ([`LossReason::TrackFull`]), or units
+    /// this version does not know ([`LossReason::Other`]).
     pub count: u64,
 }
 
-/// Losses of a whole run.
+/// Losses of a whole run. Totals of reasons this version does not know are ignored on read.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LossTotals {
     /// Records dropped because the ring buffer was full.
@@ -1248,6 +1254,41 @@ pub(crate) mod tests {
         // Fields a later minor revision adds are ignored.
         let extra = json.replacen("\"v\":1", "\"v\":1,\"later\":true", 1);
         assert!(Line::parse(&extra).is_ok());
+    }
+
+    #[test]
+    fn loss_reasons_of_a_later_revision_still_parse() {
+        let line = Line::parse(
+            r#"{"type":"lost","v":1,"ts":"2026-10-14T14:02:11Z","reason":"cache-full","count":5}"#,
+        )
+        .unwrap();
+        let Line::Lost(lost) = line else {
+            panic!("not lost: {line:?}");
+        };
+        assert_eq!(lost.reason, LossReason::Other);
+        assert_eq!(lost.count, 5);
+        // Known reasons keep their names.
+        let json = serde_json::to_value(LossReason::WriteEvicted).unwrap();
+        assert_eq!(json, "write-evicted");
+        // Replayed, an unknown one is written back as `other`.
+        let json = serde_json::to_value(LossReason::Other).unwrap();
+        assert_eq!(json, "other");
+
+        let summary = Line::parse(
+            r#"{"type":"summary","v":1,"ts":"2026-10-14T14:02:11Z","changes":0,
+                "lost":{"ring_full":2,"write_evicted":0,"cache_full":7},"groups":[]}"#,
+        )
+        .unwrap();
+        let Line::Summary(summary) = summary else {
+            panic!("not a summary: {summary:?}");
+        };
+        assert_eq!(
+            summary.lost,
+            LossTotals {
+                ring_full: 2,
+                ..LossTotals::default()
+            }
+        );
     }
 
     #[test]

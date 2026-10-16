@@ -29,12 +29,12 @@ Modules of `crates/fsblame/src`:
 | `tracer.rs` | Opens the object, sets `.rodata`, resizes maps, fills `roots`, loads and attaches, classifies failures (`Cause`: verifier-limit, missing-hook, permission, verifier-rejected, error), sets `armed`, reads `stats`. `Tracer` keeps only the program links (`FdLink`; the kernel keeps the maps alive through the programs) and the four maps it uses (`events`, `writes`, `tracked`, `stats`); the rest of the aya object is dropped after loading. `TRACKED_MAX` = 65,536. |
 | `btf.rs` | `KernelBtf::read` reads `/sys/kernel/btf/vmlinux` once; the same bytes give aya's parse (to load against) and, through fsblame's own raw BTF parser, kernel function prototypes (`security_inode_setattr` arity). `btf::loader` drops the copy aya's `EbpfLoader::new` parses on its own first, so one parse (about 16 MiB on 7.2) is in memory at a time; the tracer frees it after the last attach, before the ring is mapped. `doctor` shares one parse across its probe checks. |
 | `roots.rs` | Watch roots: canonicalizes paths, pins `(dev, ino)`, nested mounts, overlay model, excludes, device filter, path rebuild (`Roots::path`), mountinfo parsing. |
-| `ring.rs` | Reader of the `events` ring buffer: maps the consumer page read-write and the producer and data pages once, read-only (aya's `RingBuf` maps the data twice, all resident, which showed the 16 MiB ring as 32 MiB of RSS); copies the one record per lap that wraps into a reused buffer. Keeps aya's memory ordering (acquire header and producer loads, release consumer store, fence before rechecking). |
+| `ring.rs` | Reader of the `events` ring buffer: maps the consumer page read-write and the producer and data pages once, read-only (aya's `RingBuf` maps the data twice, all resident, which showed the 16 MiB ring as 32 MiB of RSS); copies the one record per lap that wraps into a reused buffer. Keeps aya's memory ordering (acquire header and producer loads, release consumer store, fence before rechecking). `Ring::mark` notes the producer position at a stop, `passed` says whether reading got there, `unread` counts the committed and busy records left before it (safe because the kernel writes each length before it releases the producer position). |
 | `record.rs` | Decodes ring buffer items (`Record::{Fork, Exec, Exit, Fs}`) and their payloads; never panics (fuzzed). |
 | `engine.rs` | Records to touches: feeds procctx, write bindings and windows, exec/exit flushes, lineage cache, filter, emits `ChangeReport`s. `engine_tests.rs` drives it with synthetic records, a fake `writes` map and `/proc` fixtures. |
 | `watch.rs` | The drain loop shared by watch, record and run (`run`, `follow`, `Follow`), signals via signalfd, epoll, loss meters, banners, `--tree`. |
 | `run.rs` | `fsblame run`: fork, park the child until it is tracked, drop to the sudo user, exec; pidfd for the end; exit status passthrough. |
-| `report.rs` | The report model: `Line` (`touch`, `lost`, `summary`), schema version, `LineEncoder` (reuses encoded lineages, 64 slots), `Summary`. |
+| `report.rs` | The report model: `Line` (`touch`, `lost`, `summary`), schema version, loss reasons (`ring-full`, `write-evicted`, `track-full`, `unread`; `LossTotals` fields after the first default to 0 when parsing), `LineEncoder` (reuses encoded lineages, 64 slots), `Summary`. |
 | `render.rs` | Sinks: `Human` (tree view, color palette, `~` for home) and `Json`. |
 | `filter.rs`, `glob.rs` | Change selection (cheapest test first: pid, uid, comm, ignore_comm, unit, include) and byte-wise gitignore-style globs (never allocate while matching; fuzzed). |
 | `journal.rs` | `fsblame record` (`journal::command`, the watch loop with a journal sink) and the rotating NDJSON journal: `fsblame-<UTC start>.ndjson`, one `write(2)` per line and nothing buffered (a crash can only tear the last line), dir 0700 and files 0600, rotation at `--max-size`, oldest beyond `--keep` deleted, first file created at the first line. |
@@ -282,11 +282,19 @@ namespace.
 
 `watch::watch` runs the preflight, resolves roots, loads the tracer, then loops on epoll
 (ring buffer, signalfd, the follower's pidfd) with a 100 ms tick: drain, `Engine::poll`,
-`lost` lines (at most one per reason per second), flush the 64 KiB output buffer. On stop it
-drains for up to 1 s, finishes every window, writes the remaining losses and the summary.
-Human output writes losses to stderr; NDJSON writes them as lines. A closed pipe ends the run
-cleanly. `record` uses the same loop with a `journal::Writer` sink; `blame` replays journal
-lines through the same sinks, so its tree view is byte-identical to `watch`'s.
+`lost` lines (at most one per reason per second), flush the 64 KiB output buffer. The loop
+exits as soon as it sees a stop (SIGINT/SIGTERM/SIGHUP, `--duration`, the end of `run`'s
+command). `drain_to_stop` then takes a `ring::Mark` (where the records reserved so far end)
+and reads up to it, yielding while the next record is still being written, so every change
+made before the stop is reported and none after it. It gives up after `STOP_DRAIN` (10 s) or
+at another stop signal, checked once per tick, and counts what is left with
+`Ring::unread(mark)` (committed and busy records, not discarded ones) as the loss reason
+`unread`. Then it finishes every write window and writes the remaining losses (four meters:
+`ring-full`, `write-evicted`, `track-full`, `unread`) and the summary. Human output writes
+losses to stderr; NDJSON writes them as lines. A closed pipe ends the run cleanly. `record`
+uses the same loop with a `journal::Writer` sink; `blame` replays journal lines through the
+same sinks, so its tree view is byte-identical to `watch`'s, and turns recorded losses into
+notes on stderr.
 
 ## Verifier budget (read before touching `fsblame.bpf.c`)
 
@@ -434,7 +442,7 @@ asserts on the NDJSON, usually that exactly the expected set of changes was repo
 | aa | 300 recycled struct files and inode numbers stay 300 writes; 200 reopen-append rounds are one write with `calls == 200` |
 | ab | `sh -c 'echo x >> f; exec mkdir d'` → the write is `sh`'s, not `mkdir`'s |
 | ac | after `drop_caches`, `>>` to an existing file → one write, no create when `security_file_post_open` exists |
-| ad | 20,000-file churn started at the `fsblame: watching` line → every change reported or counted in `lost` lines and the summary |
+| ad | 10,000-file churn (create, write, rename, unlink) from the `fsblame: watching` line, SIGINT right after it, with the default and a 256K ring → every change reported, or the missing ones no more than the `ring-full` + `unread` records lost; the summary's `lost` has exactly the four known keys, each equal to its `lost` lines' total, with the matching stderr warnings |
 
 ### CI, release and the kernel matrix
 
@@ -496,7 +504,7 @@ panic. Add a unit test with each crashing input next to the code it exercises.
 
 ## Known limitations
 
-- Only changes after the `fsblame: watching` line; history needs `record`.
+- Only changes from the `fsblame: watching` line to the stop; history needs `record`.
 - Network and FUSE filesystems: other clients' changes are never seen, and a FUSE daemon's
   writes to its backing store are attributed to the daemon (`fsblame.watchfs` warns).
 - An overlay mounted in another mount namespace (rootless Podman) is not visible, so its upper
