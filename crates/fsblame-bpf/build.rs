@@ -66,6 +66,9 @@ fn main() {
                 "-target", target, "-O2", "-g", "-mcpu=v3", "-Wall", "-Werror",
             ])
             .arg(format!("-D__TARGET_ARCH_{arch}"))
+            // Reproducible objects: no build directory in the debug info and BTF line info.
+            .arg("-fdebug-compilation-dir=.")
+            .arg(format!("-fdebug-prefix-map={}=OUT_DIR", out.display()))
             .args(["-I", "bpf", "-I", "bpf/include", "-I"])
             .arg(&out)
             .arg("-c")

@@ -33,6 +33,8 @@ output has its own schema version, the `v` field of every line; see
   the call asked for, as operations reported at their check still do.
 - The man pages are rewritten, with exit status, environment, files and examples for each
   command; `man fsblame` gives the overview.
+- The embedded BPF objects are reproducible: clang no longer records the build directory in
+  their debug and BTF line info.
 
 ### Fixed
 
