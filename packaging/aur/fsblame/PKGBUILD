@@ -21,7 +21,7 @@ makedepends=(cargo clang)
 backup=(etc/default/fsblame)
 source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz"
         "tracekit-$_tracekit.tar.gz::https://github.com/Arinerron/tracekit/archive/v$_tracekit.tar.gz")
-sha256sums=('0000000000000000000000000000000000000000000000000000000000000000'
+sha256sums=('1e1a8c88b510295a55fa2e8024ec1d3dbbe1f042bbcf98464ec9250b25d71d0a'
             'c5d39a2c096b5e743a5b62085e84184cd682e0b6e127bfac23dd37dcfb058252')
 
 prepare() {

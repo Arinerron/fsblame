@@ -19,8 +19,8 @@ backup=(etc/default/fsblame)
 options=(!debug)
 source_x86_64=("$url/releases/download/v$pkgver/$_pkgname-v$pkgver-x86_64-linux-musl.tar.gz")
 source_aarch64=("$url/releases/download/v$pkgver/$_pkgname-v$pkgver-aarch64-linux-musl.tar.gz")
-sha256sums_x86_64=('0000000000000000000000000000000000000000000000000000000000000000')
-sha256sums_aarch64=('0000000000000000000000000000000000000000000000000000000000000000')
+sha256sums_x86_64=('ffcfa0630fa4eeddeedecffeaad2954a1cfd341d1de4722e52d488b313a1535d')
+sha256sums_aarch64=('32b86075d8853860d84ab8b0201894ca9e52bad0f8c4414a04a261bab8eb28f6')
 
 package() {
   cd "$_pkgname-v$pkgver-$CARCH-linux-musl"
