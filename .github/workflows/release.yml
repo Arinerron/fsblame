@@ -2,7 +2,9 @@ name: release
 
 # A `v*` tag builds static x86_64 and aarch64 binaries and publishes them, with shell
 # completions, man pages, the systemd unit and the third-party license notices, as a GitHub
-# release.
+# release, then packages those tarballs (packages.yml: .deb/.rpm/.apk/Arch, install.sh) and
+# the container image (image.yml). A release made with GITHUB_TOKEN triggers no `release`
+# event, hence the explicit calls.
 on:
   push:
     tags: ["v*"]
@@ -64,3 +66,18 @@ jobs:
             fsblame/dist/*.tar.gz
             fsblame/dist/*.tar.gz.sha256
           generate_release_notes: true
+
+  packages:
+    needs: release
+    uses: ./.github/workflows/packages.yml
+    with:
+      tag: ${{ github.ref_name }}
+
+  image:
+    needs: release
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/image.yml
+    with:
+      tag: ${{ github.ref_name }}

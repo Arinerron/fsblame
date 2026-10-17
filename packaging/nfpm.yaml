@@ -1,0 +1,69 @@
+# nfpm (https://nfpm.goreleaser.com) config for the .deb, .rpm, .apk and Arch packages,
+# built by .github/workflows/packages.yml from a release tarball, not from source.
+#
+# Environment:
+#   FSBLAME_VERSION  version without the leading v, e.g. 0.1.1
+#   FSBLAME_ARCH     amd64 or arm64 (nfpm maps them to each format's name)
+#   FSBLAME_SRC      the extracted fsblame-vX.Y.Z-ARCH-linux-musl directory, with its man
+#                    pages gzipped (gzip -9n man/*.1) and the unit's ExecStart pointed at
+#                    /usr/bin/fsblame (the sed in packages.yml)
+#
+# Local build with the nfpm version pinned in packages.yml, e.g. the Debian package:
+#   FSBLAME_VERSION=0.1.1 FSBLAME_ARCH=amd64 FSBLAME_SRC=fsblame-v0.1.1-x86_64-linux-musl \
+#     nfpm pkg -f packaging/nfpm.yaml -p deb -t fsblame_0.1.1_amd64.deb
+#
+# No install scripts: granting cap_bpf,cap_perfmon would let every local user watch any path
+# and read every user's command lines, so that stays an explicit opt-in (README,
+# Privileges). For the same reason fsblame-record.service is installed but neither enabled
+# nor started; /etc/default/fsblame, its settings, is a config file that upgrades keep.
+name: fsblame
+version: ${FSBLAME_VERSION}
+version_schema: semver
+arch: ${FSBLAME_ARCH}
+platform: linux
+maintainer: Aaron Esau <git@aaronesau.com>
+vendor: Aaron Esau
+homepage: https://github.com/Arinerron/fsblame
+license: MIT
+section: admin
+priority: optional
+# One line: apk and Arch metadata cannot hold a multi-line description.
+description: >-
+  Which command changed this file? Live eBPF attribution of file changes to the full
+  process lineage
+
+rpm:
+  group: Applications/System
+  summary: Which command changed this file?
+  packager: Aaron Esau <git@aaronesau.com>
+
+archlinux:
+  packager: Aaron Esau <git@aaronesau.com>
+
+# Debian's zsh searches vendor-completions and keeps licenses in /usr/share/doc/fsblame
+# (copyright); the other formats use site-functions and /usr/share/licenses/fsblame. Every
+# format, Alpine's included (its systemd subpackages use the same directory), gets the unit
+# in /usr/lib/systemd/system.
+contents:
+  - {src: "${FSBLAME_SRC}/fsblame", dst: /usr/bin/fsblame, expand: true, file_info: {mode: 0755}}
+  - {src: "${FSBLAME_SRC}/man/*.1.gz", dst: /usr/share/man/man1/, expand: true, file_info: {mode: 0644}}
+  - {src: "${FSBLAME_SRC}/completions/fsblame.bash", dst: /usr/share/bash-completion/completions/fsblame, expand: true, file_info: {mode: 0644}}
+  - {src: "${FSBLAME_SRC}/completions/fsblame.fish", dst: /usr/share/fish/vendor_completions.d/fsblame.fish, expand: true, file_info: {mode: 0644}}
+  - {src: "${FSBLAME_SRC}/systemd/fsblame-record.service", dst: /usr/lib/systemd/system/fsblame-record.service, expand: true, file_info: {mode: 0644}}
+  - {src: "${FSBLAME_SRC}/systemd/fsblame.default", dst: /etc/default/fsblame, type: config|noreplace, expand: true, file_info: {mode: 0644}}
+
+  - {src: "${FSBLAME_SRC}/completions/_fsblame", dst: /usr/share/zsh/vendor-completions/_fsblame, packager: deb, expand: true, file_info: {mode: 0644}}
+  - {src: "${FSBLAME_SRC}/LICENSE", dst: /usr/share/doc/fsblame/copyright, packager: deb, expand: true, file_info: {mode: 0644}}
+  - {src: "${FSBLAME_SRC}/THIRD_PARTY_LICENSES.md", dst: /usr/share/doc/fsblame/THIRD_PARTY_LICENSES.md, packager: deb, expand: true, file_info: {mode: 0644}}
+
+  - &zsh {src: "${FSBLAME_SRC}/completions/_fsblame", dst: /usr/share/zsh/site-functions/_fsblame, packager: rpm, expand: true, file_info: {mode: 0644}}
+  - &license {src: "${FSBLAME_SRC}/LICENSE", dst: /usr/share/licenses/fsblame/LICENSE, type: license, packager: rpm, expand: true, file_info: {mode: 0644}}
+  - &notices {src: "${FSBLAME_SRC}/THIRD_PARTY_LICENSES.md", dst: /usr/share/licenses/fsblame/THIRD_PARTY_LICENSES.md, type: license, packager: rpm, expand: true, file_info: {mode: 0644}}
+  # rpm, unlike the others, removes only the directories a package lists.
+  - {dst: /usr/share/licenses/fsblame, type: dir, packager: rpm, file_info: {mode: 0755}}
+  - {<<: *zsh, packager: apk}
+  - {<<: *license, type: file, packager: apk}
+  - {<<: *notices, type: file, packager: apk}
+  - {<<: *zsh, packager: archlinux}
+  - {<<: *license, type: file, packager: archlinux}
+  - {<<: *notices, type: file, packager: archlinux}

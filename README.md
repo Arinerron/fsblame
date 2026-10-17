@@ -87,9 +87,80 @@ questions it answers:
 
 ## Install
 
-### From a release
+fsblame is one static binary for x86_64 and aarch64 Linux; every method below installs the
+same program. It then runs with sudo (or two capabilities, see
+[Privileges](#privileges-sudo-or-setcap)).
 
-Every release has static binaries for x86_64 and aarch64 Linux, with a SHA-256 checksum:
+**Install script.** Downloads the latest release for your machine, checks its SHA-256 and
+installs the binary, man pages and shell completions to `/usr/local` (through sudo when
+needed), or to `~/.local` without sudo. Run it again to upgrade.
+
+```sh
+curl -fsSL https://github.com/Arinerron/fsblame/releases/latest/download/install.sh | sh
+```
+
+Pick a release or a directory with `... | FSBLAME_VERSION=v0.1.1 sh` and
+`... | sh -s -- --prefix DIR`.
+
+**Packages.** Every [release](https://github.com/Arinerron/fsblame/releases/latest) has
+packages for both architectures (checksums in `SHA256SUMS`). Download yours, then:
+
+| System | Release asset | Install |
+|---|---|---|
+| Debian, Ubuntu | `fsblame_X.Y.Z_amd64.deb`, `_arm64.deb` | `sudo apt install ./fsblame_*.deb` |
+| Fedora, RHEL | `fsblame-X.Y.Z-1.x86_64.rpm`, `.aarch64.rpm` | `sudo dnf install ./fsblame-*.rpm` |
+| openSUSE | the same `.rpm` | `sudo zypper install --allow-unsigned-rpm ./fsblame-*.rpm` |
+| Alpine | `fsblame_X.Y.Z_x86_64.apk`, `_aarch64.apk` | `sudo apk add --allow-untrusted ./fsblame_*.apk` |
+| Arch | `fsblame-X.Y.Z-1-x86_64.pkg.tar.zst`, `-aarch64` | `sudo pacman -U ./fsblame-*.pkg.tar.zst` |
+
+The packages also install the [systemd unit](#running-as-a-service), neither enabled nor
+started, and its settings file `/etc/default/fsblame`, which upgrades leave as you edited it.
+
+On Arch, the AUR has [`fsblame-bin`](https://aur.archlinux.org/packages/fsblame-bin) (the
+release binary) and [`fsblame`](https://aur.archlinux.org/packages/fsblame) (built from the
+release tag): `paru -S fsblame-bin`.
+
+**Nix** (flakes; builds from source, with man pages and completions):
+
+```sh
+nix run github:Arinerron/fsblame -- doctor
+nix profile add github:Arinerron/fsblame   # before Nix 2.30: nix profile install
+```
+
+On NixOS, the flake's module runs the [recording service](#running-as-a-service):
+`imports = [ fsblame.nixosModules.default ];` and
+`services.fsblame.record = { enable = true; paths = [ "/etc" ]; };`.
+
+**Container** (`ghcr.io/arinerron/fsblame`, Alpine based). `--pid=host` is required, since
+fsblame reads the host's processes; bind-mount each directory to watch at its host path:
+
+```sh
+docker run --rm --pid=host --cgroupns=host --cap-add BPF --cap-add PERFMON \
+  --cap-add SYS_PTRACE -v /etc:/etc:ro ghcr.io/arinerron/fsblame watch /etc
+```
+
+`--cgroupns=host` lets it name systemd units and containers, and `SYS_PTRACE` read other
+users' processes. `doctor` takes the same flags. `record` also needs the journal,
+`-v /var/lib/fsblame:/var/lib/fsblame` (run it with `-d`), which is all `blame` needs:
+`docker run --rm -v /var/lib/fsblame:/var/lib/fsblame:ro ghcr.io/arinerron/fsblame blame /etc/hosts`.
+
+**Cargo.**
+
+```sh
+cargo install fsblame --locked   # build from source
+cargo binstall fsblame           # the static release binary
+```
+
+`cargo install` compiles fsblame and its BPF programs on your machine, so it needs a Rust
+toolchain of at least the crate's `rust-version` (1.94) and clang with the BPF target (any
+distribution clang has it; check with `clang -print-targets | grep bpf`). It builds a
+dynamically linked binary for the host target in `~/.cargo/bin`; for the static release
+binary, add `--target x86_64-unknown-linux-musl` after installing that target with rustup.
+Neither installs the man pages.
+
+**Release tarball.** Each tarball holds the binary, `LICENSE`, `THIRD_PARTY_LICENSES.md`
+(the licenses of everything built into the binary), `README.md`, man pages, shell completions
+(bash, zsh, fish, elvish, PowerShell) and the [systemd unit](#running-as-a-service):
 
 ```sh
 VERSION=v0.1.1
@@ -99,13 +170,6 @@ curl -fLO https://github.com/Arinerron/fsblame/releases/download/$VERSION/$NAME.
 sha256sum -c $NAME.tar.gz.sha256
 tar -xzf $NAME.tar.gz
 sudo install -m 0755 $NAME/fsblame /usr/local/bin/fsblame
-```
-
-The archive also holds man pages, shell completions (bash, zsh, fish, elvish, PowerShell), a
-[systemd unit](#running-as-a-service), and `THIRD_PARTY_LICENSES.md` with the licenses of
-everything built into the binary:
-
-```sh
 sudo install -Dm 0644 -t /usr/local/share/man/man1 $NAME/man/*.1
 sudo install -Dm 0644 $NAME/completions/fsblame.bash /usr/local/share/bash-completion/completions/fsblame
 sudo install -Dm 0644 $NAME/completions/_fsblame /usr/local/share/zsh/site-functions/_fsblame
@@ -118,11 +182,12 @@ sudo install -Dm 0644 $NAME/completions/fsblame.fish /usr/local/share/fish/vendo
 
 ### Privileges: sudo or setcap
 
-fsblame loads BPF programs, which needs `CAP_BPF` and `CAP_PERFMON`. Either run it with
-`sudo`, as the examples here do, or give the binary those capabilities once:
+fsblame loads BPF programs, which needs `CAP_BPF` and `CAP_PERFMON`. No installation method
+above grants them by itself. Either run it with `sudo`, as the examples here do, or give the
+binary those capabilities once:
 
 ```sh
-sudo setcap cap_bpf,cap_perfmon+ep /usr/local/bin/fsblame
+sudo setcap cap_bpf,cap_perfmon+ep "$(command -v fsblame)"
 fsblame watch ~/webapp
 ```
 
@@ -131,12 +196,16 @@ Things to know about `setcap`:
 - Every user who can execute the binary can then watch any path and read every user's command
   lines. On a shared machine, restrict who may run it (for example `chmod 0750` and a group).
 - File capabilities are ignored on `nosuid` mounts (often `/tmp` and some home directories),
-  and are removed when the file is replaced: run `setcap` again after every upgrade.
+  so install to a regular path (not the read-only Nix store). They are removed when the file
+  is replaced: run `setcap` again after every upgrade, a package upgrade included.
 - Without `CAP_SYS_PTRACE` (root has it), the command lines and working directories of other
   users' processes that started before fsblame are not readable; `fsblame doctor` says so.
 
 Without either, fsblame prints what is missing, including the `setcap` line for its own path,
 and exits with status 4.
+
+sudo only searches its `secure_path` (the system directories), so for `~/.local/bin`,
+`~/.cargo/bin` or `~/.nix-profile/bin` run `sudo "$(command -v fsblame)" watch PATH`.
 
 ### From source
 
@@ -154,18 +223,6 @@ sudo install -m 0755 target/x86_64-unknown-linux-musl/release/fsblame /usr/local
 For aarch64, add the target with `rustup target add aarch64-unknown-linux-musl` and build with
 `--target aarch64-unknown-linux-musl`; the bundled `rust-lld` links it, no cross compiler
 needed. [CONTRIBUTING.md](https://github.com/Arinerron/fsblame/blob/main/CONTRIBUTING.md) covers tests, benchmarks and fuzzing.
-
-### From crates.io
-
-```sh
-cargo install fsblame --locked
-```
-
-This needs a Rust toolchain of at least the crate's `rust-version` (1.94) and clang with the
-BPF target (any distribution clang has it; check with `clang -print-targets | grep bpf`). It
-builds a dynamically linked binary for the host target in `~/.cargo/bin`; for the static
-release binary, add `--target x86_64-unknown-linux-musl` after installing that target with
-rustup. The [privileges](#privileges-sudo-or-setcap) above apply to it as well.
 
 ## Quick start
 
@@ -415,9 +472,20 @@ per second while one happens, and the totals when it stops:
 [`contrib/systemd/fsblame-record.service`](https://github.com/Arinerron/fsblame/blob/main/contrib/systemd/fsblame-record.service) runs
 `fsblame record` from boot, so `fsblame blame` can answer for changes made while nobody was
 watching. It runs with only the capabilities fsblame needs and a hardened sandbox; the
-comments in the unit explain each setting. It expects the binary at `/usr/local/bin/fsblame`,
-where the [install steps](#install) put it. The release archive carries the unit and its
-settings file in `systemd/`; from the directory you extracted it in:
+comments in the unit explain each setting.
+
+The `.deb`, `.rpm`, `.apk` and Arch [packages](#install) and both AUR packages install it as
+`/usr/lib/systemd/system/fsblame-record.service`, running `/usr/bin/fsblame`, together with
+`/etc/default/fsblame`, and leave it disabled. Set the paths, then start it:
+
+```sh
+sudoedit /etc/default/fsblame               # set FSBLAME_PATHS, optionally FSBLAME_ARGS
+sudo systemctl enable --now fsblame-record.service
+```
+
+Otherwise the unit expects the binary at `/usr/local/bin/fsblame`, where the install script
+and the release tarball steps put it. The release archive carries the unit and its settings
+file in `systemd/`; from the directory you extracted it in:
 
 ```sh
 sudo install -m 0644 $NAME/systemd/fsblame-record.service /etc/systemd/system/
@@ -428,7 +496,8 @@ sudo systemctl enable --now fsblame-record.service
 ```
 
 From a source checkout, install `contrib/systemd/fsblame-record.service` and
-`contrib/systemd/fsblame.default` the same way.
+`contrib/systemd/fsblame.default` the same way. On NixOS, the flake's module sets it up
+(see [Install](#install)).
 
 [`/etc/default/fsblame`](https://github.com/Arinerron/fsblame/blob/main/contrib/systemd/fsblame.default) holds two settings:
 
