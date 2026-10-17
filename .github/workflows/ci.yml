@@ -62,11 +62,16 @@ jobs:
           done
           cargo xtask man target/man
           test -s target/man/fsblame.1
-          # Every page must render without a single groff warning (-ww: all of them).
+          # Every page must render without a single groff warning (-ww: all of them), at
+          # groff's default width and at the usual terminal widths around it: groff versions
+          # differ in which overlong or unadjustable lines they warn about at a given width.
           command -v groff > /dev/null || sudo apt-get install -yq --no-install-recommends groff-base
           for page in target/man/*.1; do
-            warnings=$(groff -man -Tutf8 -ww -z "$page" 2>&1)
-            if [ -n "$warnings" ]; then echo "$page: $warnings"; exit 1; fi
+            for width in default 70 72 74 76 78 80 90 100 120; do
+              if [ "$width" = default ]; then set --; else set -- "-rLL=${width}n"; fi
+              warnings=$(groff -man -Tutf8 -ww -z "$@" "$page" 2>&1)
+              if [ -n "$warnings" ]; then echo "$page (width $width): $warnings"; exit 1; fi
+            done
           done
       - name: Bundle the e2e binaries
         working-directory: fsblame

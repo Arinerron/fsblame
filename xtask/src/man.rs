@@ -189,6 +189,23 @@ impl Page {
         self.text(text);
     }
 
+    /// A tagged paragraph indented by `indent` ens, then `lines` shown as they are at that
+    /// indent: for paths too long to share a filled line with other words.
+    fn tp_lines(&mut self, indent: u8, term: &str, text: &str, lines: &[&str]) {
+        self.tp_indent(indent, term, text);
+        self.raw(".nf");
+        for line in lines {
+            let width = CODE_WIDTH + 4 - usize::from(indent);
+            assert!(
+                line.chars().count() <= width,
+                "longer than {width} characters, wider than an 80-column terminal shows at \
+                 that indent: {line:?}"
+            );
+            self.raw(&escape_line(line));
+        }
+        self.raw(".fi");
+    }
+
     /// A bullet item.
     fn bullet(&mut self, text: &str) {
         self.raw(r".IP \(bu 2");
@@ -954,36 +971,45 @@ fn completions(p: &mut Page) {
         "`fsblame completions` prints the completion script for {SHELL} to stdout. The release \
          archive ships the same scripts in its `completions` directory. Where to put them:",
     );
-    p.tp_indent(
+    p.tp_lines(
         12,
         "`bash`",
-        "`/usr/local/share/bash-completion/completions/fsblame`, or for one user \
-         `~/.local/share/bash-completion/completions/fsblame`; bash-completion loads it when \
-         `fsblame` is first completed.",
+        "bash-completion loads it when `fsblame` is first completed, from one of:",
+        &[
+            "/usr/local/share/bash-completion/completions/fsblame",
+            "~/.local/share/bash-completion/completions/fsblame",
+        ],
     );
-    p.tp_indent(
+    p.tp_lines(
         12,
         "`zsh`",
-        "A file named `_fsblame` in a directory on `$fpath`, such as \
-         `/usr/local/share/zsh/site-functions/_fsblame`; start a new shell (or delete \
-         `~/.zcompdump`) for `compinit` to find it.",
+        "A file named `_fsblame` in a directory on `$fpath`, such as the one below; start a \
+         new shell (or delete `~/.zcompdump`) for `compinit` to find it.",
+        &["/usr/local/share/zsh/site-functions/_fsblame"],
     );
-    p.tp_indent(
+    p.tp_lines(
         12,
         "`fish`",
-        "`/usr/local/share/fish/vendor_completions.d/fsblame.fish`, or for one user \
-         `~/.config/fish/completions/fsblame.fish`.",
+        "For all users, or for one:",
+        &[
+            "/usr/local/share/fish/vendor_completions.d/fsblame.fish",
+            "~/.config/fish/completions/fsblame.fish",
+        ],
     );
-    p.tp_indent(
+    p.tp_lines(
         12,
         "`elvish`",
-        "Evaluate it from `~/.config/elvish/rc.elv`: `eval (fsblame completions elvish | slurp)`.",
+        "Evaluate it from `~/.config/elvish/rc.elv`:",
+        &["eval (fsblame completions elvish | slurp)"],
     );
-    p.tp_indent(
+    p.tp_lines(
         12,
         "`powershell`",
-        "Evaluate it from your profile (`$PROFILE`): \
-         `fsblame completions powershell | Out-String | Invoke-Expression`.",
+        "Evaluate it from your profile (`$PROFILE`):",
+        &[
+            "fsblame completions powershell |",
+            "    Out-String | Invoke-Expression",
+        ],
     );
     p.options();
     p.sh("EXIT STATUS");
@@ -1250,6 +1276,65 @@ mod tests {
             )),
             "{synopsis}"
         );
+    }
+
+    /// The longest word a filled line may hold. A word that does not fit beside the next one
+    /// can end up alone on a line that groff can neither break nor adjust, and it warns
+    /// (`cannot break line`, or `cannot adjust line` with groff 1.23 at its default 78
+    /// columns). Longer paths and commands go in no-fill lines. The term of a tagged paragraph
+    /// is exempt: it ends with a break, so it is never adjusted, and has the full width.
+    const MAX_WORD: usize = 40;
+
+    /// The printed text of a roff text line: without font, hyphenation and zero-width
+    /// escapes, the others as one character each.
+    fn printed(line: &str) -> String {
+        let mut out = String::new();
+        let mut rest = line;
+        while let Some(at) = rest.find('\\') {
+            out.push_str(&rest[..at]);
+            let esc = &rest[at + 1..];
+            let skip = if esc.starts_with('f') {
+                2
+            } else if esc.starts_with('%') || esc.starts_with('&') {
+                1
+            } else if esc.starts_with("*(") || esc.starts_with('(') {
+                out.push('x');
+                esc.find('(').map_or(1, |open| open + 3)
+            } else if esc.starts_with('[') {
+                out.push('x');
+                esc.find(']').map_or(1, |close| close + 1)
+            } else {
+                out.push('x');
+                1
+            };
+            rest = &esc[skip.min(esc.len())..];
+        }
+        out.push_str(rest);
+        out
+    }
+
+    #[test]
+    fn filled_text_has_no_word_too_long_to_break() {
+        for (name, page) in pages() {
+            let mut fill = true;
+            let mut term = false;
+            for line in page.lines() {
+                let was_term = std::mem::replace(&mut term, line.starts_with(".TP"));
+                match line {
+                    ".nf" => fill = false,
+                    ".fi" => fill = true,
+                    _ if line.starts_with('.') || !fill || was_term => {}
+                    _ => {
+                        for word in printed(line).split(' ') {
+                            assert!(
+                                word.chars().count() <= MAX_WORD,
+                                "{name}: {word:?} is longer than {MAX_WORD} characters, in {line:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
