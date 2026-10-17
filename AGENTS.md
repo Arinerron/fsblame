@@ -18,7 +18,9 @@ aarch64. Users read [README.md](README.md); the NDJSON schema is [docs/json.md](
 | `fuzz/` | cargo-fuzz crate (nightly, its own workspace): `record_decode`, `report_line`, `glob_match`. `corpus/` and `artifacts/` are gitignored. |
 | `tracekit/` | Git submodule (tracekit v0.1.0): `wire` (ABI macros and header builder), `procctx` (process table, lineage, context, origin classification), `bpfdoctor` (shared checks). **Changes go to the tracekit repository**; here only the submodule pointer moves. |
 | `contrib/systemd/` | `fsblame-record.service` (hardened `record` unit) and `fsblame.default` (`/etc/default/fsblame`); shipped in the release archives as `systemd/`. |
-| `.github/` | `workflows/ci.yml`, `workflows/release.yml`, `actions/setup` (clang plus the pinned toolchain), issue and PR templates, dependabot. |
+| `.github/` | `workflows/ci.yml`, `workflows/release.yml`, `workflows/packages.yml`, `workflows/image.yml`, `actions/setup` (clang plus the pinned toolchain), issue and PR templates, dependabot. |
+| `packaging/` | `nfpm.yaml` (deb, rpm, apk, Arch), `install.sh`, `Containerfile`, `aur/{fsblame,fsblame-bin}/PKGBUILD`; see Packaging. |
+| `flake.nix`, `flake.lock` | Nix flake: package, NixOS module, dev shell. |
 
 Modules of `crates/fsblame/src`:
 
@@ -537,8 +539,11 @@ completions under qemu-user), `fuzz` (each target 60 s on nightly, crashing inpu
 v6.1.190, v6.6.159, v6.12.113, v7.2.6). `release.yml`: a `v*` tag builds both targets,
 packages `fsblame-<tag>-<arch>-linux-musl.tar.gz` (binary, LICENSE, README,
 `THIRD_PARTY_LICENSES.md`, `completions/`, `man/`, and `contrib/systemd` as `systemd/`) with a
-`.sha256` each, and publishes a GitHub release with generated notes (replaced by the
-CHANGELOG section, see Releasing).
+`.sha256` each, publishes a GitHub release with generated notes (replaced by the CHANGELOG
+section, see Releasing), then calls `packages.yml` and `image.yml` with the tag (see
+Packaging). The README's install snippet, `install.sh`, the system packages, the AUR
+`fsblame-bin`, the container image and the cargo-binstall metadata all depend on these names
+and this layout.
 
 Reproduce a matrix kernel locally (vng downloads and caches the kernel), from a directory
 holding prebuilt `fsblame` and `xtask` binaries:
@@ -580,22 +585,127 @@ identical texts are printed once, and it fails if a dependency ships no license 
 1. Bump `[workspace.package] version` and the `=X.Y.Z` pins of `fsblame-abi` and
    `fsblame-bpf` in `[workspace.dependencies]` together, run `cargo update -w`, and commit
    `Cargo.lock` with them (CI's `cargo xtask licenses` uses `cargo metadata --locked`, and
-   `cargo publish` refuses a dirty tree).
+   `cargo publish` refuses a dirty tree). If the tracekit submodule moved, update
+   `flake.nix`'s `tracekit` input and `_tracekit` in `packaging/aur/fsblame/PKGBUILD` to the
+   same tag (see Packaging).
 2. Date the `CHANGELOG.md` section and update its link refs, push to main and wait for
    green CI.
 3. `git tag -a vX.Y.Z -m 'fsblame X.Y.Z' && git push origin vX.Y.Z`. Once `release.yml` has
    published, replace its generated notes with the CHANGELOG section plus an install snippet
    pinned to the tag: `gh release edit vX.Y.Z --title 'fsblame X.Y.Z' --notes-file NOTES.md`.
+   Check that its `packages` and `image` jobs passed: the release has the eight packages,
+   `SHA256SUMS` and `install.sh`, and `ghcr.io/arinerron/fsblame:X.Y.Z` exists. If either
+   failed, fix it on main and rerun it with `gh workflow run` (see Packaging).
 4. From a clean checkout of the tag with the submodule initialized
    (`git clone --recursive --branch vX.Y.Z …`): `cargo publish --workspace --locked --target
    x86_64-unknown-linux-gnu --dry-run`, then the same without `--dry-run`. `--target` makes
    the verify build use glibc (what `cargo install` users get). Cargo publishes fsblame-abi,
    fsblame-bpf, fsblame in order, waits for the index between them, and skips `xtask`.
+5. Update the AUR packages `fsblame-bin` and `fsblame` (both need only the GitHub release
+   and its tag), as described in Packaging, and commit the bumped PKGBUILDs here.
 
 CI's `build-test` job runs `cargo package --locked -p fsblame-abi -p fsblame-bpf -p fsblame
 --target x86_64-unknown-linux-gnu` (each crate built from its tarball against a temporary
 local registry) and `cargo check --locked -p fsblame` for x86_64 and aarch64 glibc, so step 4
 problems show up before the tag.
+
+## Packaging
+
+Every channel repackages the release tarballs or builds from source; none builds its own
+binary in CI.
+
+| Channel | Files | Published by |
+|---|---|---|
+| `.deb`, `.rpm`, `.apk`, Arch `.pkg.tar.zst` (release assets) | `packaging/nfpm.yaml` | `.github/workflows/packages.yml` |
+| `curl … \| sh` (release asset `install.sh`) | `packaging/install.sh` | `packages.yml` |
+| Container `ghcr.io/arinerron/fsblame` | `packaging/Containerfile` | `.github/workflows/image.yml` |
+| AUR `fsblame` (tag source) and `fsblame-bin` (tarball) | `packaging/aur/*/PKGBUILD` | by hand |
+| Nix (`nix run github:Arinerron/fsblame`) | `flake.nix`, `flake.lock` | the repository itself |
+| `cargo binstall fsblame` | `[package.metadata.binstall]` in `crates/fsblame/Cargo.toml` | crates.io |
+
+`packages.yml` and `image.yml` run on `workflow_call` (from `release.yml`, after the
+`release` job: a release made with `GITHUB_TOKEN` fires no `release` event) and on
+`workflow_dispatch`, both with input `tag`. They download the tag's published tarballs and
+never rebuild fsblame. To backfill or redo a release: `gh workflow run packages.yml -f
+tag=vX.Y.Z` and `gh workflow run image.yml -f tag=vX.Y.Z`. Dispatched, they take
+`packaging/` from the branch they run on (main); called from `release.yml`, from the tag.
+Both need 0.1.1 or later: 0.1.0's tarballs have no `THIRD_PARTY_LICENSES.md`.
+
+The tarball's `systemd/fsblame-record.service` runs `/usr/local/bin/fsblame`, where the
+README's manual steps and, by default, `install.sh` put the binary. The packages that
+install `/usr/bin/fsblame` (nfpm's and both AUR ones) rewrite that `ExecStart=`, install the
+unit as `/usr/lib/systemd/system/fsblame-record.service` and `fsblame.default` as
+`/etc/default/fsblame`, a config file that upgrades keep, and neither enable nor start the
+unit. The flake's package points the unit at its store path instead.
+
+- **System packages.** `packages.yml` verifies each tarball's `.sha256`, gzips the man
+  pages (`gzip -9n`), points the unit at `/usr/bin/fsblame` (`sed`, checked with `grep`),
+  runs nfpm (pinned with its checksum: `NFPM_VERSION`, `NFPM_SHA256` in `packages.yml`) for
+  deb, rpm, apk and archlinux on amd64 and arm64, writes `SHA256SUMS` (the packages and
+  `install.sh`) and uploads everything with `gh release upload --clobber`. Asset names are
+  nfpm's defaults, which the README's package table names: `fsblame_X.Y.Z_{amd64,arm64}.deb`,
+  `fsblame-X.Y.Z-1.{x86_64,aarch64}.rpm`, `fsblame_X.Y.Z_{x86_64,aarch64}.apk`,
+  `fsblame-X.Y.Z-1-{x86_64,aarch64}.pkg.tar.zst`. Contents: `/usr/bin/fsblame`,
+  `/usr/share/man/man1/*.1.gz`, bash and fish completions in
+  `/usr/share/{bash-completion/completions,fish/vendor_completions.d}`, zsh in
+  `/usr/share/zsh/vendor-completions` (deb) or `site-functions` (others),
+  `/usr/lib/systemd/system/fsblame-record.service`, `/etc/default/fsblame` (deb conffile,
+  rpm `%config(noreplace)`, Arch `backup`; apk protects `/etc` by itself and writes
+  `.apk-new`), licenses in `/usr/share/doc/fsblame/copyright` + `THIRD_PARTY_LICENSES.md`
+  (deb) or `/usr/share/licenses/fsblame/` (others; rpm also lists that directory, since rpm
+  removes only the directories a package owns). No dependencies, no install scripts: a
+  package never runs `setcap` (every user who can execute the binary could watch any path
+  and read every user's command lines). Unsigned: users check `SHA256SUMS`, and apk needs
+  `--allow-untrusted`. Local build: the command in the header of `nfpm.yaml`, on a tarball
+  directory prepared like `packages.yml` does.
+- **install.sh.** POSIX sh (keep it `shellcheck -s sh` clean), served as
+  `releases/latest/download/install.sh`, so every release must carry it. Linux x86_64 and
+  aarch64 only; resolves the latest tag through the `/releases/latest` redirect (curl, or
+  wget for busybox), verifies the `.sha256`, installs to `$prefix/bin`,
+  `$prefix/share/{man/man1,bash-completion/completions,zsh/site-functions,fish/vendor_completions.d,licenses/fsblame}`;
+  not the unit (README, Running as a service). Prefix: `--prefix DIR` / `FSBLAME_PREFIX`,
+  else `/usr/local` (directly when writable, else via sudo or doas), else `~/.local`.
+  `FSBLAME_VERSION=vX.Y.Z` pins a release (0.1.0 too: `THIRD_PARTY_LICENSES.md` is optional).
+  Try a change with `FSBLAME_VERSION=vX.Y.Z sh packaging/install.sh --prefix DIR`.
+- **Container.** `image.yml` builds `linux/amd64` and `linux/arm64` from the tarballs (the
+  final stage only copies, so no QEMU) and tags `X.Y.Z`, and `X.Y` and `latest` only when the
+  tag is the newest non-prerelease of its line and overall (a backfill never moves them).
+  The run flags (`--pid=host`, `--cgroupns=host`, `BPF`, `PERFMON`, `SYS_PTRACE`, watched
+  directories bind-mounted at their host paths) are explained in the header of
+  `packaging/Containerfile`; the README repeats the `watch` line.
+- **AUR.** `packaging/aur/fsblame-bin/PKGBUILD` repackages the tarballs (provides and
+  conflicts `fsblame`); `packaging/aur/fsblame/PKGBUILD` builds the GitHub tag archive for
+  the host target with the system toolchain (glibc; makedepends cargo, clang) and renders
+  the man pages with xtask. Tag archives omit submodules: tracekit comes from its own tag
+  archive (`_tracekit` in the PKGBUILD; bump it with the submodule). Each AUR package is its
+  own git repo holding `PKGBUILD` and `.SRCINFO` (never committed here):
+
+  ```sh
+  git clone ssh://aur@aur.archlinux.org/fsblame-bin.git ~/aur/fsblame-bin   # once
+  cp packaging/aur/fsblame-bin/PKGBUILD ~/aur/fsblame-bin/ && cd ~/aur/fsblame-bin
+  sed -i 's/^pkgver=.*/pkgver=X.Y.Z/; s/^pkgrel=.*/pkgrel=1/' PKGBUILD
+  updpkgsums && makepkg -cf && makepkg --printsrcinfo > .SRCINFO   # updpkgsums: pacman-contrib
+  git add PKGBUILD .SRCINFO && git commit -m 'Update to X.Y.Z' && git push
+  ```
+
+  The same for `fsblame` (`ssh://aur@aur.archlinux.org/fsblame.git`); copy the bumped
+  PKGBUILDs back to `packaging/aur/` and commit them. A packaging-only fix bumps `pkgrel`.
+- **Nix.** `flake.nix` builds the checkout itself (`src = self`, version from `Cargo.toml`,
+  dependencies from `Cargo.lock`, so there is no hash to bump), with man pages, completions
+  and the unit (not enabled). `github:` flake sources omit submodules, so tracekit is the
+  flake input `github:Arinerron/tracekit/vT` (locked in `flake.lock`): when the submodule
+  moves to a new tag, change that URL to match and run `nix flake update tracekit`. `nix run
+  github:Arinerron/fsblame` follows main; `github:Arinerron/fsblame/vX.Y.Z` pins a release
+  from the first tag that has `flake.nix`. On NixOS, `nixosModules.default`
+  (`services.fsblame.record`) enables that unit with the paths and arguments as options.
+  The header of `flake.nix` lists the outputs.
+- **cargo-binstall.** Overrides for `{x86_64,aarch64}-unknown-linux-{gnu,musl}` point at the
+  musl tarball and its `fsblame-vX.Y.Z-ARCH-linux-musl/fsblame`; other targets fall back to
+  building. binstall reads the metadata from the published crate, so it works from 0.1.1,
+  the first crates.io release. Check it against a published release with
+  `cargo binstall --manifest-path crates/fsblame/Cargo.toml --targets
+  x86_64-unknown-linux-gnu --root DIR --disable-strategies compile,quick-install
+  fsblame@X.Y.Z`.
 
 ## Bench (`cargo xtask bench [--bin PATH] [--quick] [--json]`)
 

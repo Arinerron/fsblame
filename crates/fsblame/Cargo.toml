@@ -16,6 +16,26 @@ include = ["src/**/*.rs", "LICENSE"]
 [package.metadata.docs.rs]
 targets = ["x86_64-unknown-linux-gnu"]
 
+# `cargo binstall fsblame`: the static musl release tarball, for glibc hosts as well.
+[package.metadata.binstall]
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-unknown-linux-musl]
+pkg-url = "{ repo }/releases/download/v{ version }/fsblame-v{ version }-x86_64-linux-musl.tar.gz"
+bin-dir = "fsblame-v{ version }-x86_64-linux-musl/{ bin }"
+
+[package.metadata.binstall.overrides.x86_64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/fsblame-v{ version }-x86_64-linux-musl.tar.gz"
+bin-dir = "fsblame-v{ version }-x86_64-linux-musl/{ bin }"
+
+[package.metadata.binstall.overrides.aarch64-unknown-linux-musl]
+pkg-url = "{ repo }/releases/download/v{ version }/fsblame-v{ version }-aarch64-linux-musl.tar.gz"
+bin-dir = "fsblame-v{ version }-aarch64-linux-musl/{ bin }"
+
+[package.metadata.binstall.overrides.aarch64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/fsblame-v{ version }-aarch64-linux-musl.tar.gz"
+bin-dir = "fsblame-v{ version }-aarch64-linux-musl/{ bin }"
+
 [dependencies]
 fsblame-abi = { workspace = true, features = ["user"] }
 fsblame-bpf.workspace = true

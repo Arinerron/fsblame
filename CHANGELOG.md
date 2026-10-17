@@ -15,6 +15,14 @@ output has its own schema version, the `v` field of every line; see
 
 - `cargo install fsblame --locked`: fsblame is published on crates.io, as the crates
   `fsblame`, `fsblame-bpf` and `fsblame-abi`.
+- More ways to install, see the README: an install script (`curl -fsSL
+  https://github.com/Arinerron/fsblame/releases/latest/download/install.sh | sh`), `.deb`,
+  `.rpm`, `.apk` and Arch packages attached to each release (with `SHA256SUMS`), the AUR
+  packages `fsblame-bin` and `fsblame`, a Nix flake (`nix run github:Arinerron/fsblame`)
+  with a NixOS module for the recording service, a container image
+  (`ghcr.io/arinerron/fsblame`) and `cargo binstall fsblame`. The system and AUR packages
+  install `fsblame-record.service`, not enabled, and keep your `/etc/default/fsblame` across
+  upgrades.
 - A new loss reason, `skipped`: runs of fsblame's kernel programs that the kernel skipped
   because the same program was already running on that CPU, which happens under heavy
   parallel load. It counts the programs whose skipped run can lose a change; those changes

@@ -1,0 +1,80 @@
+name: packages
+
+# Turns a published release's static tarballs (no rebuild) into .deb, .rpm, .apk and Arch
+# packages with packaging/nfpm.yaml, and uploads them, SHA256SUMS and packaging/install.sh
+# (as install.sh) to that release. release.yml calls it for each tag; backfill or redo a
+# release with `gh workflow run packages.yml -f tag=vX.Y.Z` (nfpm.yaml and install.sh then
+# come from the branch the workflow runs on, so older tags work too).
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: Release tag, e.g. v0.1.1
+        type: string
+        required: true
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag, e.g. v0.1.1
+        type: string
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  NFPM_VERSION: 2.48.0
+  NFPM_SHA256: 6d7f9a28b2f397934403950fcbba83f598b08d02edbe79a0815b3b4897341750
+
+jobs:
+  packages:
+    runs-on: ubuntu-24.04
+    env:
+      TAG: ${{ inputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install nfpm
+        run: |
+          set -euo pipefail
+          tarball="nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz"
+          curl -fsSLo "$RUNNER_TEMP/$tarball" \
+            "https://github.com/goreleaser/nfpm/releases/download/v$NFPM_VERSION/$tarball"
+          echo "$NFPM_SHA256  $RUNNER_TEMP/$tarball" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP" nfpm
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+
+      - name: Download release tarballs
+        run: |
+          set -euo pipefail
+          mkdir -p work dist
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -D work \
+            -p "fsblame-$TAG-*-linux-musl.tar.gz" -p "fsblame-$TAG-*-linux-musl.tar.gz.sha256"
+          (cd work && sha256sum -c ./*.sha256)
+
+      # The tarball's unit runs /usr/local/bin/fsblame, where a manual install puts it; the
+      # packages install /usr/bin/fsblame.
+      - name: Build packages
+        run: |
+          set -euo pipefail
+          export FSBLAME_VERSION="${TAG#v}"
+          for pair in x86_64:amd64 aarch64:arm64; do
+            name="fsblame-$TAG-${pair%%:*}-linux-musl"
+            tar -xzf "work/$name.tar.gz" -C work
+            gzip -9n "work/$name"/man/*.1
+            unit="work/$name/systemd/fsblame-record.service"
+            sed -i '/^ExecStart=/s|/usr/local/bin/fsblame|/usr/bin/fsblame|' "$unit"
+            grep -q '^ExecStart=/usr/bin/fsblame ' "$unit"
+            for packager in deb rpm apk archlinux; do
+              FSBLAME_ARCH="${pair##*:}" FSBLAME_SRC="work/$name" \
+                nfpm pkg -f packaging/nfpm.yaml -p "$packager" -t dist/
+            done
+          done
+          cp packaging/install.sh dist/install.sh
+          (cd dist && sha256sum -- * > SHA256SUMS && cat SHA256SUMS)
+
+      - name: Upload to the release
+        run: gh release upload "$TAG" -R "$GITHUB_REPOSITORY" --clobber dist/*
