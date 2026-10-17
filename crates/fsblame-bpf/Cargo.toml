@@ -3,8 +3,27 @@ name = "fsblame-bpf"
 description = "fsblame's BPF objects, compiled from C CO-RE sources by build.rs (needs clang)"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+# The crate is MIT; bpf/include/bpf/ vendors libbpf headers (LGPL-2.1 OR BSD-2-Clause, see
+# bpf/include/bpf/LICENSE.BSD-2-Clause).
+license = "MIT AND (LGPL-2.1-only OR BSD-2-Clause)"
 rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/fsblame-bpf"
+keywords = ["ebpf", "bpf", "co-re", "filesystem", "observability"]
+categories = ["os::linux-apis", "filesystem"]
+include = [
+    "build.rs",
+    "src/**/*.rs",
+    "bpf/*.c",
+    "bpf/*.h",
+    "bpf/include/bpf/*.h",
+    "bpf/include/bpf/LICENSE.BSD-2-Clause",
+    "LICENSE",
+]
+
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu"]
 
 [build-dependencies]
 fsblame-abi = { workspace = true, features = ["std"] }

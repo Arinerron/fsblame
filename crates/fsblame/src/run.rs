@@ -61,19 +61,28 @@ pub fn command(args: &RunArgs) -> Result<ExitCode, Failure> {
 
 /// Opens the `--output` file. The report holds the argv, cwd and environment-derived facts
 /// of the command's processes, so a new file gets mode 0600 and, under sudo, the invoking
-/// user (`owner`) as its owner. An existing file is truncated; under sudo it must belong to
-/// the invoking user. A symbolic link is refused, so that one planted by another user cannot
-/// redirect fsblame's privileged write.
+/// user (`owner`) as its owner. An existing file is truncated and keeps its mode; it must be
+/// a regular file of the invoking user (fsblame's effective user when not under sudo).
+/// Symbolic links, FIFOs, sockets and devices are refused, so that a path planted by another
+/// user cannot redirect, receive or stall fsblame's privileged write.
+///
+/// Without sudo, an existing file is reopened with `O_CREAT` too, so that
+/// `fs.protected_regular` and `fs.protected_fifos` refuse another user's file in a sticky
+/// world-writable directory such as /tmp before fsblame opens it. Under sudo they would
+/// also refuse the invoking user's own file there, since fsblame opens it as root, so the
+/// ownership and type checks alone guard that case. Opens use `O_NONBLOCK`, so that a FIFO
+/// is refused without waiting for a reader; the flag does nothing to a regular file.
 fn open_output(path: &Path, owner: Option<&Credentials>) -> io::Result<File> {
-    let open = |create: bool| {
+    let open = |create: bool, exclusive: bool| {
         OpenOptions::new()
             .write(true)
-            .create_new(create)
+            .create(create)
+            .create_new(exclusive)
             .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(path)
     };
-    match open(true) {
+    match open(true, true) {
         Ok(file) => {
             if let Some(owner) = owner {
                 fchown(&file, Some(owner.uid), Some(owner.gid))?;
@@ -81,26 +90,26 @@ fn open_output(path: &Path, owner: Option<&Credentials>) -> io::Result<File> {
             Ok(file)
         }
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-            let file = open(false).map_err(|e| {
-                if e.raw_os_error() == Some(libc::ELOOP) {
-                    io::Error::other("it is a symbolic link")
-                } else {
-                    e
-                }
+            let file = open(owner.is_none(), false).map_err(|e| match e.raw_os_error() {
+                Some(libc::ELOOP) => io::Error::other("it is a symbolic link"),
+                // What a write-only, non-blocking open of a FIFO without a reader, or of a
+                // socket, fails with.
+                Some(libc::ENXIO) => io::Error::other("it is not a regular file"),
+                _ => e,
             })?;
             let meta = file.metadata()?;
-            if let Some(owner) = owner
-                && meta.uid() != owner.uid
-            {
+            if !meta.is_file() {
+                return Err(io::Error::other("it is not a regular file"));
+            }
+            // SAFETY: geteuid cannot fail.
+            let uid = owner.map_or_else(|| unsafe { libc::geteuid() }, |owner| owner.uid);
+            if meta.uid() != uid {
                 return Err(io::Error::other(format!(
-                    "it belongs to uid {}, not to the invoking user (uid {})",
-                    meta.uid(),
-                    owner.uid
+                    "it belongs to uid {}, not to the invoking user (uid {uid})",
+                    meta.uid()
                 )));
             }
-            if meta.is_file() {
-                file.set_len(0)?;
-            }
+            file.set_len(0)?;
             Ok(file)
         }
         Err(e) => Err(e),
@@ -560,4 +569,111 @@ fn read_full(fd: RawFd, buf: &mut [u8]) -> usize {
         }
     }
     done
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{fs, os::unix::fs::PermissionsExt as _};
+
+    use super::*;
+    use crate::journal::tests::TestDir;
+
+    /// A fresh, empty directory for one test.
+    fn test_dir(name: &str) -> TestDir {
+        let dir = TestDir::new(name);
+        fs::create_dir_all(&dir.0).unwrap();
+        dir
+    }
+
+    fn mkfifo(path: &Path) {
+        let c = CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `c` is a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o666) }, 0);
+    }
+
+    fn refusal(path: &Path, owner: Option<&Credentials>) -> String {
+        open_output(path, owner).unwrap_err().to_string()
+    }
+
+    #[test]
+    fn new_file_is_private() {
+        let dir = test_dir("run-new");
+        let path = dir.0.join("report");
+        open_output(&path, None).unwrap();
+        let meta = fs::symlink_metadata(&path).unwrap();
+        assert!(meta.is_file());
+        assert_eq!(meta.mode() & 0o7777, 0o600);
+        // SAFETY: geteuid cannot fail.
+        assert_eq!(meta.uid(), unsafe { libc::geteuid() });
+    }
+
+    #[test]
+    fn own_file_is_truncated_and_keeps_its_mode() {
+        let dir = test_dir("run-own");
+        let path = dir.0.join("report");
+        fs::write(&path, "old report").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        let mut file = open_output(&path, None).unwrap();
+        file.write_all(b"new").unwrap();
+        drop(file);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new");
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o7777, 0o640);
+    }
+
+    #[test]
+    fn file_of_another_user_is_left_alone() {
+        let dir = test_dir("run-other");
+        let path = dir.0.join("report");
+        fs::write(&path, "theirs").unwrap();
+        // SAFETY: geteuid and getegid cannot fail.
+        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        let caller = Credentials {
+            uid: uid + 1,
+            gid,
+            groups: Vec::new(),
+        };
+        assert_eq!(
+            refusal(&path, Some(&caller)),
+            format!(
+                "it belongs to uid {uid}, not to the invoking user (uid {})",
+                uid + 1
+            )
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "theirs");
+    }
+
+    #[test]
+    fn symbolic_link_is_refused() {
+        let dir = test_dir("run-link");
+        let target = dir.0.join("target");
+        fs::write(&target, "kept").unwrap();
+        let path = dir.0.join("report");
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert_eq!(refusal(&path, None), "it is a symbolic link");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "kept");
+    }
+
+    #[test]
+    fn fifo_is_refused_without_blocking() {
+        let dir = test_dir("run-fifo");
+        let path = dir.0.join("report");
+        mkfifo(&path);
+        // Without a reader the open itself fails; with one it succeeds and the type check
+        // refuses it. Neither waits.
+        assert_eq!(refusal(&path, None), "it is not a regular file");
+        let _reader = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&path)
+            .unwrap();
+        assert_eq!(refusal(&path, None), "it is not a regular file");
+    }
+
+    #[test]
+    fn socket_is_refused() {
+        let dir = test_dir("run-socket");
+        let path = dir.0.join("report");
+        let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        assert_eq!(refusal(&path, None), "it is not a regular file");
+    }
 }

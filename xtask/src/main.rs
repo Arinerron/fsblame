@@ -10,11 +10,19 @@
 //!
 //! `cargo xtask man [DIR]` writes `fsblame.1` and one page per subcommand to DIR (default
 //! `$CARGO_TARGET_DIR/man`, else `target/man`), from the binary's own clap definition.
+//!
+//! `cargo xtask licenses [FILE]` writes the release binary's third-party notices (see
+//! [`licenses`]).
 
 mod bench;
 mod e2e_core;
+mod e2e_enginefix;
 mod e2e_features;
+mod e2e_kernelfix;
+mod e2e_skipfix;
 mod e2e_startup;
+mod licenses;
+mod man;
 
 /// The binary's CLI, compiled in from its source so the man pages cannot drift from it. It
 /// needs only clap, `clock`, `glob` and `ops`; including the sources avoids building the BPF object.
@@ -49,7 +57,6 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, bail, ensure};
-use clap::CommandFactory as _;
 use serde_json::Value;
 
 /// Longest wait for `fsblame: watching` (programs load and attach).
@@ -64,6 +71,7 @@ const VERIFIER_LIMIT: u64 = 1_000_000;
 const USAGE: &str = "usage: cargo xtask test-e2e [--bin PATH] [--only ID,...]
        cargo xtask bench [--bin PATH] [--quick] [--json]
        cargo xtask man [DIR]
+       cargo xtask licenses [FILE]
 
   test-e2e       run the end-to-end scenarios against the running kernel
     --bin PATH   test this fsblame binary instead of building the release one
@@ -73,6 +81,8 @@ const USAGE: &str = "usage: cargo xtask test-e2e [--bin PATH] [--only ID,...]
     --quick      one run per workload instead of the median of three, fewer operations
     --json       print one JSON object instead of the table
   man            write the man pages to DIR (default $CARGO_TARGET_DIR/man, else target/man)
+  licenses       write the release binary's third-party license notices to FILE (default
+                 $CARGO_TARGET_DIR/THIRD_PARTY_LICENSES.md, else target/THIRD_PARTY_LICENSES.md)
 
 test-e2e runs as your normal user; each scenario calls `sudo -n` itself. Its work directory is
 $FSBLAME_E2E_DIR (default ~/.cache/fsblame-e2e), on a disk filesystem without nosuid. bench
@@ -83,7 +93,8 @@ fn main() {
     let args: Vec<OsString> = env::args_os().skip(1).collect();
     let result = match args.first().and_then(|a| a.to_str()) {
         Some("test-e2e") => test_e2e(&args[1..]),
-        Some("man") => man(&args[1..]),
+        Some("man") => man::man(&args[1..]),
+        Some("licenses") => licenses::licenses(&args[1..]),
         Some("bench") => bench::bench(&args[1..]),
         Some("-h" | "--help") | None => {
             println!("{USAGE}");
@@ -260,6 +271,46 @@ const SCENARIOS: &[Scenario] = &[
         name: "a churn from the watching line to the stop: every change reported or counted lost",
         run: e2e_startup::startup_churn,
     },
+    Scenario {
+        id: "ae",
+        name: "only changes that are made: a failed rmdir, chmod, chown or rename is not reported",
+        run: e2e_kernelfix::failed_ops,
+    },
+    Scenario {
+        id: "af",
+        name: "a chown that clears the setuid and setgid bits is reported as a chown",
+        run: e2e_kernelfix::chown_setuid,
+    },
+    Scenario {
+        id: "ag",
+        name: "a symlink target longer than PATH_CAP - 1 bytes is cut there and marked truncated",
+        run: e2e_kernelfix::long_symlink,
+    },
+    Scenario {
+        id: "ah",
+        name: "a kept descriptor writes at the new name after a rename, as the new program after exec",
+        run: e2e_enginefix::kept_descriptor,
+    },
+    Scenario {
+        id: "ai",
+        name: "run: a Ctrl-C after the command exited does not cut the report of its changes short",
+        run: e2e_enginefix::run_drain_sigint,
+    },
+    Scenario {
+        id: "ak",
+        name: "a parallel write storm: every file reported, or covered by the lost counts (skipped too)",
+        run: e2e_skipfix::write_storm,
+    },
+    Scenario {
+        id: "al",
+        name: "a record held for a create that failed is not reported for a later create",
+        run: e2e_kernelfix::stale_create,
+    },
+    Scenario {
+        id: "am",
+        name: "a name made is reported with its inode: number and mode as the filesystem set them",
+        run: e2e_kernelfix::made_inodes,
+    },
 ];
 
 fn print_scenarios() {
@@ -267,25 +318,6 @@ fn print_scenarios() {
     for s in SCENARIOS {
         println!("  {:<2}  {}", s.id, s.name);
     }
-}
-
-/// `cargo xtask man [DIR]`: renders the man pages into DIR.
-fn man(args: &[OsString]) -> Result<bool> {
-    let dir = match args {
-        [] => env::var_os("CARGO_TARGET_DIR")
-            .map_or_else(
-                || Path::new(env!("CARGO_MANIFEST_DIR")).join("../target"),
-                PathBuf::from,
-            )
-            .join("man"),
-        [dir] => PathBuf::from(dir),
-        [_, extra, ..] => bail!("unexpected argument {}\n{USAGE}", extra.display()),
-    };
-    fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-    clap_mangen::generate_to(cli::Cli::command(), &dir)
-        .with_context(|| format!("writing man pages to {}", dir.display()))?;
-    println!("{}", dir.display());
-    Ok(true)
 }
 
 fn test_e2e(args: &[OsString]) -> Result<bool> {
@@ -655,6 +687,14 @@ fn touch<'a>(touches: &'a [Value], op: &str, path: &Path) -> Result<&'a Value> {
         .iter()
         .find(|t| t["op"] == op && t["path"] == path.as_str())
         .with_context(|| format!("no {op} touch for {path}; {}", summary(touches)))
+}
+
+/// Whether `line` is a `lost` line a scenario's own small workload could have caused. Skipped
+/// hook runs (`skipped`) are counted for every process on the machine, mostly for files
+/// elsewhere, and come and go with its load: the exact changes a scenario asserts show whether
+/// one of its own was lost.
+fn workload_loss(line: &Value) -> bool {
+    line["type"] == "lost" && line["reason"] != "skipped"
 }
 
 fn write_fsync(ctx: &Ctx) -> Result<String> {

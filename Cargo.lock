@@ -209,7 +209,7 @@ checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
 name = "fsblame"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "aya",
@@ -229,7 +229,7 @@ dependencies = [
 
 [[package]]
 name = "fsblame-abi"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aya",
  "tracekit-wire",
@@ -237,7 +237,7 @@ dependencies = [
 
 [[package]]
 name = "fsblame-bpf"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "fsblame-abi",
 ]
@@ -469,7 +469,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",

@@ -20,7 +20,18 @@ There are three line types:
 
 Paths and command lines are Linux byte strings; bytes that are not valid UTF-8 are replaced
 with U+FFFD. Times are RFC 3339 in UTC with microseconds, such as
-`2026-10-16T22:11:26.804885Z`.
+`2026-10-16T22:11:26.804885Z`. They come from the kernel's boot clock, converted with the
+wall-clock offset fsblame samples on every pass of its loop, so a step of the system clock
+(NTP's first sync, `date -s`) applies from the next events on. Times are not made monotonic:
+after the clock is set back, later lines carry earlier times, as in the system's other logs.
+
+Only changes that were made are reported. fsblame sees each operation at the kernel's
+permission check, before the filesystem acts, and holds the record until the VFS function
+that ran the check returns; a call that failed (an `rmdir` of a directory that is not empty,
+a `chmod` of someone else's file) is dropped. Two exceptions: on a kernel where that function
+cannot be traced, fsblame warns at start and reports the operation at its check; and before
+Linux 6.9, a create by `open(O_CREAT)` is reported at its check, so one that fails is
+reported too.
 
 ## Compatibility
 
@@ -127,12 +138,12 @@ fsblame writes each line compactly, on one line; it is indented here for reading
 |-------|------|------|---------|
 | `type` | string | no | `"touch"`. |
 | `v` | integer | no | `1`. |
-| `ts` | string | no | When it happened. For a write, the time of the latest write call of the window. |
+| `ts` | string | no | When it happened: when the operation returned, or for an operation reported at its check, when it was checked. For a write, the time of the latest write call of the window. |
 | `op` | string | no | The operation, see [Operations](#operations). |
 | `path` | string | no | The absolute path changed: for a rename the new name, for a link or symlink the new link. |
 | `old_path` | string | yes | The old name of a rename; `null` for every other op. |
-| `target` | string | yes | `symlink`: the link's target text as stored, not resolved (`"util.js"`). `link`: the absolute path of the existing name the new link points at. `null` for every other op. |
-| `truncated` | boolean | no | Upper components of `path`, `old_path` or `target` are missing: the kernel walk emits at most 1024 bytes or 64 names per path. A cut path keeps its lowest names and reads `<watch root>/…/<names>`. |
+| `target` | string | yes | `symlink`: the link's target text as stored, not resolved (`"util.js"`); a target longer than 1023 bytes is cut there and ends in `…`. `link`: the absolute path of the existing name the new link points at. `null` for every other op. |
+| `truncated` | boolean | no | Part of `path`, `old_path` or `target` is missing. The kernel walk emits at most 1024 bytes or 64 names per path; a cut path keeps its lowest names and reads `<watch root>/…/<names>`. A cut symlink target keeps its start and ends in `…`. |
 | `bytes` | integer | yes | Write windows: bytes requested by the window's write calls (the count passed to the call, not what it returned). `null` for every other op and for a shared mapping. |
 | `calls` | integer | yes | Write windows: the number of write calls. `null` otherwise. |
 | `file` | object | no | The file's identity, see below. |
@@ -154,12 +165,12 @@ All pids are as seen from the initial pid namespace, except `ns_pid`.
 | Field | Type | Meaning |
 |-------|------|---------|
 | `dev` | string | The filesystem's device number, `"MAJOR:MINOR"` (for an overlay, the overlay's own). |
-| `ino` | integer | The inode number; `0` for a name that has no inode yet (`create`, `mkdir`, `mknod`, `symlink`), except a create confirmed after its `open` (see below), which has its new inode. |
-| `mode` | string | The inode's `i_mode` in octal, such as `"100644"` (type and permission bits) at the time of the operation, so before a `chmod`. For `create`, `mkdir` and `mknod` the mode the caller asked for, before the umask (a create confirmed after its `open`: the new file's mode); `"0"` for `symlink`. |
+| `ino` | integer | The inode number. For `create`, `mkdir`, `mknod` and `symlink`, the new file's, read once the operation succeeded; `0` when the operation was reported at its check (see below). |
+| `mode` | string | The inode's `i_mode` in octal, such as `"100644"` (type and permission bits), as before the operation: for a `chmod`, the old mode. For `create`, `mkdir`, `mknod` and `symlink`, the mode the new file got: after the umask and a default ACL, with the setgid bit a directory passes on, and `"120777"` for a symlink. Reported at its check, it is the mode the call asked for (`"0"` for a symlink). |
 
-A create "confirmed after its open" is an `open(O_CREAT)` of a name that was not in the
-kernel's dentry cache. On Linux 6.9 and newer fsblame waits until the open has run, to report
-it only if it did create the file; the file exists by then.
+An operation is "reported at its check" when no program confirms it: before Linux 6.9 every
+create by `open(O_CREAT)` is, and so is an operation whose VFS function cannot be traced on
+the running kernel (fsblame warns about that at start).
 
 `context` (every field may be `null`):
 
@@ -202,7 +213,7 @@ it only if it did create the file; the file exists by then.
 
 | `op` | Reported for |
 |------|--------------|
-| `write` | Data written to a regular file (`write`, `pwrite`, `writev`, `splice`, `copy_file_range`, `fallocate`, reflinks), coalesced into one line per process and file: the window closes once the file has been quiet for 200 ms, after 1 s, when the process execs or exits, before another change to the same file is reported, or when fsblame stops. Also a shared mapping of the file made writable (`change.mapped`). |
+| `write` | Data written to a regular file (`write`, `pwrite`, `writev`, `splice`, `copy_file_range`, `fallocate`, reflinks), coalesced into one line per process and file: the window closes once the file has been quiet for 200 ms, after 1 s, when the process execs or exits, before another change to the same file is reported, or when fsblame stops. Writes are reported at the file's name when they were made, so writes through a descriptor kept open across a rename are reported at the new name. Also a shared mapping of the file made writable (`change.mapped`). |
 | `create` | A regular file created. |
 | `mkdir` | A directory created. |
 | `mknod` | A special file created (FIFO, socket, device node). |
@@ -212,10 +223,10 @@ it only if it did create the file; the file exists by then.
 | `rmdir` | A directory removed. |
 | `rename` | A name moved. |
 | `chmod` | Permissions changed. |
-| `chown` | Owner or group changed. |
+| `chown` | Owner or group changed. A chown that also clears the setuid or setgid bits is one `chown`, not a `chmod`. |
 | `truncate` | Size changed (`truncate`, `O_TRUNC`). |
 | `utimes` | Timestamps set (`utimensat`, `touch`). |
-| `setattr` | Any other attribute change, such as the kernel clearing setuid bits. |
+| `setattr` | Any other attribute change the kernel's setattr check sees. |
 
 ### The `change` object
 
@@ -271,13 +282,15 @@ The second line is from a run stopped with two quick Ctrl-C while it was far beh
 | `reason` | `count` counts | What is missing |
 |----------|----------------|-----------------|
 | `ring-full` | records | The kernel ring buffer was full: changes, or the process events lineage is built from, were dropped. Raise `--ring-size`. |
-| `write-evicted` | write bindings | The kernel's write table evicted open files before fsblame read their latest totals: their `bytes` and `calls` since the previous read are missing. |
+| `write-evicted` | write bindings | The latest totals of open files were lost: the kernel's write table evicted them before fsblame read them, or the record handing them over was dropped with the ring buffer full. Their `bytes` and `calls` since the previous read are missing. |
 | `track-full` | processes | `fsblame run` and `watch --tree` only: the table of followed processes was full (65,536 entries), so new processes started by followed ones were not followed, and their changes are missing. |
-| `unread` | records | fsblame stopped before it had read the records of every change made before the stop. After a stop (SIGINT, SIGTERM, SIGHUP, the `--duration` deadline, or the end of `run`'s command) it keeps reading them for up to 10 s, and a second stop signal ends that at once; the changes or process events still in the ring then are missing. |
+| `unread` | records | fsblame stopped before it had read the records of every change made before the stop. After a stop (SIGINT, SIGTERM, SIGHUP, the `--duration` deadline, or the end of `run`'s command) it keeps reading them for up to 10 s; SIGTERM or SIGHUP end that at once, and so does a second SIGINT except under `fsblame run`, where SIGINT belongs to the command. The changes or process events still in the ring then are missing. |
+| `skipped` | hook runs | The kernel skipped runs of fsblame's programs because the same program was already running on that CPU (preempted or interrupted in the middle of a run): changes, the confirmation of held changes, or process events may be missing. Counted for the programs whose skipped run can lose a change (the checks, the confirming and mapping programs, and the scheduler tracepoints), not for those that only add detail such as byte counts. Every skipped run counts, for any file on the system, so this is an upper bound. |
 
 The counts of all `lost` lines of a run add up to the run's totals in the `summary` line and
 in the warning fsblame prints on stderr when it stops. In human output, losses go to stderr
-as warnings instead.
+as warnings instead. A reason fsblame does not know reads as `other` (see
+[Compatibility](#compatibility)).
 
 ## `summary`: the whole run
 
@@ -289,7 +302,7 @@ Written last when `--summary` is given (from a real run, shortened to two groups
   "v": 1,
   "ts": "2026-10-16T22:11:12.662355Z",
   "changes": 18,
-  "lost": { "ring_full": 0, "write_evicted": 0, "track_full": 0, "unread": 0 },
+  "lost": { "ring_full": 0, "write_evicted": 0, "track_full": 0, "unread": 0, "skipped": 0 },
   "groups": [
     {
       "group": { "comm": "bash" },
@@ -321,7 +334,7 @@ Written last when `--summary` is given (from a real run, shortened to two groups
 | `v` | integer | `1`. |
 | `ts` | string | When the run stopped. |
 | `changes` | integer | Changes reported (after the filters). |
-| `lost` | object | The run's losses: `ring_full` (records), `write_evicted` (write bindings), `track_full` (processes), `unread` (records); see [`lost`](#lost-data-that-did-not-reach-the-report). fsblame reads a missing `track_full` or `unread` as 0. |
+| `lost` | object | The run's losses: `ring_full` (records), `write_evicted` (write bindings), `track_full` (processes), `unread` (records), `skipped` (hook runs); see [`lost`](#lost-data-that-did-not-reach-the-report). Keys after `write_evicted` were added within version 1: fsblame reads a missing one as 0 and ignores one it does not know. |
 | `groups` | array | Changes grouped by build step, or by the acting process's `comm` when there is none. Most changes first, ties in the order they first changed something. |
 
 Each group:

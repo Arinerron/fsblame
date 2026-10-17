@@ -590,8 +590,17 @@ impl Roots {
 
     /// The absolute path for dentry names reported relative to `root` (leaf first, each
     /// NUL-terminated). `None` for `ROOT_NONE` or an unknown root id. A truncated walk lost
-    /// its upper components, which show as `…`.
+    /// its upper components, which show as `…`; a truncated raw string (`ROOT_RAW`, a symlink
+    /// target) lost its end, which shows as `…` too.
     pub fn path(&self, root: u32, dev: u32, names: &[u8], truncated: bool) -> Option<PathBuf> {
+        if root == abi::ROOT_RAW {
+            let raw = names.split(|&b| b == 0).next().unwrap_or_default();
+            let mut raw = OsStr::from_bytes(raw).to_os_string();
+            if truncated {
+                raw.push("…");
+            }
+            return Some(PathBuf::from(raw));
+        }
         let mut rel = PathBuf::new();
         if truncated {
             rel.push("…");
@@ -603,10 +612,6 @@ impl Roots {
         }
         match root {
             abi::ROOT_NONE => None,
-            abi::ROOT_RAW => {
-                let raw = names.split(|&b| b == 0).next().unwrap_or_default();
-                Some(PathBuf::from(OsStr::from_bytes(raw)))
-            }
             abi::ROOT_FSROOT => Some(
                 visible(&self.mounts, dev, &rel)
                     .unwrap_or_else(|| Path::new(&format!("<dev {}>", dev_string(dev))).join(&rel)),
@@ -745,6 +750,11 @@ mod tests {
         assert_eq!(
             roots.path(abi::ROOT_RAW, 0, b"../target\0", false),
             Some(PathBuf::from("../target"))
+        );
+        // A symlink target the kernel cut lost its end, not its start.
+        assert_eq!(
+            roots.path(abi::ROOT_RAW, 0, b"../tar\0", true),
+            Some(PathBuf::from("../tar…"))
         );
     }
 

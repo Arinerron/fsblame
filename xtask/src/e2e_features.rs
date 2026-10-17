@@ -24,7 +24,9 @@ use std::{
 use anyhow::{Context as _, Result, anyhow, bail, ensure};
 use serde_json::{Value, json};
 
-use crate::{Ctx, Finished, MAX_RUN, READY_TIMEOUT, Watcher, sh, summary, text, touch};
+use crate::{
+    Ctx, Finished, MAX_RUN, READY_TIMEOUT, Watcher, sh, summary, text, touch, workload_loss,
+};
 
 /// Longest a scenario waits for its own background workload to make progress.
 const PROGRESS_TIMEOUT: Duration = Duration::from_secs(10);
@@ -293,18 +295,149 @@ fn parse(ndjson: &str) -> Result<Vec<Value>> {
         .collect()
 }
 
-/// The touch lines among `lines`. A `lost` line fails: these workloads are far too small for
-/// fsblame to lose anything.
-fn changes_in(lines: Vec<Value>) -> Result<Vec<Value>> {
-    if let Some(lost) = lines.iter().find(|l| l["type"] == "lost") {
-        bail!("fsblame lost data: {lost}");
-    }
-    Ok(lines.into_iter().filter(|l| l["type"] == "touch").collect())
+/// The NDJSON one fsblame run printed, by line type.
+struct Output {
+    /// The changes.
+    touches: Vec<Value>,
+    /// The `lost` lines of hook runs the kernel skipped, the only loss allowed
+    /// ([`workload_loss`]).
+    skipped: Vec<Value>,
+    /// The summary line, if it was asked for.
+    summary: Option<Value>,
 }
 
-/// The touches a finished watcher printed ([`changes_in`]).
-fn changes(done: &Finished) -> Result<Vec<Value>> {
-    changes_in(done.touches()?)
+impl Output {
+    /// Sorts `lines` by type. Any loss but skipped hook runs fails: these workloads are far
+    /// too small for fsblame to lose anything. A summary must be the last line.
+    fn of(lines: Vec<Value>) -> Result<Self> {
+        let mut out = Self {
+            touches: Vec::new(),
+            skipped: Vec::new(),
+            summary: None,
+        };
+        for line in lines {
+            if let Some(summary) = &out.summary {
+                bail!("a line after the summary {summary}: {line}");
+            }
+            match line["type"].as_str() {
+                Some("touch") => out.touches.push(line),
+                Some("summary") => out.summary = Some(line),
+                Some("lost") if !workload_loss(&line) => out.skipped.push(line),
+                Some("lost") => bail!("fsblame lost data: {line}"),
+                _ => bail!("not a report line: {line}"),
+            }
+        }
+        Ok(out)
+    }
+
+    /// What a finished watcher printed ([`Output::of`]).
+    fn printed(done: &Finished) -> Result<Self> {
+        Self::of(done.touches()?)
+    }
+
+    /// Runs `check` on the changes. When it fails and the kernel skipped hook runs, one of
+    /// which may have lost a change it looks for, the failure lists their `lost` lines.
+    fn check<T>(&self, check: impl FnOnce(&[Value]) -> Result<T>) -> Result<T> {
+        let lines: Vec<String> = self.skipped.iter().map(Value::to_string).collect();
+        explained(check(&self.touches), &lines.join("\n"))
+    }
+
+    /// Hook runs the kernel skipped, by the `lost` lines.
+    fn skipped_runs(&self) -> u64 {
+        self.skipped
+            .iter()
+            .map(|l| l["count"].as_u64().unwrap_or(0))
+            .sum()
+    }
+
+    /// Checks the summary line against the changes it summarises: the total, the losses
+    /// (only the skipped hook runs the `lost` lines reported), and per group the changes,
+    /// the counts per op and the distinct paths.
+    fn check_summary(&self) -> Result<()> {
+        let summary = self.summary.as_ref().context("no summary line")?;
+        let touches = &self.touches;
+        ensure!(
+            summary["changes"] == touches.len() as u64,
+            "the summary counts {} changes, {} were reported",
+            summary["changes"],
+            touches.len()
+        );
+        let lost = json!({
+            "ring_full": 0,
+            "write_evicted": 0,
+            "track_full": 0,
+            "unread": 0,
+            "skipped": self.skipped_runs(),
+        });
+        ensure!(
+            summary["lost"] == lost,
+            "the summary reports the losses {}, the lost lines {lost}",
+            summary["lost"]
+        );
+        let mut tally: BTreeMap<String, (BTreeMap<String, u64>, BTreeSet<&str>)> = BTreeMap::new();
+        for t in touches {
+            let (ops, paths) = tally.entry(group_of(t)).or_default();
+            *ops.entry(t["op"].as_str().unwrap_or("?").to_owned())
+                .or_default() += 1;
+            paths.insert(t["path"].as_str().unwrap_or("?"));
+        }
+        let want: BTreeMap<String, (BTreeMap<String, u64>, u64)> = tally
+            .into_iter()
+            .map(|(group, (ops, paths))| (group, (ops, paths.len() as u64)))
+            .collect();
+        let mut got = BTreeMap::new();
+        for g in summary["groups"]
+            .as_array()
+            .context("the summary has no groups")?
+        {
+            let ops: BTreeMap<String, u64> = g["ops"]
+                .as_object()
+                .with_context(|| format!("group without ops: {g}"))?
+                .iter()
+                .map(|(op, n)| (op.clone(), n.as_u64().unwrap_or(0)))
+                .collect();
+            ensure!(
+                g["changes"].as_u64() == Some(ops.values().sum()),
+                "group {} counts {} changes but {ops:?} by op",
+                g["group"],
+                g["changes"]
+            );
+            got.insert(
+                g["group"].to_string(),
+                (ops, g["paths"].as_u64().unwrap_or(0)),
+            );
+        }
+        ensure!(
+            got == want,
+            "summary groups (ops, distinct paths) {got:?}, but the touches give {want:?}"
+        );
+        Ok(())
+    }
+}
+
+/// `result`, with a failure followed by `losses` (what fsblame said it lost) unless that is
+/// empty: a check of changes fails when a skipped hook run lost one of them.
+fn explained<T>(result: Result<T>, losses: &str) -> Result<T> {
+    result.map_err(|e| {
+        if losses.is_empty() {
+            e
+        } else {
+            anyhow!(
+                "{e:#}\n     the kernel skipped runs of fsblame's hooks meanwhile, which may \
+                 have lost changes:\n     {}",
+                losses.replace('\n', "\n     ")
+            )
+        }
+    })
+}
+
+/// The warnings of a human view's stderr about hook runs the kernel skipped.
+fn skip_warnings(stderr: &str) -> String {
+    stderr
+        .lines()
+        .filter(|l| l.contains("skipped by the kernel"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// How many touches have `op` on `path`.
@@ -370,65 +503,6 @@ fn group_of(touch: &Value) -> String {
         } })
     };
     group.to_string()
-}
-
-/// Checks the summary line `summary` against the touches it summarises: the total, nothing
-/// lost, and per group the changes, the counts per op and the distinct paths.
-fn check_summary(summary: &Value, touches: &[Value]) -> Result<()> {
-    ensure!(
-        summary["type"] == "summary",
-        "the last line is not the summary: {summary}"
-    );
-    ensure!(
-        summary["changes"] == touches.len() as u64,
-        "the summary counts {} changes, {} were reported",
-        summary["changes"],
-        touches.len()
-    );
-    ensure!(
-        summary["lost"]
-            == json!({ "ring_full": 0, "write_evicted": 0, "track_full": 0, "unread": 0 }),
-        "the summary reports losses: {}",
-        summary["lost"]
-    );
-    let mut tally: BTreeMap<String, (BTreeMap<String, u64>, BTreeSet<&str>)> = BTreeMap::new();
-    for t in touches {
-        let (ops, paths) = tally.entry(group_of(t)).or_default();
-        *ops.entry(t["op"].as_str().unwrap_or("?").to_owned())
-            .or_default() += 1;
-        paths.insert(t["path"].as_str().unwrap_or("?"));
-    }
-    let want: BTreeMap<String, (BTreeMap<String, u64>, u64)> = tally
-        .into_iter()
-        .map(|(group, (ops, paths))| (group, (ops, paths.len() as u64)))
-        .collect();
-    let mut got = BTreeMap::new();
-    for g in summary["groups"]
-        .as_array()
-        .context("the summary has no groups")?
-    {
-        let ops: BTreeMap<String, u64> = g["ops"]
-            .as_object()
-            .with_context(|| format!("group without ops: {g}"))?
-            .iter()
-            .map(|(op, n)| (op.clone(), n.as_u64().unwrap_or(0)))
-            .collect();
-        ensure!(
-            g["changes"].as_u64() == Some(ops.values().sum()),
-            "group {} counts {} changes but {ops:?} by op",
-            g["group"],
-            g["changes"]
-        );
-        got.insert(
-            g["group"].to_string(),
-            (ops, g["paths"].as_u64().unwrap_or(0)),
-        );
-    }
-    ensure!(
-        got == want,
-        "summary groups (ops, distinct paths) {got:?}, but the touches give {want:?}"
-    );
-    Ok(())
 }
 
 /// `text` without ANSI SGR sequences (`ESC [ ... m`).
@@ -612,29 +686,30 @@ pub(crate) fn mapped_writes(ctx: &Ctx) -> Result<String> {
     mapping.store(0, 1);
     drop(mapping);
     drop(file);
-    let touches = changes(&watcher.stop()?)?;
-
     let me = u64::from(std::process::id());
-    for (path, via) in [(&mmapped, "mmap"), (&protected, "mprotect")] {
-        let name = text(path);
-        let on: Vec<&Value> = touches
-            .iter()
-            .filter(|t| t["path"] == name.as_str())
-            .collect();
+    Output::printed(&watcher.stop()?)?.check(|touches| {
+        for (path, via) in [(&mmapped, "mmap"), (&protected, "mprotect")] {
+            let name = text(path);
+            let on: Vec<&Value> = touches
+                .iter()
+                .filter(|t| t["path"] == name.as_str())
+                .collect();
+            ensure!(
+                matches!(&on[..], [t] if t["op"] == "write"
+                    && t["change"]["mapped"] == via
+                    && t["bytes"].is_null()
+                    && t["proc"]["pid"] == me),
+                "expected one write by pid {me} with change.mapped {via:?} for {name}, got \
+                 {on:?}"
+            );
+        }
         ensure!(
-            matches!(&on[..], [t] if t["op"] == "write"
-                && t["change"]["mapped"] == via
-                && t["bytes"].is_null()
-                && t["proc"]["pid"] == me),
-            "expected one write by pid {me} with change.mapped {via:?} for {name}, got {on:?}"
+            touches.len() == 2,
+            "only the two mappings were expected; {}",
+            summary(touches)
         );
-    }
-    ensure!(
-        touches.len() == 2,
-        "only the two mappings were expected; {}",
-        summary(&touches)
-    );
-    Ok("one write per open file: change.mapped mmap (mapped twice), mprotect".to_owned())
+        Ok("one write per open file: change.mapped mmap (mapped twice), mprotect".to_owned())
+    })
 }
 
 /// t: the kernel captures the cwd at exec, so a process that exits before fsblame could read
@@ -646,26 +721,27 @@ pub(crate) fn exec_cwd(ctx: &Ctx) -> Result<String> {
     fs::write(sub.join("a"), "a\n")?;
     let watcher = ctx.watch(&[&dir])?;
     sh(&dir, "cd sub && exec mv a b")?;
-    let touches = changes(&watcher.stop()?)?;
-    let t = touch(&touches, "rename", &sub.join("b"))?;
-    let old = text(&sub.join("a"));
-    ensure!(
-        t["old_path"] == old.as_str(),
-        "rename old_path is {}, expected {old}",
-        t["old_path"]
-    );
-    ensure!(
-        t["proc"]["comm"] == "mv",
-        "rename attributed to {}",
-        t["proc"]["comm"]
-    );
-    let cwd = text(&sub);
-    ensure!(
-        t["proc"]["cwd"] == cwd.as_str(),
-        "mv's cwd is {}, expected {cwd}",
-        t["proc"]["cwd"]
-    );
-    Ok(format!("mv's cwd {cwd}"))
+    Output::printed(&watcher.stop()?)?.check(|touches| {
+        let t = touch(touches, "rename", &sub.join("b"))?;
+        let old = text(&sub.join("a"));
+        ensure!(
+            t["old_path"] == old.as_str(),
+            "rename old_path is {}, expected {old}",
+            t["old_path"]
+        );
+        ensure!(
+            t["proc"]["comm"] == "mv",
+            "rename attributed to {}",
+            t["proc"]["comm"]
+        );
+        let cwd = text(&sub);
+        ensure!(
+            t["proc"]["cwd"] == cwd.as_str(),
+            "mv's cwd is {}, expected {cwd}",
+            t["proc"]["cwd"]
+        );
+        Ok(format!("mv's cwd {cwd}"))
+    })
 }
 
 /// The command of scenario u, run as `sh -c RUN_SCRIPT sh ELSEWHERE` in its directory.
@@ -729,13 +805,13 @@ pub(crate) fn run_command(ctx: &Ctx) -> Result<String> {
         "the command ran as uid {}, not as the invoking uid {me}",
         uid.trim()
     );
-    let touches = changes_in(parse(
+    let out = Output::of(parse(
         &fs::read_to_string(&report).with_context(|| format!("reading {}", report.display()))?,
     )?)?;
-    check_run(&touches, &dir, &elsewhere, me)?;
+    out.check(|touches| check_run(touches, &dir, &elsewhere, me))?;
     Ok(format!(
         "{} changes in {} and {} as uid {me}, none of {during} unrelated writes; exit 7 passed on",
-        touches.len(),
+        out.touches.len(),
         dir.display(),
         elsewhere.display()
     ))
@@ -842,30 +918,52 @@ pub(crate) fn tree(ctx: &Ctx) -> Result<String> {
     wait_until("the tracked loop to write 3 times", || {
         line_count(&looped) >= start + 3
     })?;
-    let touches = changes(&watcher.stop()?)?;
+    let out = Output::printed(&watcher.stop()?)?;
     ensure!(
         line_count(&other) > others,
         "the untracked writer did not write while watched"
     );
-    let pid64 = u64::from(tracked.pid());
-    let (looped, child) = (text(&looped), text(&child));
+    out.check(|touches| check_tree(touches, tracked.pid(), &looped, &child))?;
+
+    let missing = fsblame(ctx)
+        .args(["watch", "--tree", NO_PID])
+        .arg(&dir)
+        .stdin(Stdio::null())
+        .output()?;
+    let stderr = String::from_utf8_lossy(&missing.stderr);
     ensure!(
-        touches.iter().any(|t| t["op"] == "write"
-            && t["path"] == looped.as_str()
-            && t["proc"]["pid"] == pid64),
+        missing.status.code() == Some(2) && stderr.contains("no such process"),
+        "--tree {NO_PID}: {}, expected exit 2 for no such process:\n{stderr}",
+        missing.status
+    );
+    Ok(format!(
+        "{} changes by {pid} and its children, none by the writer beside it; --tree {NO_PID} exits 2",
+        out.touches.len()
+    ))
+}
+
+/// Checks the changes of scenario v: writes to `looped` by the tracked shell `pid` and to
+/// `child` by a child of it, and nothing by a process outside its tree.
+fn check_tree(touches: &[Value], pid: u32, looped: &Path, child: &Path) -> Result<()> {
+    let pid = u64::from(pid);
+    let (looped, child) = (text(looped), text(child));
+    ensure!(
+        touches
+            .iter()
+            .any(|t| t["op"] == "write" && t["path"] == looped.as_str() && t["proc"]["pid"] == pid),
         "no write to {looped} by the tracked shell {pid}; {}",
-        summary(&touches)
+        summary(touches)
     );
     ensure!(
         touches.iter().any(|t| t["op"] == "write"
             && t["path"] == child.as_str()
-            && t["ancestry"][0]["pid"] == pid64),
+            && t["ancestry"][0]["pid"] == pid),
         "no write to {child} by a child of {pid}; {}",
-        summary(&touches)
+        summary(touches)
     );
-    for t in &touches {
+    for t in touches {
         ensure!(
-            in_chain(t, pid64),
+            in_chain(t, pid),
             "{} {} by {} (pid {}) is outside the tree of {pid}",
             t["op"],
             t["path"],
@@ -873,22 +971,7 @@ pub(crate) fn tree(ctx: &Ctx) -> Result<String> {
             t["proc"]["pid"]
         );
     }
-
-    let out = fsblame(ctx)
-        .args(["watch", "--tree", NO_PID])
-        .arg(&dir)
-        .stdin(Stdio::null())
-        .output()?;
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    ensure!(
-        out.status.code() == Some(2) && stderr.contains("no such process"),
-        "--tree {NO_PID}: {}, expected exit 2 for no such process:\n{stderr}",
-        out.status
-    );
-    Ok(format!(
-        "{} changes by {pid} and its children, none by the writer beside it; --tree {NO_PID} exits 2",
-        touches.len()
-    ))
+    Ok(())
 }
 
 /// Whether a filter of scenario w admits a change to the file `name` by `comm`.
@@ -935,27 +1018,40 @@ pub(crate) fn filters(ctx: &Ctx) -> Result<String> {
 
     for ((args, admits), done) in cases.iter().zip(&finished) {
         let filter = args.join(" ");
-        let lines = done.touches()?;
-        let (last, rest) = lines
-            .split_last()
-            .with_context(|| format!("{filter}: no output"))?;
-        let touches = changes_in(rest.to_vec())?;
-        let mut got = shape(&touches, &dir);
-        got.sort();
+        let out = Output::printed(done).with_context(|| filter.clone())?;
         let mut want: Vec<String> = all
             .iter()
             .filter(|(_, name, comm)| admits(name, comm))
             .map(|(op, name, comm)| format!("{op} {name} by {comm}"))
             .collect();
         want.sort();
-        ensure!(got == want, "{filter}: reported {got:?}, expected {want:?}");
-        check_summary(last, &touches).with_context(|| filter.clone())?;
+        out.check(|touches| {
+            let mut got = shape(touches, &dir);
+            got.sort();
+            ensure!(got == want, "{filter}: reported {got:?}, expected {want:?}");
+            Ok(())
+        })?;
+        out.check_summary().with_context(|| filter.clone())?;
     }
     Ok(
         "--include '*.txt', --ignore-comm sh, --comm sh,tee, --pid: the matching changes only, \
          and summaries of them"
             .to_owned(),
     )
+}
+
+/// The `touch` lines and the `lost` lines of `ndjson`, as printed; any other line fails.
+fn by_type(ndjson: &str) -> Result<(Vec<&str>, Vec<&str>)> {
+    let (mut touches, mut lost) = (Vec::new(), Vec::new());
+    for line in ndjson.lines() {
+        let v: Value = serde_json::from_str(line).with_context(|| format!("not JSON: {line}"))?;
+        match v["type"].as_str() {
+            Some("touch") => touches.push(line),
+            Some("lost") => lost.push(line),
+            _ => bail!("neither a change nor a loss: {line}"),
+        }
+    }
+    Ok((touches, lost))
 }
 
 /// Runs `sudo -n fsblame blame PATH --journal JOURNAL ARGS` and returns its stdout.
@@ -1030,33 +1126,69 @@ pub(crate) fn record_blame(ctx: &Ctx) -> Result<String> {
             .args(["-n", "sh", "-c", r#"cat -- "$0"/*.ndjson"#])
             .arg(&journal),
     )?;
-    let (f_path, g_path) = (text(&f), text(&g));
-    let mut of_f = Vec::new();
-    let mut of_g = 0;
-    for line in recorded.lines() {
-        let v: Value = serde_json::from_str(line).with_context(|| format!("journal: {line}"))?;
-        if v["path"] == f_path.as_str() {
-            of_f.push((line, v));
-        } else if v["path"] == g_path.as_str() {
-            of_g += 1;
-        }
+    let journaled = recorded
+        .lines()
+        .map(|line| {
+            serde_json::from_str(line)
+                .map(|v: Value| (line, v))
+                .with_context(|| format!("journal: {line}"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if let Some((line, _)) = journaled.iter().find(|(_, v)| workload_loss(v)) {
+        bail!("the recorder lost data: {line}");
     }
-    let ops: Vec<&str> = of_f.iter().filter_map(|(_, v)| v["op"].as_str()).collect();
-    ensure!(
-        ops == ["create", "write", "chmod", "write"] && of_g == 2,
-        "the journal holds {ops:?} for {f_path} and {of_g} changes of {g_path}:\n{recorded}"
-    );
-    let of_f: Vec<&str> = of_f.iter().map(|(line, _)| *line).collect();
+    let skipped: Vec<&str> = journaled
+        .iter()
+        .filter(|(_, v)| v["type"] == "lost")
+        .map(|(line, _)| *line)
+        .collect();
+    let losses = skipped.join("\n");
+    let (f_path, g_path) = (text(&f), text(&g));
+    let of = |path: &str| -> Vec<(usize, &str)> {
+        journaled
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, v))| v["type"] == "touch" && v["path"] == path)
+            .map(|(at, (line, _))| (at, *line))
+            .collect()
+    };
+    let (of_f, of_g) = (of(&f_path), of(&g_path).len());
+    let ops: Vec<&str> = of_f
+        .iter()
+        .filter_map(|&(at, _)| journaled[at].1["op"].as_str())
+        .collect();
+    explained(
+        if ops == ["create", "write", "chmod", "write"] && of_g == 2 {
+            Ok(())
+        } else {
+            Err(anyhow!(
+                "the journal holds {ops:?} for {f_path} and {of_g} changes of {g_path}:\n{recorded}"
+            ))
+        },
+        &losses,
+    )?;
+    let last_f = of_f.last().map_or(0, |&(at, _)| at);
+    let of_f: Vec<&str> = of_f.into_iter().map(|(_, line)| line).collect();
 
+    // blame passes on the journal's losses in the queried time: every one, and with --limit
+    // those from the oldest change shown on.
     let blamed = blame(ctx, &journal, &f, &["--json"])?;
+    let (touches, lost) = by_type(&blamed)?;
     ensure!(
-        blamed.lines().eq(of_f.iter().copied()),
-        "blame --json {f_path}:\n{blamed}\nthe journal's lines of it:\n{}",
+        touches == of_f && lost == skipped,
+        "blame --json {f_path}:\n{blamed}\nthe journal's lines of it:\n{}\nand its losses:\n\
+         {losses}",
         of_f.join("\n")
     );
     let latest = blame(ctx, &journal, &f, &["--json", "--limit", "1"])?;
+    let (touches, lost) = by_type(&latest)?;
+    let after: Vec<&str> = journaled[last_f..]
+        .iter()
+        .filter(|(_, v)| v["type"] == "lost")
+        .map(|(line, _)| *line)
+        .collect();
     ensure!(
-        latest.lines().eq(of_f.last().copied()),
+        touches == of_f[of_f.len() - 1..] && lost == after,
         "blame --json --limit 1 {f_path}:\n{latest}"
     );
     let future = blame(
@@ -1081,10 +1213,21 @@ pub(crate) fn record_blame(ctx: &Ctx) -> Result<String> {
     );
     let human = blame(ctx, &journal, &f, &["--color", "never"])?;
     let shown = blocks_of(&live.stdout, "/watched/f");
-    ensure!(
-        !human.is_empty() && human == shown,
-        "blame's tree:\n{human}\nwatch's tree of the file:\n{shown}"
-    );
+    let warned = skip_warnings(&live.stderr);
+    explained(
+        if !human.is_empty() && human == shown {
+            Ok(())
+        } else {
+            Err(anyhow!(
+                "blame's tree:\n{human}\nwatch's tree of the file:\n{shown}"
+            ))
+        },
+        &[losses.as_str(), warned.as_str()]
+            .into_iter()
+            .filter(|l| !l.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )?;
     Ok(format!(
         "{} of {} changes recorded are f's; journal 0700/0600; --limit 1, --since, exit 4 \
          unprivileged; same tree as watch",
@@ -1217,7 +1360,7 @@ pub(crate) fn output_options(ctx: &Ctx) -> Result<String> {
         &dir,
         "mkdir d && echo x > d/f && chmod 600 d/f && mv d/f d/g && rm d/g && rmdir d",
     )?;
-    let [json, quiet, always, never, _, _] = stop_all(watchers)?;
+    let [json, quiet, always, never, on_tty, on_no_color_tty] = stop_all(watchers)?;
     let tty = tty
         .join()
         .map_err(|_| anyhow!("terminal reader panicked"))?;
@@ -1239,14 +1382,17 @@ pub(crate) fn output_options(ctx: &Ctx) -> Result<String> {
     if let Some(line) = lines.iter().chain(&quiet_lines).find(|l| l["v"] != 1) {
         bail!("a line without \"v\":1: {line}");
     }
-    let (last, rest) = lines.split_last().context("--json printed nothing")?;
-    let touches = changes_in(rest.to_vec())?;
-    ensure!(
-        shape(&touches, &dir) == expected,
-        "--json reported {:?}, expected {expected:?}",
-        shape(&touches, &dir)
-    );
-    check_summary(last, &touches)?;
+    let versioned = lines.len() + quiet_lines.len();
+    let out = Output::of(lines)?;
+    out.check(|touches| {
+        ensure!(
+            shape(touches, &dir) == expected,
+            "--json reported {:?}, expected {expected:?}",
+            shape(touches, &dir)
+        );
+        Ok(())
+    })?;
+    out.check_summary()?;
     let count_line = format!("fsblame: {} changes reported", expected.len());
     ensure!(
         json.stderr.contains(&count_line),
@@ -1259,20 +1405,27 @@ pub(crate) fn output_options(ctx: &Ctx) -> Result<String> {
         "-q printed the banner or the count:\n{}",
         quiet.stderr
     );
-    let quiet_touches = changes_in(quiet_lines)?;
-    ensure!(
-        shape(&quiet_touches, &dir) == expected,
-        "-q reported {:?}, expected {expected:?}",
-        shape(&quiet_touches, &dir)
-    );
+    Output::of(quiet_lines)?.check(|touches| {
+        ensure!(
+            shape(touches, &dir) == expected,
+            "-q reported {:?}, expected {expected:?}",
+            shape(touches, &dir)
+        );
+        Ok(())
+    })?;
 
     let views = [
-        ("--color always", &always.stdout, true),
-        ("--color never", &never.stdout, false),
-        ("auto on a terminal", &tty, true),
-        ("auto on a terminal with NO_COLOR=1", &no_color_tty, false),
+        ("--color always", &always.stdout, &always.stderr, true),
+        ("--color never", &never.stdout, &never.stderr, false),
+        ("auto on a terminal", &tty, &on_tty.stderr, true),
+        (
+            "auto on a terminal with NO_COLOR=1",
+            &no_color_tty,
+            &on_no_color_tty.stderr,
+            false,
+        ),
     ];
-    for (view, out, colored) in views {
+    for (view, out, stderr, colored) in views {
         ensure!(
             if colored {
                 out.contains("\x1b[")
@@ -1283,15 +1436,21 @@ pub(crate) fn output_options(ctx: &Ctx) -> Result<String> {
             if colored { "" } else { "no" }
         );
         let shown = headers(&plain(out));
-        ensure!(
-            shown == expected.len(),
-            "{view} shows {shown} changes, expected {}:\n{out}",
-            expected.len()
-        );
+        explained(
+            if shown == expected.len() {
+                Ok(())
+            } else {
+                Err(anyhow!(
+                    "{view} shows {shown} changes, expected {}:\n{out}",
+                    expected.len()
+                ))
+            },
+            &skip_warnings(stderr),
+        )?;
     }
     Ok(format!(
-        "{} lines v1, summary matches, -q silent until --ready-fd, colors per --color and NO_COLOR",
-        lines.len() + quiet_touches.len()
+        "{versioned} lines v1, summary matches, -q silent until --ready-fd, colors per --color \
+         and NO_COLOR"
     ))
 }
 
@@ -1324,8 +1483,17 @@ pub(crate) fn write_identity(ctx: &Ctx) -> Result<String> {
             .open(&same)?
             .write_all(b"x")?;
     }
-    let touches = changes(&watcher.stop()?)?;
+    let out = Output::printed(&watcher.stop()?)?;
+    out.check(|touches| check_identity(touches, &dir, &same))?;
+    Ok(format!(
+        "{FILES} files over {} inode numbers: {FILES} writes at distinct paths; {APPENDS} \
+         reopened appends: 1 write of {APPENDS} calls",
+        inodes.len()
+    ))
+}
 
+/// Checks the changes of scenario aa in `dir`: each file once, `same` written once.
+fn check_identity(touches: &[Value], dir: &Path, same: &Path) -> Result<()> {
     let me = u64::from(std::process::id());
     let prefix = format!("{}/f", dir.display());
     let writes: Vec<&Value> = touches
@@ -1360,7 +1528,7 @@ pub(crate) fn write_identity(ctx: &Ctx) -> Result<String> {
     }
     let appended: Vec<&Value> = touches
         .iter()
-        .filter(|t| t["op"] == "write" && t["path"] == text(&same).as_str())
+        .filter(|t| t["op"] == "write" && t["path"] == text(same).as_str())
         .collect();
     ensure!(
         matches!(&appended[..], [t] if t["calls"] == APPENDS && t["bytes"] == APPENDS),
@@ -1373,11 +1541,7 @@ pub(crate) fn write_identity(ctx: &Ctx) -> Result<String> {
         touches.len(),
         4 * FILES + 1
     );
-    Ok(format!(
-        "{FILES} files over {} inode numbers: {FILES} writes at distinct paths; {APPENDS} \
-         reopened appends: 1 write of {APPENDS} calls",
-        inodes.len()
-    ))
+    Ok(())
 }
 
 /// ab: a write window still open when its process execs is the old image's: the write of
@@ -1387,39 +1551,40 @@ pub(crate) fn exec_attribution(ctx: &Ctx) -> Result<String> {
     let script = "echo x >> f; exec mkdir d";
     let watcher = ctx.watch(&[&dir])?;
     sh(&dir, script)?;
-    let touches = changes(&watcher.stop()?)?;
     let file = dir.join("f");
-    ensure!(
-        count(&touches, "write", &file) == 1,
-        "expected one write to {}; {}",
-        file.display(),
-        summary(&touches)
-    );
-    for op in ["create", "write"] {
-        let t = touch(&touches, op, &file)?;
+    Output::printed(&watcher.stop()?)?.check(|touches| {
         ensure!(
-            t["proc"]["comm"] == "sh"
-                && t["comm"] == "sh"
-                && argv(&t["proc"]) == ["sh", "-c", script],
-            "{op} of f attributed to {} {:?} (thread {})",
-            t["proc"]["comm"],
-            argv(&t["proc"]),
-            t["comm"]
+            count(touches, "write", &file) == 1,
+            "expected one write to {}; {}",
+            file.display(),
+            summary(touches)
         );
-    }
-    let write = touch(&touches, "write", &file)?;
-    let mkdir = touch(&touches, "mkdir", &dir.join("d"))?;
-    ensure!(
-        mkdir["proc"]["comm"] == "mkdir" && mkdir["proc"]["pid"] == write["proc"]["pid"],
-        "mkdir attributed to {} (pid {}), expected mkdir in pid {}",
-        mkdir["proc"]["comm"],
-        mkdir["proc"]["pid"],
-        write["proc"]["pid"]
-    );
-    Ok(format!(
-        "pid {}: write by sh, then mkdir by mkdir",
-        write["proc"]["pid"]
-    ))
+        for op in ["create", "write"] {
+            let t = touch(touches, op, &file)?;
+            ensure!(
+                t["proc"]["comm"] == "sh"
+                    && t["comm"] == "sh"
+                    && argv(&t["proc"]) == ["sh", "-c", script],
+                "{op} of f attributed to {} {:?} (thread {})",
+                t["proc"]["comm"],
+                argv(&t["proc"]),
+                t["comm"]
+            );
+        }
+        let write = touch(touches, "write", &file)?;
+        let mkdir = touch(touches, "mkdir", &dir.join("d"))?;
+        ensure!(
+            mkdir["proc"]["comm"] == "mkdir" && mkdir["proc"]["pid"] == write["proc"]["pid"],
+            "mkdir attributed to {} (pid {}), expected mkdir in pid {}",
+            mkdir["proc"]["comm"],
+            mkdir["proc"]["pid"],
+            write["proc"]["pid"]
+        );
+        Ok(format!(
+            "pid {}: write by sh, then mkdir by mkdir",
+            write["proc"]["pid"]
+        ))
+    })
 }
 
 /// ac: appending to an existing file whose name left the dentry cache runs the create check
@@ -1439,35 +1604,37 @@ pub(crate) fn confirmed_creates(ctx: &Ctx) -> Result<String> {
     ensure!(status.success(), "dropping the caches failed: {status}");
     sh(&dir, "echo more >> existing.txt")?;
     let done = watcher.stop()?;
-    let touches = changes(&done)?;
-    let creates = count(&touches, "create", &file);
     ensure!(
-        count(&touches, "write", &file) == 1 && touches.len() == 1 + creates,
-        "expected one write to {} and no other change but a create; {}",
-        file.display(),
-        summary(&touches)
-    );
-    if !confirmable {
-        ensure!(
-            creates <= 1,
-            "{creates} create touches; {}",
-            summary(&touches)
-        );
-        return Ok(format!(
-            "{creates} create for the append: no {HOOK} on this kernel, so creates are not \
-             confirmed"
-        ));
-    }
-    ensure!(
-        !done.stderr.contains(HOOK),
+        !confirmable || !done.stderr.contains(HOOK),
         "{HOOK} is in BTF but fsblame did not attach it:\n{}",
         done.stderr
     );
-    ensure!(
-        creates == 0,
-        "a create touch for {}, which existed; {}",
-        file.display(),
-        summary(&touches)
-    );
-    Ok(format!("no create for the cold append ({HOOK} confirms)"))
+    // A skipped run of the confirming hook leaves a create unconfirmed: the failure says so.
+    Output::printed(&done)?.check(|touches| {
+        let creates = count(touches, "create", &file);
+        ensure!(
+            count(touches, "write", &file) == 1 && touches.len() == 1 + creates,
+            "expected one write to {} and no other change but a create; {}",
+            file.display(),
+            summary(touches)
+        );
+        if !confirmable {
+            ensure!(
+                creates <= 1,
+                "{creates} create touches; {}",
+                summary(touches)
+            );
+            return Ok(format!(
+                "{creates} create for the append: no {HOOK} on this kernel, so creates are not \
+                 confirmed"
+            ));
+        }
+        ensure!(
+            creates == 0,
+            "a create touch for {}, which existed; {}",
+            file.display(),
+            summary(touches)
+        );
+        Ok(format!("no create for the cold append ({HOOK} confirms)"))
+    })
 }

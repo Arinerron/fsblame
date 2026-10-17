@@ -7,7 +7,7 @@
  * root (not an exclude). The verdict is cached per dentry in `verdicts`, validated against the
  * dentry's parent, inode number and `dir_epoch`, so an unwatched path costs one device check
  * and one LRU lookup. `dir_epoch` is bumped when a directory on a watched filesystem is about
- * to move (on_rename) and again once it has moved (on_renamed): a walk in between still sees
+ * to move (on_rename) and again once it has moved (on_vfs_rename): a walk in between still sees
  * the old tree.
  *
  * Writes: rw_verify_area stashes the requested byte count per CPU; the security_file_permission
@@ -18,10 +18,17 @@
  * open instance of its struct file (`files`); on_file_free ends the instance, so a reused
  * struct file starts a new binding.
  *
- * Creates: open(O_CREAT) of a name missing from the dentry cache runs the create check before
- * the lookup that tells whether the file exists. on_create leaves such a create (its dentry is
- * still in lookup) to on_file_post_open, which reports it if the open did create the file;
- * `creating` carries it from one to the other per thread.
+ * Success: the security_inode_* checks run before the filesystem makes the change, which can
+ * still fail (rmdir of a non-empty directory, a chmod the filesystem refuses). A check holds its
+ * record in `pending`, under the thread and the dentry the VFS function that ran the check was
+ * called with, and the fexit on that function reports it only if the function succeeded. Each
+ * check that may hold first drops what its key holds, reported or not, so a record left by a
+ * call whose fexit never came is not reported for a later call that ran its check. An op whose
+ * fexit is not attached (no bit in `armed`) is reported at its check.
+ *
+ * Creates: open(O_CREAT) runs the create check (may_o_create) without vfs_create, and for a
+ * name missing from the dentry cache before the lookup that tells whether the file exists.
+ * on_file_post_open reports the held create of an open that did create the file.
  *
  * cwd: on_exec_cwd walks the new image's working directory into `cwd_buf` and on_exec, which
  * runs right after it on the same tracepoint and CPU, copies it into the exec record.
@@ -90,12 +97,10 @@ char LICENSE[] SEC("license") = "Dual MIT/GPL";
 #define SELINUX_MAGIC 0xf97cff8c
 #define SMACK_MAGIC 0x43415d53
 
-/* fs_buf slots: the op programs use their op, the mapping and open programs the slots after
- * them. */
+/* fs_buf slots: the op programs use their op, the mapping programs the slots after them. */
 #define SLOT_MMAP OP_COUNT
 #define SLOT_MPROTECT (OP_COUNT + 1)
-#define SLOT_POST_OPEN (OP_COUNT + 2)
-#define FS_SLOTS (OP_COUNT + 3)
+#define FS_SLOTS (OP_COUNT + 2)
 
 /* d_parent hops of the scope walk. A record carries at most WALK_MAX names, but the walk has
  * to reach the root above a deeper change to tell whether it is watched: this covers any path
@@ -109,6 +114,11 @@ char LICENSE[] SEC("license") = "Dual MIT/GPL";
  * single write. */
 #define FS_DATA_MASK 4095
 #define FS_DATA_BYTES (FS_DATA_MASK + 1 + PATH_CAP)
+/* A record's payload: two paths of less than PATH_CAP + NAME_CAP each (a name starts below
+ * PATH_CAP), or a path and a symlink target of at most PATH_CAP bytes. */
+#define FS_PAYLOAD_MAX (2 * (PATH_CAP + NAME_CAP))
+/* The symlink target is read with one byte more than it keeps (see emit_change). */
+_Static_assert(FS_DATA_MASK + PATH_CAP + 1 <= FS_DATA_BYTES, "the slack covers the target read");
 #define EXEC_DATA_MASK 16383
 #define EXEC_DATA_BYTES (EXEC_DATA_MASK + 1 + ENV_CAP)
 /* cwd names start below PATH_CAP and are at most NAME_CAP each. */
@@ -131,6 +141,26 @@ struct fs_scratch {
 	 * is a state of its own that the rest of the program is verified from. */
 	u32 cut; /* names left out: past the path's end, or past WALK_MAX */
 	u32 top; /* got to the filesystem root */
+	u32 _pad;
+};
+
+/* A record held from its check until the VFS function that ran the check returns (see the top
+ * comment): the head of the fs_scratch it was built in, copied from it. */
+struct pending_rec {
+	struct fs_rec rec;
+	u8 data[FS_PAYLOAD_MAX];
+};
+_Static_assert(__builtin_offsetof(struct pending_rec, data) ==
+		       __builtin_offsetof(struct fs_scratch, data) &&
+		       sizeof(struct pending_rec) <= sizeof(struct fs_scratch),
+	       "a held record is the head of its scratch");
+
+/* Whose held record: the thread's, for the dentry its VFS function is called with (vfs_rename:
+ * the old name). The dentry keeps apart the operations an operation runs itself on the same
+ * thread before it returns: an overlay's on its upper layer. */
+struct pending_key {
+	u64 dentry;
+	u32 tid;
 	u32 _pad;
 };
 
@@ -206,12 +236,13 @@ const volatile u32 track = 0;           /* report only the processes in `tracked
 u64 dir_epoch = 0;
 
 /* Set by the loader once every program is attached, so file events are reported from one
- * instant on for every op, not from whenever each hook happened to attach. Its own section
- * (map), so the loader writes it without touching dir_epoch. */
+ * instant on for every op, not from whenever each hook happened to attach: ARMED_ON, with the
+ * bit (1 << OP_*) of each op whose fexit is attached, which a check of the op then holds its
+ * record for. Its own section (map), so the loader writes it without touching dir_epoch. */
 u32 armed SEC(".data.armed") = 0;
 
-/* Set by on_file_post_open when it first runs: from then on it reports the creates that
- * on_create leaves to it. Written only here. */
+/* Set by on_file_post_open when it first runs: from then on it reports the creates of opens
+ * that on_create holds for it. Written only here. */
 u32 creates_confirmed = 0;
 
 struct {
@@ -254,14 +285,15 @@ struct {
 	__type(value, struct file_seen);
 } files SEC(".maps");
 
-/* The dentry, still in lookup, of each thread's open(O_CREAT) on a watched filesystem that
- * passed the create check before its lookup (see on_create). */
+/* Records held for their op's fexit (see the top comment). An entry lasts from the check to the
+ * return of its VFS function, except an open(O_CREAT) that created nothing: it leaves its
+ * create to the LRU. */
 struct {
 	__uint(type, BPF_MAP_TYPE_LRU_HASH);
-	__uint(max_entries, 4096);
-	__type(key, u32);   /* tid */
-	__type(value, u64); /* struct dentry * */
-} creating SEC(".maps");
+	__uint(max_entries, 1024);
+	__type(key, struct pending_key);
+	__type(value, struct pending_rec);
+} pending SEC(".maps");
 
 /* The processes whose changes are reported when `track` is set. */
 struct {
@@ -342,6 +374,14 @@ static __always_inline bool reporting(u16 op)
 		return false;
 	tgid = current_tgid();
 	return tgid != self_tgid && !untracked(tgid);
+}
+
+/* Whether a check of `op` holds its record for the fexit of its VFS function, which reports it
+ * only if the function succeeds: that fexit is attached (see `armed`). Otherwise the check
+ * reports the op at once. */
+static __always_inline bool confirmed(u16 op)
+{
+	return armed & (1U << op);
 }
 
 /* Whether `dev` is in the device filter. Constant-folded against .rodata by the verifier. */
@@ -615,6 +655,106 @@ static __always_inline void submit_fs(struct fs_scratch *s, u32 len)
 	output(s, size);
 }
 
+/* Whether `d` is still being looked up (d_in_lookup). The flag became `enum dentry_flags`, and
+ * moved, in Linux 6.15. */
+static __always_inline bool in_lookup(struct dentry *d)
+{
+	u32 bit = 0x10000000;
+
+	if (bpf_core_enum_value_exists(enum dentry_flags, DCACHE_PAR_LOOKUP))
+		bit = bpf_core_enum_value(enum dentry_flags, DCACHE_PAR_LOOKUP);
+	return d->d_flags & bit;
+}
+
+/* When a check holds its record: when its op is confirmed, or as on_create says. */
+enum hold { HOLD_CONFIRMED, HOLD_CREATE };
+
+/*
+ * Submits the record of `op` built in `s` (`len` payload bytes), or holds it for the fexit of
+ * the VFS function called with `key` (see `how`). Decided last, after the path walks: a branch
+ * before them would have the verifier walk them once for each way. A record that cannot be
+ * held is submitted.
+ */
+static __always_inline void finish_fs(struct fs_scratch *s, u32 len, u16 op, struct dentry *key,
+				      enum hold how)
+{
+	struct pending_key k;
+	bool hold = confirmed(op);
+
+	if (how == HOLD_CREATE)
+		hold = creates_confirmed && (hold || in_lookup(key));
+	if (hold) {
+		k.dentry = (u64)key;
+		k.tid = s->rec.tid;
+		k._pad = 0;
+		/* The update copies the head of the scratch: the record and its payload. */
+		if (!bpf_map_update_elem(&pending, &k, s, BPF_ANY))
+			return;
+	}
+	submit_fs(s, len);
+}
+
+/*
+ * The fexit side of a held record: reports the record the current thread's check held for
+ * `dentry` if the VFS function succeeded (`ok`) and the record is of one of its ops, `first` to
+ * `last`, and drops it either way. Every check that may hold first drops what its key holds
+ * (see forget), so the record found is that of the check of this call. A record of another op
+ * is stale: the check that held it ran in a call whose fexit never came.
+ *
+ * `made` (0: none) is the dentry of a name the call made: the record takes its inode's number
+ * and mode, which the check, run before the inode existed, could not have, and which the
+ * filesystem settles (umask, default ACL, setgid directory). A record reported at its check,
+ * where no fexit confirms it, keeps inode 0 and the mode the create, mkdir or mknod asked for
+ * (0 for a symlink).
+ */
+static __always_inline int commit(u64 dentry, u16 first, u16 last, bool ok, u64 made)
+{
+	struct pending_key key = {
+		.dentry = dentry, .tid = (u32)bpf_get_current_pid_tgid(), ._pad = 0
+	};
+	struct pending_rec *p;
+	struct inode *inode;
+	u64 size;
+	u16 op;
+
+	p = bpf_map_lookup_elem(&pending, &key);
+	if (!p)
+		return 0;
+	op = p->rec.hdr.op;
+	if (ok && op >= first && op <= last) {
+		/* The change is made now. */
+		p->rec.hdr.ts_ns = bpf_ktime_get_boot_ns();
+		/* A filesystem that gave the name another dentry may leave this one negative. */
+		inode = made ? BPF_CORE_READ((struct dentry *)made, d_inode) : NULL;
+		if (inode) {
+			p->rec.ino = BPF_CORE_READ(inode, i_ino);
+			p->rec.mode = BPF_CORE_READ(inode, i_mode);
+		}
+		size = sizeof(p->rec) + (u64)p->rec.path_len + p->rec.path2_len;
+		if (size > sizeof(*p))
+			size = sizeof(*p);
+		output(p, size);
+	}
+	bpf_map_delete_elem(&pending, &key);
+	return 0;
+}
+
+/*
+ * Drops the record held under `key` for the current thread: a check that held it ran in a call
+ * whose fexit never came (an open that failed to create, or a run the kernel skipped for
+ * recursion). Each check that may hold calls this before anything else, reported or not, so a
+ * later fexit or open of the same dentry by the same thread cannot report a change that check
+ * never saw.
+ */
+static __always_inline void forget(struct dentry *key)
+{
+	struct pending_key k = {
+		.dentry = (u64)key, .tid = (u32)bpf_get_current_pid_tgid(), ._pad = 0
+	};
+
+	bpf_map_delete_elem(&pending, &k);
+}
+
 static __always_inline void set_inode(struct fs_rec *r, struct inode *inode)
 {
 	if (inode) {
@@ -626,12 +766,13 @@ static __always_inline void set_inode(struct fs_rec *r, struct inode *inode)
 /*
  * Reports an operation on `d` (path) and optionally a second name `d2` (path2) or a raw
  * string `raw` (path2, ROOT_RAW). In scope when either name is. `mode` overrides the inode's
- * mode when non-zero; `inode` supplies ino and mode (NULL: d's inode). The caller checked
+ * mode when non-zero; `inode` supplies ino and mode (NULL: d's inode). The record may wait for
+ * the fexit of the VFS function called with `key` (see finish_fs). The caller checked
  * reporting(op).
  */
 static __always_inline int emit_change(u32 slot, u16 op, struct dentry *d, struct dentry *d2,
 				       const char *raw, struct inode *inode, u32 mode, u64 aux,
-				       u64 aux2)
+				       u64 aux2, struct dentry *key, enum hold how)
 {
 	struct scope sc, sc2 = { .root = ROOT_NONE, .depth = 0 };
 	struct fs_scratch *s;
@@ -660,7 +801,14 @@ static __always_inline int emit_change(u32 slot, u16 op, struct dentry *d, struc
 	if (d2) {
 		end2 = emit_path(s, slot, end, d2, sc2, &s->rec.root2, &trunc2);
 	} else if (raw) {
-		n = bpf_probe_read_kernel_str(&s->data[end & FS_DATA_MASK], PATH_CAP, raw);
+		/* One byte more than is kept tells a string of PATH_CAP - 1 bytes, kept whole,
+		 * from a longer one, which is cut there. */
+		n = bpf_probe_read_kernel_str(&s->data[end & FS_DATA_MASK], PATH_CAP + 1, raw);
+		if (n > PATH_CAP) {
+			n = PATH_CAP;
+			s->data[(end + PATH_CAP - 1) & FS_DATA_MASK] = 0;
+			trunc2 = 1;
+		}
 		if (n > 0) {
 			end2 = end + n;
 			s->rec.root2 = ROOT_RAW;
@@ -671,116 +819,90 @@ static __always_inline int emit_change(u32 slot, u16 op, struct dentry *d, struc
 		s->rec.hdr.flags |= F_PATH_TRUNC;
 	if (trunc2)
 		s->rec.hdr.flags |= F_PATH2_TRUNC;
-	submit_fs(s, end2);
+	finish_fs(s, end2, op, key, how);
 	return 0;
 }
 
-/* emit_change() if the current process's `op` is reported. */
+/* emit_change() if the current process's `op` is reported, held for the fexit of the VFS
+ * function called with `key` when that is attached. */
 static __always_inline int report(u32 slot, u16 op, struct dentry *d, struct dentry *d2,
-				  const char *raw, struct inode *inode, u32 mode, u64 aux, u64 aux2)
+				  const char *raw, struct inode *inode, u32 mode, u64 aux, u64 aux2,
+				  struct dentry *key)
 {
+	if (confirmed(op))
+		forget(key);
 	if (!reporting(op))
 		return 0;
-	return emit_change(slot, op, d, d2, raw, inode, mode, aux, aux2);
-}
-
-/* Whether `d` is still being looked up (d_in_lookup). The flag became `enum dentry_flags`, and
- * moved, in Linux 6.15. */
-static __always_inline bool in_lookup(struct dentry *d)
-{
-	u32 bit = 0x10000000;
-
-	if (bpf_core_enum_value_exists(enum dentry_flags, DCACHE_PAR_LOOKUP))
-		bit = bpf_core_enum_value(enum dentry_flags, DCACHE_PAR_LOOKUP);
-	return d->d_flags & bit;
+	return emit_change(slot, op, d, d2, raw, inode, mode, aux, aux2, key, HOLD_CONFIRMED);
 }
 
 /*
- * open(O_CREAT) of a name missing from the dentry cache calls this hook (may_o_create) with a
- * dentry that is still in lookup: the file may exist, and then the open creates nothing. Such a
- * create is left to on_file_post_open once that program runs (it needs Linux 6.9). The entry is
- * matched by dentry, not just by thread: the create may run creates of its own in between (an
- * overlay creates the file on its upper layer). A create of the pending dentry decided here (its
- * open failed after the check, and a later one found the name cached) clears the entry so that
- * the open is not reported again. A process that is not reported leaves no entry for
- * on_file_post_open to find.
+ * The create check runs from vfs_create (mknod, overlayfs, nfsd), whose fexit reports the held
+ * create, and from open(O_CREAT) (may_o_create), which calls no vfs_create: on_file_post_open
+ * reports the held create of an open that made the file. Both need on_file_post_open to run
+ * (Linux 6.9; `creates_confirmed`); without it creates are reported here. An open's check runs
+ * for a name missing from the dentry cache before the lookup that tells whether the file
+ * exists (its dentry is still in lookup): without vfs_create's fexit only those are held.
  */
 SEC("fentry/security_inode_create")
 int BPF_PROG(on_create, struct inode *dir, struct dentry *dentry, umode_t mode)
 {
-	u32 tid = (u32)bpf_get_current_pid_tgid();
-	u64 d = (u64)dentry, *pending;
-
+	if (creates_confirmed)
+		forget(dentry);
 	if (!reporting(OP_CREATE))
 		return 0;
-	if (creates_confirmed && dev_in_scope(dentry->d_sb->s_dev)) {
-		if (in_lookup(dentry)) {
-			bpf_map_update_elem(&creating, &tid, &d, BPF_ANY);
-			return 0;
-		}
-		pending = bpf_map_lookup_elem(&creating, &tid);
-		if (pending && *pending == d)
-			bpf_map_delete_elem(&creating, &tid);
-	}
-	return emit_change(OP_CREATE, OP_CREATE, dentry, NULL, NULL, NULL, mode | S_IFREG, 0, 0);
+	return emit_change(OP_CREATE, OP_CREATE, dentry, NULL, NULL, NULL, mode | S_IFREG, 0, 0,
+			   dentry, HOLD_CREATE);
 }
 
-/* Reports the create of an open that on_create left to it. Runs after every successful open:
- * one that created nothing costs a flag test. */
+/* Reports the create on_create held for an open that did create the file. Runs after every
+ * successful open: one that created nothing costs a flag test. */
 SEC("fentry/security_file_post_open")
 int BPF_PROG(on_file_post_open, struct file *file, int mask)
 {
-	struct dentry *dentry;
-	u64 *pending;
-	u32 tid;
-
 	if (!creates_confirmed)
 		creates_confirmed = 1;
 	if (!(file->f_mode & FMODE_CREATED))
 		return 0;
-	tid = (u32)bpf_get_current_pid_tgid();
-	pending = bpf_map_lookup_elem(&creating, &tid);
-	dentry = file->f_path.dentry;
-	if (!pending || *pending != (u64)dentry)
-		return 0;
-	bpf_map_delete_elem(&creating, &tid);
-	return report(SLOT_POST_OPEN, OP_CREATE, dentry, NULL, NULL, NULL, 0, 0, 0);
+	return commit((u64)file->f_path.dentry, OP_CREATE, OP_CREATE, true,
+		      (u64)file->f_path.dentry);
 }
 
 SEC("fentry/security_inode_mkdir")
 int BPF_PROG(on_mkdir, struct inode *dir, struct dentry *dentry, umode_t mode)
 {
-	return report(OP_MKDIR, OP_MKDIR, dentry, NULL, NULL, NULL, mode | S_IFDIR, 0, 0);
+	return report(OP_MKDIR, OP_MKDIR, dentry, NULL, NULL, NULL, mode | S_IFDIR, 0, 0, dentry);
 }
 
 SEC("fentry/security_inode_mknod")
 int BPF_PROG(on_mknod, struct inode *dir, struct dentry *dentry, umode_t mode, dev_t rdev)
 {
-	return report(OP_MKNOD, OP_MKNOD, dentry, NULL, NULL, NULL, mode, rdev, 0);
+	return report(OP_MKNOD, OP_MKNOD, dentry, NULL, NULL, NULL, mode, rdev, 0, dentry);
 }
 
 SEC("fentry/security_inode_symlink")
 int BPF_PROG(on_symlink, struct inode *dir, struct dentry *dentry, const char *old_name)
 {
-	return report(OP_SYMLINK, OP_SYMLINK, dentry, NULL, old_name, NULL, 0, 0, 0);
+	return report(OP_SYMLINK, OP_SYMLINK, dentry, NULL, old_name, NULL, 0, 0, 0, dentry);
 }
 
 SEC("fentry/security_inode_link")
 int BPF_PROG(on_link, struct dentry *old_dentry, struct inode *dir, struct dentry *new_dentry)
 {
-	return report(OP_LINK, OP_LINK, new_dentry, old_dentry, NULL, old_dentry->d_inode, 0, 0, 0);
+	return report(OP_LINK, OP_LINK, new_dentry, old_dentry, NULL, old_dentry->d_inode, 0, 0, 0,
+		      new_dentry);
 }
 
 SEC("fentry/security_inode_unlink")
 int BPF_PROG(on_unlink, struct inode *dir, struct dentry *dentry)
 {
-	return report(OP_UNLINK, OP_UNLINK, dentry, NULL, NULL, NULL, 0, 0, 0);
+	return report(OP_UNLINK, OP_UNLINK, dentry, NULL, NULL, NULL, 0, 0, 0, dentry);
 }
 
 SEC("fentry/security_inode_rmdir")
 int BPF_PROG(on_rmdir, struct inode *dir, struct dentry *dentry)
 {
-	return report(OP_RMDIR, OP_RMDIR, dentry, NULL, NULL, NULL, 0, 0, 0);
+	return report(OP_RMDIR, OP_RMDIR, dentry, NULL, NULL, NULL, 0, 0, 0, dentry);
 }
 
 /* Bumps dir_epoch if renaming `old` onto `new` (`flags` RENAME_*) moves a directory on a
@@ -805,16 +927,19 @@ int BPF_PROG(on_rename, struct inode *old_dir, struct dentry *old_dentry, struct
 
 	bump_dir_epoch(old_dentry, new_dentry, flags);
 	return report(OP_RENAME, OP_RENAME, new_dentry, old_dentry, NULL, src, 0, flags,
-		      dst ? dst->i_ino : 0);
+		      dst ? dst->i_ino : 0, old_dentry);
 }
 
-/* The second bump of a directory move, once vfs_rename has made it (see the top comment). The
- * dentries keep their inodes across the move, so the test is on_rename's. */
+/* Once vfs_rename returns: the second bump of a directory move it made (see the top comment;
+ * the dentries keep their inodes across the move, so the test is on_rename's), and the
+ * rename's held record. vfs_rename takes a struct renamedata on every supported kernel. */
 SEC("fexit/vfs_rename")
-int BPF_PROG(on_renamed, struct renamedata *rd, int ret)
+int BPF_PROG(on_vfs_rename, struct renamedata *rd, int ret)
 {
 	if (ret == 0)
 		bump_dir_epoch(rd->old_dentry, rd->new_dentry, rd->flags);
+	if (op_mask & (1U << OP_RENAME))
+		commit((u64)rd->old_dentry, OP_RENAME, OP_RENAME, ret == 0, 0);
 	return 0;
 }
 
@@ -848,22 +973,72 @@ int on_setattr(u64 *ctx)
 			     : "r"(ctx));
 	valid = attr->ia_valid;
 
+	/* The owner before the mode: notify_change turns the setuid and setgid bits a chown
+	 * clears into ATTR_MODE, which is then part of the chown. */
 	if (valid & ATTR_SIZE) {
 		op = OP_TRUNCATE;
 		value = attr->ia_size;
-	} else if (valid & ATTR_MODE) {
-		op = OP_CHMOD;
-		value = attr->ia_mode;
 	} else if (valid & (ATTR_UID | ATTR_GID)) {
 		op = OP_CHOWN;
 		value = ((u64)attr->ia_uid.val << 32) | attr->ia_gid.val;
+	} else if (valid & ATTR_MODE) {
+		op = OP_CHMOD;
+		value = attr->ia_mode;
 	} else if (valid & (ATTR_ATIME | ATTR_MTIME)) {
 		op = OP_UTIMES;
 	} else {
 		op = OP_SETATTR;
 	}
-	return report(OP_SETATTR, op, dentry, NULL, NULL, NULL, 0, valid, value);
+	return report(OP_SETATTR, op, dentry, NULL, NULL, NULL, 0, valid, value, dentry);
 }
+
+#define MAX_ERRNO 4095
+
+/* Whether a VFS function that returned `ret` succeeded: 0, or for one that returns a pointer
+ * (`ret_ptr`, .rodata), anything but an ERR_PTR. */
+static __always_inline bool succeeded(u64 ret, u32 ret_ptr)
+{
+	if (ret_ptr)
+		return ret < (u64)-MAX_ERRNO;
+	return (int)ret == 0;
+}
+
+/*
+ * The fexit on a VFS function that runs a check: reports what the check held (see commit) if
+ * the function succeeded, with the inode of the name it made when it `makes` one. Where the
+ * function has the dentry, and whether it returns an int or (vfs_mkdir from Linux 6.15) the
+ * dentry of the new directory, which can be another than it was called with, changed across
+ * kernels: the loader sets `shape_<function>` from the running kernel's BTF prototype, and
+ * bpf_get_func_arg takes the parameter's index at run time.
+ */
+#define CONFIRM(fn, first, last, makes)                                                  \
+	const volatile struct exit_shape shape_##fn = {};                                \
+	SEC("fexit/" #fn)                                                                \
+	int on_##fn(u64 *ctx)                                                            \
+	{                                                                                \
+		u64 dentry = 0, ret = 0, made = 0;                                       \
+                                                                                         \
+		bpf_get_func_arg(ctx, shape_##fn.arg, &dentry);                          \
+		bpf_get_func_ret(ctx, &ret);                                             \
+		if (makes)                                                               \
+			made = shape_##fn.ret_ptr && ret ? ret : dentry;                 \
+		return commit(dentry, first, last, succeeded(ret, shape_##fn.ret_ptr),   \
+			      made);                                                     \
+	}
+
+CONFIRM(vfs_create, OP_CREATE, OP_CREATE, true)
+CONFIRM(vfs_mkdir, OP_MKDIR, OP_MKDIR, true)
+CONFIRM(vfs_mknod, OP_MKNOD, OP_MKNOD, true)
+CONFIRM(vfs_symlink, OP_SYMLINK, OP_SYMLINK, true)
+/* A link's record has the linked inode from its check. */
+CONFIRM(vfs_link, OP_LINK, OP_LINK, false)
+CONFIRM(vfs_unlink, OP_UNLINK, OP_UNLINK, false)
+CONFIRM(vfs_rmdir, OP_RMDIR, OP_RMDIR, false)
+/* The ops on_setattr tells apart, which are reported with notify_change's success. */
+_Static_assert(OP_CHMOD < OP_CHOWN && OP_CHOWN < OP_TRUNCATE && OP_TRUNCATE < OP_UTIMES &&
+		       OP_UTIMES < OP_SETATTR && OP_SETATTR - OP_CHMOD == 4,
+	       "the setattr ops are OP_CHMOD to OP_SETATTR");
+CONFIRM(notify_change, OP_CHMOD, OP_SETATTR, false)
 
 /*
  * Whether `file` is overlayfs's own open of a layer's file under the overlay's path, as made

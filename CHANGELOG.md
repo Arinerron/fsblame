@@ -9,6 +9,62 @@ output has its own schema version, the `v` field of every line; see
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-10-17
+
+### Added
+
+- `cargo install fsblame --locked`: fsblame is published on crates.io, as the crates
+  `fsblame`, `fsblame-bpf` and `fsblame-abi`.
+- A new loss reason, `skipped`: runs of fsblame's kernel programs that the kernel skipped
+  because the same program was already running on that CPU, which happens under heavy
+  parallel load. It counts the programs whose skipped run can lose a change; those changes
+  went missing silently before. The summary's `lost` object gains `skipped`.
+- Release archives include `THIRD_PARTY_LICENSES.md`, the licenses of everything built into
+  the binary.
+
+### Changed
+
+- `write-evicted` losses also count write totals whose record was dropped with the ring buffer
+  full; the warning now reads "kernel write table or ring buffer full".
+- `fsblame doctor` treats an empty `NO_COLOR` as unset, as `watch` does.
+- Creates, mkdirs, mknods and symlinks report the inode number and mode the new file got
+  (after the umask, a default ACL or a setgid directory), read once the operation succeeded.
+  Before, only creates confirmed by `open` had the inode; the others had inode 0 and the mode
+  the call asked for, as operations reported at their check still do.
+- The man pages are rewritten, with exit status, environment, files and examples for each
+  command; `man fsblame` gives the overview.
+
+### Fixed
+
+- Operations that failed are no longer reported, such as an `rmdir` of a directory that is
+  not empty, a `chmod` or `chown` the kernel refused, or a rename onto a non-empty directory.
+  Each operation is reported once its call has succeeded, stamped with the time it returned.
+  Creates by `open(O_CREAT)` are confirmed this way on Linux 6.9 and newer.
+- A `chown` of a setuid or setgid file is reported as a `chown`, not as a `chmod`.
+- Symlink targets of 1024 bytes or more were cut without being marked; they are now cut at
+  1023 bytes, end in `…` and are marked `truncated`.
+- Writes through a descriptor kept open across a rename of its file (a log being rotated) are
+  reported at the new name, and writes through one inherited across an exec carry the new
+  program's name.
+- Write totals that the kernel handed over while fsblame had not read the previous ones yet
+  are no longer dropped.
+- A step of the system clock (NTP's first sync, `date -s`) is applied to later timestamps;
+  before, the offset taken at start was used for the whole run.
+- Under `fsblame run`, a Ctrl-C after the command exited no longer cuts short the report of
+  its last changes; SIGTERM and SIGHUP still do.
+
+### Security
+
+- The tree view shows control characters in reported text (file names, command lines, units
+  and the rest) as visible escapes, and quotes arguments holding them as `$'...'`, so a
+  crafted file name or command line can no longer inject terminal escape sequences or fake
+  lines. `--json` is unchanged.
+- `fsblame run -o FILE` refuses FIFOs, sockets and devices, and opens without blocking.
+  Without sudo (run as root from `su` or cron), it now also requires an existing file to
+  belong to the user fsblame runs as, and leaves the kernel's `fs.protected_regular` and
+  `fs.protected_fifos` in force, so another user's file in `/tmp` can no longer be truncated
+  through it.
+
 ## [0.1.0] - 2026-10-16
 
 The first public release.
@@ -65,5 +121,6 @@ The first public release.
 - Linux 5.17 and newer with BTF. Opens with `O_CREAT` of existing files are told apart from
   real creates on Linux 6.9 and newer.
 
-[Unreleased]: https://github.com/Arinerron/fsblame/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/Arinerron/fsblame/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/Arinerron/fsblame/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/Arinerron/fsblame/releases/tag/v0.1.0

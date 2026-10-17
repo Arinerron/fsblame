@@ -58,7 +58,8 @@ Then:
 ```sh
 cargo build --release --target x86_64-unknown-linux-musl   # the shipped static binary (LTO, a few minutes)
 cargo build -p fsblame                                      # fast debug build for iteration
-cargo xtask man                                             # man pages, from the CLI definition
+cargo xtask man                                             # man pages: options from the CLI definition, prose in xtask/src/man.rs
+cargo xtask licenses                                        # THIRD_PARTY_LICENSES.md for the release binary
 ```
 
 The release binary is at

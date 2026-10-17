@@ -153,8 +153,41 @@ impl OpSet {
 pub enum Role {
     /// Reports its ops: without it they are not reported.
     Reports,
-    /// Adds to what another program reports; the text says what is lost without it.
+    /// Reports changes of its ops the reporting program does not see (writes through shared
+    /// mappings), or commits the ones it held (an `open(O_CREAT)` that created the file); the
+    /// text says what is lost without it.
+    Adds(&'static str),
+    /// Adds detail to what another program reports (byte counts, the open instance of a
+    /// struct file, the cwd): without it no change is lost, only that detail, which the text
+    /// says.
     Supplements(&'static str),
+    /// An fexit on the VFS function that runs the check of its ops: with it attached, the
+    /// check holds the record and the fexit reports it only if the function succeeded; without
+    /// it the check reports the op at once, whatever becomes of it.
+    Confirms {
+        /// What is lost without it.
+        lost: &'static str,
+        /// The `.rodata` [`ExitShape`](abi::ExitShape) the loader sets from the function's
+        /// prototype in the running kernel's BTF; `None` for a prototype that is the same on
+        /// every supported kernel.
+        shape: Option<&'static str>,
+    },
+}
+
+impl Role {
+    /// What is lost without the program; `None` for one that reports its ops.
+    pub const fn lost(self) -> Option<&'static str> {
+        match self {
+            Self::Reports => None,
+            Self::Adds(lost) | Self::Supplements(lost) | Self::Confirms { lost, .. } => Some(lost),
+        }
+    }
+
+    /// Whether a run of the program the kernel skips can lose or misreport a change: every
+    /// role but [`Supplements`](Self::Supplements), whose skipped run only loses detail.
+    pub const fn skip_loses_changes(self) -> bool {
+        !matches!(self, Self::Supplements(_))
+    }
 }
 
 /// An optional program of the tracer and its attach point.
@@ -177,10 +210,18 @@ impl Hook {
     pub fn wanted(&self, ops: OpSet) -> bool {
         self.always || self.ops.iter().any(|&op| ops.contains(op))
     }
+
+    /// The `.rodata` shape the loader sets for the program (see [`Role::Confirms`]).
+    pub const fn shape(&self) -> Option<&'static str> {
+        match self.role {
+            Role::Confirms { shape, .. } => shape,
+            Role::Reports | Role::Adds(_) | Role::Supplements(_) => None,
+        }
+    }
 }
 
 /// The fentry and fexit hooks, in attach order.
-pub const FS_HOOKS: [Hook; 16] = [
+pub const FS_HOOKS: [Hook; 24] = [
     Hook {
         program: "on_rw_verify_area",
         function: "rw_verify_area",
@@ -210,14 +251,14 @@ pub const FS_HOOKS: [Hook; 16] = [
         function: "security_mmap_file",
         ops: &[Op::Write],
         always: false,
-        role: Role::Supplements("writes through shared mmap(2) mappings are not reported"),
+        role: Role::Adds("writes through shared mmap(2) mappings are not reported"),
     },
     Hook {
         program: "on_file_mprotect",
         function: "security_file_mprotect",
         ops: &[Op::Write],
         always: false,
-        role: Role::Supplements(
+        role: Role::Adds(
             "writes through shared mappings made writable by mprotect(2) are not reported",
         ),
     },
@@ -233,10 +274,20 @@ pub const FS_HOOKS: [Hook; 16] = [
         function: "security_file_post_open",
         ops: &[Op::Create],
         always: false,
-        role: Role::Supplements(
-            "an open(O_CREAT) of an existing file not yet in the dentry cache is reported as a \
-             create",
+        role: Role::Adds(
+            "an open(O_CREAT) of an existing file not yet in the dentry cache, or a create that \
+             fails, is reported as a create",
         ),
+    },
+    Hook {
+        program: "on_vfs_create",
+        function: "vfs_create",
+        ops: &[Op::Create],
+        always: false,
+        role: Role::Confirms {
+            lost: "creates that fail may be reported",
+            shape: Some("shape_vfs_create"),
+        },
     },
     Hook {
         program: "on_mkdir",
@@ -246,11 +297,31 @@ pub const FS_HOOKS: [Hook; 16] = [
         role: Role::Reports,
     },
     Hook {
+        program: "on_vfs_mkdir",
+        function: "vfs_mkdir",
+        ops: &[Op::Mkdir],
+        always: false,
+        role: Role::Confirms {
+            lost: "mkdirs that fail may be reported",
+            shape: Some("shape_vfs_mkdir"),
+        },
+    },
+    Hook {
         program: "on_mknod",
         function: "security_inode_mknod",
         ops: &[Op::Mknod],
         always: false,
         role: Role::Reports,
+    },
+    Hook {
+        program: "on_vfs_mknod",
+        function: "vfs_mknod",
+        ops: &[Op::Mknod],
+        always: false,
+        role: Role::Confirms {
+            lost: "mknods that fail may be reported",
+            shape: Some("shape_vfs_mknod"),
+        },
     },
     Hook {
         program: "on_symlink",
@@ -260,11 +331,31 @@ pub const FS_HOOKS: [Hook; 16] = [
         role: Role::Reports,
     },
     Hook {
+        program: "on_vfs_symlink",
+        function: "vfs_symlink",
+        ops: &[Op::Symlink],
+        always: false,
+        role: Role::Confirms {
+            lost: "symlinks that fail may be reported",
+            shape: Some("shape_vfs_symlink"),
+        },
+    },
+    Hook {
         program: "on_link",
         function: "security_inode_link",
         ops: &[Op::Link],
         always: false,
         role: Role::Reports,
+    },
+    Hook {
+        program: "on_vfs_link",
+        function: "vfs_link",
+        ops: &[Op::Link],
+        always: false,
+        role: Role::Confirms {
+            lost: "hard links that fail may be reported",
+            shape: Some("shape_vfs_link"),
+        },
     },
     Hook {
         program: "on_unlink",
@@ -274,11 +365,31 @@ pub const FS_HOOKS: [Hook; 16] = [
         role: Role::Reports,
     },
     Hook {
+        program: "on_vfs_unlink",
+        function: "vfs_unlink",
+        ops: &[Op::Unlink],
+        always: false,
+        role: Role::Confirms {
+            lost: "unlinks that fail may be reported",
+            shape: Some("shape_vfs_unlink"),
+        },
+    },
+    Hook {
         program: "on_rmdir",
         function: "security_inode_rmdir",
         ops: &[Op::Rmdir],
         always: false,
         role: Role::Reports,
+    },
+    Hook {
+        program: "on_vfs_rmdir",
+        function: "vfs_rmdir",
+        ops: &[Op::Rmdir],
+        always: false,
+        role: Role::Confirms {
+            lost: "rmdirs that fail, such as of a directory that is not empty, may be reported",
+            shape: Some("shape_vfs_rmdir"),
+        },
     },
     Hook {
         program: "on_rename",
@@ -288,14 +399,15 @@ pub const FS_HOOKS: [Hook; 16] = [
         role: Role::Reports,
     },
     Hook {
-        program: "on_renamed",
+        program: "on_vfs_rename",
         function: "vfs_rename",
-        ops: &[],
+        ops: &[Op::Rename],
         always: true,
-        role: Role::Supplements(
-            "a change below a directory being renamed may be judged by where the directory \
-             was until the next directory rename",
-        ),
+        role: Role::Confirms {
+            lost: "a change below a directory being renamed may be judged by where the directory \
+                   was until the next directory rename, and renames that fail may be reported",
+            shape: None,
+        },
     },
     Hook {
         program: "on_setattr",
@@ -303,6 +415,16 @@ pub const FS_HOOKS: [Hook; 16] = [
         ops: &[Op::Chmod, Op::Chown, Op::Truncate, Op::Utimes, Op::Setattr],
         always: false,
         role: Role::Reports,
+    },
+    Hook {
+        program: "on_notify_change",
+        function: "notify_change",
+        ops: &[Op::Chmod, Op::Chown, Op::Truncate, Op::Utimes, Op::Setattr],
+        always: false,
+        role: Role::Confirms {
+            lost: "attribute changes that fail, such as a chmod by another user, may be reported",
+            shape: Some("shape_notify_change"),
+        },
     },
 ];
 
@@ -322,3 +444,34 @@ pub const EXEC_CWD_HOOK: Hook = Hook {
     always: true,
     role: Role::Supplements("cwds are read from /proc, too late for processes that exit quickly"),
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn skipped_runs_count_for_every_hook_that_can_lose_a_change_and_no_other() {
+        let uncounted: Vec<&str> = FS_HOOKS
+            .iter()
+            .chain([&EXEC_CWD_HOOK])
+            .filter(|hook| !hook.role.skip_loses_changes())
+            .map(|hook| hook.program)
+            .collect();
+        // Byte counts, the open instance of a struct file, the cwd: detail, never a change.
+        assert_eq!(
+            uncounted,
+            ["on_rw_verify_area", "on_file_free", "on_exec_cwd"]
+        );
+        // Programs that report, add or commit changes all count.
+        for program in [
+            "on_file_permission",
+            "on_mmap_file",
+            "on_file_mprotect",
+            "on_file_post_open",
+            "on_vfs_rename",
+        ] {
+            let hook = FS_HOOKS.iter().find(|h| h.program == program).unwrap();
+            assert!(hook.role.skip_loses_changes(), "{program}");
+        }
+    }
+}

@@ -1,7 +1,7 @@
 # fsblame
 
 [![CI](https://img.shields.io/github/actions/workflow/status/Arinerron/fsblame/ci.yml?branch=main&label=CI)](https://github.com/Arinerron/fsblame/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/github/license/Arinerron/fsblame)](LICENSE)
+[![License: MIT](https://img.shields.io/github/license/Arinerron/fsblame)](https://github.com/Arinerron/fsblame/blob/main/LICENSE)
 
 **Which command changed this file?** fsblame watches files and directory trees and prints
 every change made to them (writes, creates, renames, links, deletes, chmod, chown, truncate)
@@ -92,7 +92,7 @@ questions it answers:
 Every release has static binaries for x86_64 and aarch64 Linux, with a SHA-256 checksum:
 
 ```sh
-VERSION=v0.1.0
+VERSION=v0.1.1
 NAME=fsblame-$VERSION-$(uname -m)-linux-musl     # x86_64 or aarch64
 curl -fLO https://github.com/Arinerron/fsblame/releases/download/$VERSION/$NAME.tar.gz
 curl -fLO https://github.com/Arinerron/fsblame/releases/download/$VERSION/$NAME.tar.gz.sha256
@@ -101,17 +101,20 @@ tar -xzf $NAME.tar.gz
 sudo install -m 0755 $NAME/fsblame /usr/local/bin/fsblame
 ```
 
-The archive also holds shell completions (bash, zsh, fish, elvish, PowerShell), man pages and
-a [systemd unit](#running-as-a-service):
+The archive also holds man pages, shell completions (bash, zsh, fish, elvish, PowerShell), a
+[systemd unit](#running-as-a-service), and `THIRD_PARTY_LICENSES.md` with the licenses of
+everything built into the binary:
 
 ```sh
+sudo install -Dm 0644 -t /usr/local/share/man/man1 $NAME/man/*.1
 sudo install -Dm 0644 $NAME/completions/fsblame.bash /usr/local/share/bash-completion/completions/fsblame
 sudo install -Dm 0644 $NAME/completions/_fsblame /usr/local/share/zsh/site-functions/_fsblame
 sudo install -Dm 0644 $NAME/completions/fsblame.fish /usr/local/share/fish/vendor_completions.d/fsblame.fish
-sudo install -Dm 0644 -t /usr/local/share/man/man1 $NAME/man/*.1
 ```
 
-`fsblame completions <SHELL>` prints the same scripts.
+`man fsblame` then gives an overview, and `man fsblame-watch` (or `-run`, `-record`,
+`-blame`, `-doctor`, `-completions`) the details of each command. `fsblame completions
+<SHELL>` prints the same completion scripts.
 
 ### Privileges: sudo or setcap
 
@@ -150,7 +153,19 @@ sudo install -m 0755 target/x86_64-unknown-linux-musl/release/fsblame /usr/local
 
 For aarch64, add the target with `rustup target add aarch64-unknown-linux-musl` and build with
 `--target aarch64-unknown-linux-musl`; the bundled `rust-lld` links it, no cross compiler
-needed. [CONTRIBUTING.md](CONTRIBUTING.md) covers tests, benchmarks and fuzzing.
+needed. [CONTRIBUTING.md](https://github.com/Arinerron/fsblame/blob/main/CONTRIBUTING.md) covers tests, benchmarks and fuzzing.
+
+### From crates.io
+
+```sh
+cargo install fsblame --locked
+```
+
+This needs a Rust toolchain of at least the crate's `rust-version` (1.94) and clang with the
+BPF target (any distribution clang has it; check with `clang -print-targets | grep bpf`). It
+builds a dynamically linked binary for the host target in `~/.cargo/bin`; for the static
+release binary, add `--target x86_64-unknown-linux-musl` after installing that target with
+rustup. The [privileges](#privileges-sudo-or-setcap) above apply to it as well.
 
 ## Quick start
 
@@ -182,9 +197,9 @@ sudo fsblame watch ~/proj --tree 4242                     # only process 4242 an
 
 | Option | Meaning |
 |--------|---------|
-| `--json` | Print [NDJSON](docs/json.md) instead of the tree view. |
+| `--json` | Print [NDJSON](https://github.com/Arinerron/fsblame/blob/main/docs/json.md) instead of the tree view. |
 | `--depth N` | Ancestors shown per change in the tree view (default 4); JSON always has all of them. |
-| `--color auto\|always\|never` | Color the tree view; `auto` colors a terminal unless `NO_COLOR` is set. |
+| `--color auto\|always\|never` | Color the tree view; `auto` colors a terminal unless `NO_COLOR` is set to a non-empty value. |
 | `--summary` | When stopping, print the changes grouped by build step or command. |
 | `-q`, `--quiet` | Only warnings and errors on stderr: no start banner, no final count. |
 | `--duration D` | Stop after `250ms`, `30s`, `5m`, `1h`, `7d`; otherwise Ctrl-C, SIGTERM or SIGHUP stop it. |
@@ -241,8 +256,9 @@ command owns stdout; Ctrl-C goes to the command, and fsblame stops when the comm
 `--ready-fd`.
 
 The `-o` file holds every command line the run saw, so a new one is created with mode 0600
-and, under `sudo`, owned by you. fsblame refuses (status 2) to write through a symbolic link,
-or into an existing file that belongs to another user.
+and, under `sudo`, owned by you. An existing file must be a regular file of yours (of the user
+fsblame runs as, without `sudo`); it is truncated and keeps its mode. fsblame refuses (status
+2) anything else: a symbolic link, a FIFO, socket or device, or another user's file.
 
 Here it shows that `npm run build` also writes and prunes npm's log files in your home
 directory (an excerpt; npm's own messages are interleaved on the same terminal):
@@ -316,9 +332,9 @@ fsblame doctor · kernel 7.2.6-arch2-1 x86_64
  PASS kernel.btf             /sys/kernel/btf/vmlinux present
  PASS priv.capabilities      CAP_BPF, CAP_PERFMON effective
  ...
- PASS probe.fentry_security  fentry attached to security_inode_unlink and all 16 tracer hooks
+ PASS probe.fentry_security  fentry attached to security_inode_unlink and all 24 tracer hooks
  PASS probe.sched_tp         tp_btf attached to sched_process_fork, sched_process_exec and sched_process_exit
- PASS probe.ops              all 14 operations available; largest program on_rename verified in 3,208 of 1,000,000 instructions
+ PASS probe.ops              all 14 operations available; largest program on_rename verified in 3,261 of 1,000,000 instructions
  PASS fsblame.watchfs        /home/you/webapp on ext4
 summary: 0 fail · 0 warn · 23 pass · 3 info · 1 skip → fsblame is ready
 ```
@@ -353,6 +369,10 @@ PATH  VERB  TIME  (DETAIL)
   record of shows as `comm (pid N, not tracked)`.
 - The build step tag sits on the process whose environment identified it.
 - Paths below your home directory are shown with `~`, also under `sudo`.
+- Control characters in file names, command lines and other reported text (newlines, escape
+  sequences, bidirectional overrides) are shown as visible escapes such as `\n`, `\x1b` or
+  `\u{202e}`, and a command-line argument holding one is quoted bash-style as `$'...'`, so a
+  crafted name cannot fake or erase lines on your terminal. `--json` carries the exact text.
 
 `--depth` sets how many ancestors are shown. `--color` makes the path bold, colors the verb by
 kind of change and dims the ancestors.
@@ -362,7 +382,7 @@ kind of change and dims the ancestors.
 `--json` prints one object per line: a `touch` per change, `lost` when the kernel side lost
 data, and a `summary` with `--summary`. Every line carries the schema version `v` (currently
 1); fields are only added within a version. The schema, every field, and jq recipes are in
-[docs/json.md](docs/json.md).
+[docs/json.md](https://github.com/Arinerron/fsblame/blob/main/docs/json.md).
 
 ```sh
 sudo fsblame watch ~/proj --json | jq --unbuffered -r 'select(.type == "touch") | "\(.op) \(.path) by \(.proc.comm)"'
@@ -372,17 +392,27 @@ sudo fsblame watch ~/proj --json | jq --unbuffered -r 'select(.type == "touch") 
 
 When fsblame stops (Ctrl-C, SIGTERM, SIGHUP, `--duration`, or the end of `run`'s command), it
 reports every change made before that moment, including the write windows still open, and
-nothing made after it. If it is behind, it keeps reading for up to 10 s before it exits; a
-second Ctrl-C ends that at once.
+nothing made after it. If it is behind, it keeps reading for up to 10 s before it exits.
+SIGTERM or SIGHUP end that at once, and so does a second Ctrl-C, except under `run`, where
+Ctrl-C belongs to the command.
 
-If changes arrive faster than fsblame can read them, the kernel drops records rather than
-slowing the system down. fsblame never hides a loss: it prints a warning on stderr (a `lost`
-line in JSON) at most once per second while it happens, and the totals when it stops,
-including records it had not read yet when it stopped. A larger `--ring-size` helps.
+fsblame never hides a loss. It prints a warning on stderr (a `lost` line in JSON) at most once
+per second while one happens, and the totals when it stops:
+
+- **Ring buffer full**: changes arrived faster than fsblame could read them, and the kernel
+  dropped records rather than slow the system down. A larger `--ring-size` helps.
+- **Write counts**: the byte and call counts of some open files were lost.
+- **Untracked processes** (`run`, `watch --tree`): more than 65,536 processes were followed.
+- **Unread at the stop**: records fsblame had not read when it stopped.
+- **Skipped hook runs**: the kernel runs each of fsblame's programs at most once per CPU at a
+  time, and skips a run that would nest (a process preempted inside a program while another
+  on the same CPU makes a change). fsblame counts the skipped runs of every program that could
+  have lost a change, for any file on the system, so the count is an upper bound, and on a
+  busy machine the warning can appear when nothing you watch was affected.
 
 ## Running as a service
 
-[`contrib/systemd/fsblame-record.service`](contrib/systemd/fsblame-record.service) runs
+[`contrib/systemd/fsblame-record.service`](https://github.com/Arinerron/fsblame/blob/main/contrib/systemd/fsblame-record.service) runs
 `fsblame record` from boot, so `fsblame blame` can answer for changes made while nobody was
 watching. It runs with only the capabilities fsblame needs and a hardened sandbox; the
 comments in the unit explain each setting. It expects the binary at `/usr/local/bin/fsblame`,
@@ -400,7 +430,7 @@ sudo systemctl enable --now fsblame-record.service
 From a source checkout, install `contrib/systemd/fsblame-record.service` and
 `contrib/systemd/fsblame.default` the same way.
 
-[`/etc/default/fsblame`](contrib/systemd/fsblame.default) holds two settings:
+[`/etc/default/fsblame`](https://github.com/Arinerron/fsblame/blob/main/contrib/systemd/fsblame.default) holds two settings:
 
 | Variable | Meaning |
 |----------|---------|
@@ -438,14 +468,15 @@ Beyond the 5.17 floor, two things depend on the kernel:
 
 | Feature | Needs | Without it |
 |---------|-------|------------|
-| Confirmed creates | `security_file_post_open`, Linux 6.9 | Opening an existing file with `O_CREAT` (as `>>` in a shell does) can be reported as a `create` when its name was not in the kernel's dentry cache. The write itself is reported correctly. |
+| Confirmed creates by `open(O_CREAT)` | `security_file_post_open`, Linux 6.9 | Such creates are reported at the kernel's check: one that fails is reported too, and so is an open with `O_CREAT` of an existing file (as `>>` in a shell does) whose name was not in the kernel's dentry cache. They carry inode 0 and the requested mode, not the new file's. The write itself is reported correctly. |
 | `watch --tree` | `CONFIG_PROC_CHILDREN` | `--tree` exits with status 5. |
 
 When a program cannot be attached, fsblame names it at start and says what is missing
 without it, for example `security_file_post_open` before 6.9; `doctor` shows the same as a
-warning under `probe.ops`. Differences in kernel internals, such as the arguments of
-`security_inode_setattr` (changed in 6.0, and backported by some distributions), are read from
-the running kernel's BTF.
+warning under `probe.ops`. Differences in kernel internals, such as the arguments and return
+types of the VFS functions whose result fsblame checks, or of `security_inode_setattr`
+(changed in 6.0, and backported by some distributions), are read from the running kernel's
+BTF.
 
 Stock kernels of common distributions:
 
@@ -468,7 +499,11 @@ CI. Run `sudo fsblame doctor` to be sure.
 fsblame's programs run inside the kernel functions every file operation passes through, so
 watching has a cost even for files you do not watch. Most of it is paid by writes. Measured
 with `cargo xtask bench` on an Intel Core Ultra 7 155H (22 CPUs) running Linux 7.2.6, median
-of three runs, workloads pinned to one CPU, on a busy machine (load average about 5):
+of three runs, workloads pinned to one CPU, on a moderately busy machine (load average about
+5), with fsblame 0.1.0. Version 0.1.1 adds a small program on the return of creates,
+deletes, renames and attribute changes (87 to 161 verifier instructions each, against about
+1,000 to 3,300 for the checks), and a `skipped` column to the bench; the table below predates
+both.
 
 ```text
 workload           ops   without/s      with/s  overhead     cpu   cpu/op touches ring lost evicted  peak rss
@@ -510,7 +545,7 @@ What that means in absolute terms:
   (roughly 2.5 MiB plus `--ring-size`), and peaks at about 24 MiB while loading its programs.
 
 Numbers vary by about plus or minus four points between runs on a busy machine.
-`cargo xtask bench` measures your own machine; see [CONTRIBUTING.md](CONTRIBUTING.md#benchmarks).
+`cargo xtask bench` measures your own machine; see [CONTRIBUTING.md](https://github.com/Arinerron/fsblame/blob/main/CONTRIBUTING.md#benchmarks).
 
 ## Limitations
 
@@ -528,7 +563,15 @@ Numbers vary by about plus or minus four points between runs on a busy machine.
   watched. Paths on a filesystem mounted after the start (seen by `run` without paths) are
   shown as `<dev MAJOR:MINOR>/path`.
 - **Long paths** are cut at 1024 bytes or 64 directory levels below their root, keeping the
-  lowest part, and are marked truncated.
+  lowest part, and are marked truncated. Symlink targets longer than 1023 bytes are cut at
+  their end.
+- **Skipped hook runs.** The kernel runs each of fsblame's programs at most once per CPU at a
+  time, so under heavy parallel load (especially on kernels with full preemption) a change
+  can go unseen. fsblame counts such runs and reports them as a loss, never silently.
+- **Rare late reports.** fsblame holds a change until the call that made it returns. When a
+  call's return is not seen (the kernel skipped the program, as above), its held change can,
+  in rare cases, be reported for a later call by the same thread on the same name that made no
+  change and ran no check of its own (such as a rename between two hard links of one file).
 - **Working directory** is the one at exec (or inherited at fork). A process that changes
   directory later, such as a shell running `cd`, still shows the old one.
 - **Command lines** longer than 4 KiB are cut, and environments longer than 8 KiB lose their
@@ -544,8 +587,9 @@ Numbers vary by about plus or minus four points between runs on a busy machine.
 fsblame attaches BPF programs (fentry) to the kernel's VFS security hooks, which every create,
 link, unlink, rename, attribute change and write passes through, and to the scheduler's
 fork, exec and exit tracepoints. In the kernel, each hook decides whether the file is in a
-watched tree, with a per-dentry cache so unwatched files cost almost nothing, rebuilds its
-path, and sends a record through a ring buffer; write calls are only counted there, per
+watched tree, with a per-dentry cache so unwatched files cost almost nothing, and rebuilds its
+path. The record then waits until the VFS function that ran the check returns (fexit), and
+goes through a ring buffer only if the change succeeded; write calls are only counted, per
 process and open file. Exec records carry the command line, working directory and
 environment. In userspace, fsblame rebuilds the process tree from those records (and from
 `/proc` for processes that predate it), coalesces the write counts into one change per
@@ -555,7 +599,9 @@ prints each change with its lineage.
 ```mermaid
 flowchart LR
   subgraph kernel
-    H["fentry on VFS security hooks:<br/>create, link, unlink, rename,<br/>setattr, write, mmap"] -->|"in a watched tree?"| F["file records"]
+    H["fentry on VFS security hooks:<br/>create, link, unlink, rename,<br/>setattr, write, mmap"] -->|"in a watched tree?"| Q[("held records")]
+    X["fexit on vfs_* functions<br/>and notify_change"] -->|"succeeded?"| Q
+    Q --> F["file records"]
     H -->|"count bytes and calls"| W[("write totals")]
     S["sched tracepoints:<br/>fork, exec, exit"] --> P["process records"]
     F --> R[("ring buffer")]
@@ -568,7 +614,7 @@ flowchart LR
   E --> O3["journal for blame"]
 ```
 
-[AGENTS.md](AGENTS.md) describes the design in detail: every program and map, the verifier
+[AGENTS.md](https://github.com/Arinerron/fsblame/blob/main/AGENTS.md) describes the design in detail: every program and map, the verifier
 budget, the overlay model and the tests.
 
 ## Exit codes
@@ -587,9 +633,9 @@ stderr and status 2, 4 or 5 before the command starts, or 6 after waiting for it
 
 ## Contributing, security and license
 
-- [CONTRIBUTING.md](CONTRIBUTING.md): building, tests, the end-to-end suite and pull requests.
-- [SECURITY.md](SECURITY.md): please report vulnerabilities privately.
-- [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
-- [CHANGELOG.md](CHANGELOG.md).
+- [CONTRIBUTING.md](https://github.com/Arinerron/fsblame/blob/main/CONTRIBUTING.md): building, tests, the end-to-end suite and pull requests.
+- [SECURITY.md](https://github.com/Arinerron/fsblame/blob/main/SECURITY.md): please report vulnerabilities privately.
+- [CODE_OF_CONDUCT.md](https://github.com/Arinerron/fsblame/blob/main/CODE_OF_CONDUCT.md).
+- [CHANGELOG.md](https://github.com/Arinerron/fsblame/blob/main/CHANGELOG.md).
 
-fsblame is released under the [MIT License](LICENSE). Copyright Aaron Esau.
+fsblame is released under the [MIT License](https://github.com/Arinerron/fsblame/blob/main/LICENSE). Copyright Aaron Esau.

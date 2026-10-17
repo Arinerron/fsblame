@@ -4,8 +4,8 @@
 //! A workload that waits for the `fsblame: watching` line starts while fsblame is still
 //! setting up its consumer, so its first records reach a ring buffer nobody drains yet; the
 //! stop comes right after the last change, while a slow consumer (a debug build) is still
-//! behind. Each change must be reported, or its record counted in the `lost` lines, which the
-//! summary and the warnings on stderr must repeat.
+//! behind. Each change must be reported, or counted in the `lost` lines (its record lost, or
+//! the run of its hook skipped), which the summary and the warnings on stderr must repeat.
 
 use std::{
     collections::HashSet,
@@ -25,12 +25,14 @@ use crate::{Ctx, Finished, MAX_RUN, Watcher, text};
 const FILES: usize = 10_000;
 /// The changes each churned file makes.
 const OPS: [&str; 4] = ["create", "write", "rename", "unlink"];
-/// Every `lost` reason, with its key in the summary's `lost` totals.
-const REASONS: [(&str, &str); 4] = [
-    ("ring-full", "ring_full"),
-    ("write-evicted", "write_evicted"),
-    ("track-full", "track_full"),
-    ("unread", "unread"),
+/// Every `lost` reason, with its key in the summary's `lost` totals and the end-of-run warning
+/// on stderr that names it.
+pub const REASONS: [(&str, &str, &str); 5] = [
+    ("ring-full", "ring_full", "a larger --ring-size helps"),
+    ("write-evicted", "write_evicted", "latest byte counts of"),
+    ("track-full", "track_full", "processes were tracked"),
+    ("unread", "unread", "left unread"),
+    ("skipped", "skipped", "skipped by the kernel"),
 ];
 
 /// Creates, writes, renames and unlinks [`FILES`] files in `dir` as fast as it can.
@@ -63,14 +65,14 @@ fn churned(lines: &[Value], dir: &Path) -> HashSet<(usize, usize)> {
         .collect()
 }
 
-/// The records lost, by the `lost` lines of every reason: their totals must be the summary's
-/// and lost records must be warned about on stderr.
-fn records_lost(done: &Finished, lines: &[Value]) -> Result<u64> {
+/// The losses by the `lost` lines of each of [`REASONS`], in that order: their totals must be
+/// the summary's (`--summary`), and each reason with losses must be warned about on stderr.
+pub fn losses(done: &Finished, lines: &[Value]) -> Result<[u64; REASONS.len()]> {
     let mut totals = [0; REASONS.len()];
     for line in lines.iter().filter(|l| l["type"] == "lost") {
         let reason = REASONS
             .iter()
-            .position(|&(reason, _)| line["reason"] == reason)
+            .position(|&(reason, _, _)| line["reason"] == reason)
             .with_context(|| format!("lost line with an unknown reason: {line}"))?;
         totals[reason] += line["count"]
             .as_u64()
@@ -90,30 +92,24 @@ fn records_lost(done: &Finished, lines: &[Value]) -> Result<u64> {
         "the summary's lost totals are not those of {REASONS:?}: {}",
         end["lost"]
     );
-    for (&(reason, key), total) in REASONS.iter().zip(totals) {
+    for (&(reason, key, warning), total) in REASONS.iter().zip(totals) {
         ensure!(
             summary.get(key).and_then(Value::as_u64) == Some(total),
             "the {reason} lines count {total}, the summary's lost totals are {}",
             end["lost"]
         );
-    }
-    let [ring_full, _, _, unread] = totals;
-    for (count, warning) in [
-        (ring_full, "a larger --ring-size helps"),
-        (unread, "left unread"),
-    ] {
         ensure!(
-            count == 0 || done.stderr.contains(warning),
-            "{count} records lost without the warning {warning:?} on stderr:\n{}",
+            total == 0 || done.stderr.contains(warning),
+            "{total} {reason} losses without the warning {warning:?} on stderr:\n{}",
             done.stderr
         );
     }
-    Ok(ring_full + unread)
+    Ok(totals)
 }
 
 /// One watcher with `ring` (the default if `None`), churned at once and stopped right after:
-/// every change is reported or its record counted lost. Returns how many were reported and
-/// how many records were lost.
+/// every change is reported or counted lost. Returns how many were reported and how many
+/// records and hook runs were lost.
 fn churn_at_start(ctx: &Ctx, ring: Option<&str>) -> Result<(usize, u64)> {
     let dir = ctx.dir("ad-startup")?;
     let mut cmd = Command::new("sudo");
@@ -129,7 +125,8 @@ fn churn_at_start(ctx: &Ctx, ring: Option<&str>) -> Result<(usize, u64)> {
     let done = watcher.stop()?;
     let lines = done.touches()?;
     let seen = churned(&lines, &dir);
-    let lost = records_lost(&done, &lines)?;
+    let [ring_full, _, _, unread, skipped] = losses(&done, &lines)?;
+    let lost = ring_full + unread + skipped;
     let expected = OPS.len() * FILES;
     let missing = expected - seen.len();
     let by_op: Vec<String> = OPS
@@ -146,7 +143,8 @@ fn churn_at_start(ctx: &Ctx, ring: Option<&str>) -> Result<(usize, u64)> {
         .map(|(op, file)| format!("; first missing: {} of f{file}", OPS[op]));
     ensure!(
         u64::try_from(missing)? <= lost,
-        "ring {}: {missing} of {expected} changes missing ({}), {lost} records reported lost{}",
+        "ring {}: {missing} of {expected} changes missing ({}), {lost} records or hook runs \
+         reported lost{}",
         ring.unwrap_or("default"),
         by_op.join(", "),
         first.unwrap_or_default()
@@ -160,7 +158,7 @@ pub fn startup_churn(ctx: &Ctx) -> Result<String> {
     let expected = OPS.len() * FILES;
     Ok(format!(
         "{FILES} files churned from the watching line to the stop: {reported}/{expected} \
-         changes reported ({lost} records lost); with a 256K ring {small} reported, \
-         {small_lost} records lost"
+         changes reported ({lost} records or hook runs lost); with a 256K ring {small} \
+         reported, {small_lost} lost"
     ))
 }

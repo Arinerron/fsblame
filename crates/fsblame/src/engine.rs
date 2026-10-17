@@ -1,7 +1,13 @@
 //! Event processing: feeds process events to procctx, coalesces writes, selects changes and
 //! emits them, with their lineage, as report lines.
 
-use std::{collections::HashMap, io, path::PathBuf, rc::Rc, sync::Arc};
+use std::{
+    collections::HashMap,
+    io,
+    path::{Path, PathBuf},
+    rc::Rc,
+    sync::Arc,
+};
 
 use aya::maps::{HashMap as BpfHashMap, MapData};
 use fsblame_abi::{self as abi, WriteKey, WriteVal};
@@ -29,6 +35,11 @@ const IDLE_NS: u64 = 5_000_000_000;
 const QUIET_NS: u64 = 200_000_000;
 /// ...or has been open this long, whichever comes first.
 const HOLD_NS: u64 = 1_000_000_000;
+/// A binding the kernel replaced before the record of the replacement was read waits for that
+/// record, which carries its final totals, until the ring has been read this far past the
+/// replacement. Records reach the ring in about the order of their times, so by then the record
+/// is lost (the ring was full).
+const REPLACED_WAIT_NS: u64 = 1_000_000_000;
 /// How often exited processes past their TTL are dropped.
 const EXPIRE_EVERY_NS: u64 = 10_000_000_000;
 
@@ -81,7 +92,8 @@ pub struct Actor {
 pub struct FileId {
     /// Kernel `dev_t`.
     pub dev: u32,
-    /// Inode number; 0 for a name being created.
+    /// Inode number; for a created name, the inode it got once the creation was confirmed, or
+    /// 0 when it was reported at its check.
     pub ino: u64,
 }
 
@@ -171,7 +183,7 @@ pub struct Touch {
     pub target: Option<PathBuf>,
     /// File identity.
     pub file: FileId,
-    /// `i_mode`, or the requested mode for creations.
+    /// `i_mode`; for a creation reported at its check (not confirmed), the requested mode.
     pub mode: u32,
     /// Op-specific detail.
     pub change: Change,
@@ -229,6 +241,10 @@ struct Binding {
     /// Latest write as last read from the kernel.
     last_ns: u64,
     next_poll_ns: u64,
+    /// Kernel `first_ns` of the binding seen replacing this one before the record of the
+    /// replacement, which hands this one's final totals over, was read. Such a binding is
+    /// no longer polled; it waits for that record.
+    superseded: Option<u64>,
 }
 
 impl Binding {
@@ -312,8 +328,9 @@ pub struct Counts {
     pub touches: u64,
     /// Records that did not decode.
     pub malformed: u64,
-    /// Write bindings the kernel's `writes` LRU evicted before their latest totals were
-    /// read: the bytes and calls since the previous poll are missing from the reports.
+    /// Write bindings whose latest totals were lost: the kernel's `writes` LRU evicted them
+    /// before they were read, or the record handing them over was dropped with the ring full.
+    /// The bytes and calls since the previous poll are missing from the reports.
     pub evicted: u64,
 }
 
@@ -340,6 +357,8 @@ pub struct Engine<S> {
     /// The lineage of an unknown process.
     unknown: Rc<Lineage>,
     last_expire_ns: u64,
+    /// The latest time of a record read: how far the ring has been read.
+    read_ns: u64,
     counts: Counts,
 }
 
@@ -353,6 +372,13 @@ fn write_key((tgid, file): (u32, u64)) -> WriteKey {
 
 fn flag(flags: u32, bit: u32) -> bool {
     flags & bit != 0
+}
+
+/// The part of `path` strictly below the directory `dir`, unless `dir` is truncated.
+fn below<'p>(path: &'p Path, (dir, truncated): (&Path, bool)) -> Option<&'p Path> {
+    path.strip_prefix(dir)
+        .ok()
+        .filter(|rest| !truncated && !rest.as_os_str().is_empty())
 }
 
 impl<S: Sink> Engine<S> {
@@ -380,6 +406,7 @@ impl<S: Sink> Engine<S> {
             lineages: HashMap::new(),
             unknown: Rc::default(),
             last_expire_ns: 0,
+            read_ns: 0,
             counts: Counts::default(),
         }
     }
@@ -389,6 +416,12 @@ impl<S: Sink> Engine<S> {
         self.counts
     }
 
+    /// Converts the times of the lines reported from now on with `clock`, such as one
+    /// resampled after the wall clock was set.
+    pub fn set_clock(&mut self, clock: Clock) {
+        self.clock = clock;
+    }
+
     /// The sink, for lines that do not come from records (losses, the summary).
     pub fn sink_mut(&mut self) -> &mut S {
         &mut self.sink
@@ -396,8 +429,22 @@ impl<S: Sink> Engine<S> {
 
     /// Handles one ring buffer item.
     pub fn handle(&mut self, bytes: &[u8], totals: &mut impl Totals) -> io::Result<()> {
-        match record::decode(bytes) {
-            Ok(Record::Fork(r)) => {
+        let record = match record::decode(bytes) {
+            Ok(record) => record,
+            Err(malformed) => {
+                log::debug!("{malformed}");
+                self.counts.malformed += 1;
+                return Ok(());
+            }
+        };
+        self.read_ns = self.read_ns.max(match &record {
+            Record::Fork(r) => r.hdr.ts_ns,
+            Record::Exec(exec) => exec.rec.hdr.ts_ns,
+            Record::Exit(r) => r.hdr.ts_ns,
+            Record::Fs(fs) => fs.rec.hdr.ts_ns,
+        });
+        match record {
+            Record::Fork(r) => {
                 self.procs.on_fork(ForkEvent {
                     ts_ns: r.hdr.ts_ns,
                     parent: r.parent_tgid,
@@ -409,15 +456,24 @@ impl<S: Sink> Engine<S> {
                 });
                 Ok(())
             }
-            Ok(Record::Exec(exec)) => {
+            Record::Exec(exec) => {
+                let tgid = exec.rec.tgid;
                 // Report the writes of the image being replaced while the table still
                 // describes it: `sh -c 'echo x >> f; mkdir d'` execs mkdir in place, and its
                 // pending window for `f` would otherwise carry mkdir's comm and argv.
-                self.flush_process(exec.rec.tgid, exec.rec.hdr.ts_ns, totals)?;
+                self.flush_process(tgid, exec.rec.hdr.ts_ns, totals)?;
+                // Descriptors survive the exec: later writes through them are the new
+                // program's (`sh -c 'echo building; exec make' >> build.log`).
+                let comm = record::c_str(&exec.rec.comm);
+                for binding in self.bindings.values_mut() {
+                    if binding.actor.tgid == tgid {
+                        binding.actor.comm.clone_from(&comm);
+                    }
+                }
                 self.on_exec(&exec);
                 Ok(())
             }
-            Ok(Record::Exit(r)) => {
+            Record::Exit(r) => {
                 // Report the process's writes while its record is still live: the exit event
                 // arrives while the task is still in do_exit, so a lookup after on_exit would
                 // rebuild it from a half-torn-down /proc entry (no exe, argv, cwd or env).
@@ -433,12 +489,7 @@ impl<S: Sink> Engine<S> {
                 });
                 Ok(())
             }
-            Ok(Record::Fs(fs)) => self.on_fs(&fs, totals),
-            Err(malformed) => {
-                log::debug!("{malformed}");
-                self.counts.malformed += 1;
-                Ok(())
-            }
+            Record::Fs(fs) => self.on_fs(&fs, totals),
         }
     }
 
@@ -532,13 +583,16 @@ impl<S: Sink> Engine<S> {
             self.procs.ancestry(actor.tgid, Stop::Root);
             let key = (r.tgid, r.file);
             if let Some(mut old) = self.bindings.remove(&key) {
-                if flag(r.hdr.flags, abi::F_REPLACED) {
-                    // The struct file was reused: the kernel handed over the old binding's
-                    // final totals with the new one.
+                // The kernel replaced the binding. When the struct file was reused, it handed
+                // the old binding's final totals over; without them, the LRU had evicted it,
+                // taking the totals since the last poll along. A superseded binding was
+                // replaced by the one a poll saw: a record from after that replaced another
+                // binding, and the record with this one's final totals was lost.
+                if flag(r.hdr.flags, abi::F_REPLACED)
+                    && old.superseded.is_none_or(|by| r.hdr.ts_ns <= by)
+                {
                     old.seen = old.seen.max((r.aux, r.aux2));
                 } else {
-                    // The kernel had no binding left to replace: the LRU evicted it, taking
-                    // the totals since the last poll along.
                     self.counts.evicted += 1;
                 }
                 self.credit(&mut old, r.hdr.ts_ns)?;
@@ -555,6 +609,7 @@ impl<S: Sink> Engine<S> {
                 credited: (0, 0),
                 last_ns: now,
                 next_poll_ns: now + POLL_NS,
+                superseded: None,
             };
             self.credit(&mut binding, now)?;
             self.bindings.insert(key, binding);
@@ -562,15 +617,32 @@ impl<S: Sink> Engine<S> {
         }
 
         // Report pending writes to the inodes involved first, keeping causal order.
-        self.flush_file(file, totals)?;
+        self.flush_file(file, r.hdr.ts_ns, totals)?;
         if op == Op::Rename && r.aux2 != 0 {
             self.flush_file(
                 FileId {
                     dev: r.dev,
                     ino: r.aux2,
                 },
+                r.hdr.ts_ns,
                 totals,
             )?;
+        }
+        if op == Op::Rename
+            && let Some(old) = &path2
+        {
+            let exchanged = (u32::try_from(r.aux).unwrap_or(0) & RENAME_EXCHANGE != 0
+                && r.aux2 != 0)
+                .then_some(FileId {
+                    dev: r.dev,
+                    ino: r.aux2,
+                });
+            self.renamed(
+                file,
+                exchanged,
+                (old, flag(r.hdr.flags, abi::F_PATH2_TRUNC)),
+                (&path, flag(r.hdr.flags, abi::F_PATH_TRUNC)),
+            );
         }
         let change = match op {
             // Coalesced writes returned above: a write here is a mapping.
@@ -617,17 +689,28 @@ impl<S: Sink> Engine<S> {
             .bindings
             .iter()
             .filter(|(_, b)| {
-                b.next_poll_ns <= now_ns
-                    || self
-                        .windows
-                        .get(&b.window_key())
-                        .is_some_and(|w| w.next_poll_ns <= now_ns)
+                b.superseded.is_none()
+                    && (b.next_poll_ns <= now_ns
+                        || self
+                            .windows
+                            .get(&b.window_key())
+                            .is_some_and(|w| w.next_poll_ns <= now_ns))
             })
             .map(|(key, _)| *key)
             .collect();
         for key in due {
             self.refresh(key, now_ns, totals)?;
         }
+        let read_ns = self.read_ns;
+        self.give_up(|_, by| read_ns > by.saturating_add(REPLACED_WAIT_NS));
+        // A window fed by a superseded binding is not quiet before that binding's final
+        // totals are in; the hold limit still cuts it.
+        let waiting: Vec<WindowKey> = self
+            .bindings
+            .values()
+            .filter(|b| b.superseded.is_some())
+            .map(Binding::window_key)
+            .collect();
         let due: Vec<WindowKey> = self
             .windows
             .iter()
@@ -638,7 +721,8 @@ impl<S: Sink> Engine<S> {
             let Some(window) = self.windows.get_mut(&key) else {
                 continue;
             };
-            let quiet = now_ns.saturating_sub(window.last_ns) >= QUIET_NS;
+            let quiet =
+                now_ns.saturating_sub(window.last_ns) >= QUIET_NS && !waiting.contains(&key);
             let held = now_ns.saturating_sub(window.opened_ns) >= HOLD_NS;
             if quiet || held {
                 self.report_window(key)?;
@@ -657,7 +741,9 @@ impl<S: Sink> Engine<S> {
         self.sink.flush()
     }
 
-    /// Reports every pending write window (shutdown).
+    /// Reports every pending write window (shutdown). A superseded binding is reported as
+    /// seen: the record with its final totals comes after the stop, as later changes do, or
+    /// is counted unread.
     pub fn finish(&mut self, totals: &mut impl Totals) -> io::Result<()> {
         let now = clock::boot_now_ns();
         let keys: Vec<(u32, u64)> = self.bindings.keys().copied().collect();
@@ -685,19 +771,68 @@ impl<S: Sink> Engine<S> {
         self.report_windows(|key| key.tgid == tgid)
     }
 
-    /// A process exited: report and forget its bindings.
+    /// A process exited: report and forget its bindings. The records of its writes all came
+    /// before its exit, so a superseded binding's final totals never will.
     fn finish_process(&mut self, tgid: u32, totals: &mut impl Totals) -> io::Result<()> {
         let now = clock::boot_now_ns();
         for key in self.process_keys(tgid) {
             self.refresh(key, now, totals)?;
-            self.bindings.remove(&key);
             totals.remove(&write_key(key));
         }
+        self.give_up(|key, _| key.0 == tgid);
+        self.bindings.retain(|key, _| key.0 != tgid);
         self.report_windows(|key| key.tgid == tgid)
     }
 
-    /// Reports pending writes to `file`.
-    fn flush_file(&mut self, file: FileId, totals: &mut impl Totals) -> io::Result<()> {
+    /// Drops the superseded bindings that `which` selects by key and `superseded` time,
+    /// counting each as evicted: the record with its final totals is lost, and with them the
+    /// writes since it was last polled.
+    fn give_up(&mut self, which: impl Fn((u32, u64), u64) -> bool) {
+        let mut lost = 0;
+        self.bindings.retain(|&key, b| match b.superseded {
+            Some(by) if which(key, by) => {
+                lost += 1;
+                false
+            }
+            _ => true,
+        });
+        self.counts.evicted += lost;
+    }
+
+    /// A rename moved inode `file` from `old` to `new` and, exchanging them, inode
+    /// `exchanged` from `new` to `old` (each a path and whether it is truncated). The open
+    /// files of those inodes, and below them when they are directories, write at their new
+    /// names from now on; pending windows keep the writes before.
+    fn renamed(
+        &mut self,
+        file: FileId,
+        exchanged: Option<FileId>,
+        old: (&Path, bool),
+        new: (&Path, bool),
+    ) {
+        for binding in self.bindings.values_mut() {
+            let (path, truncated) = if binding.file == file {
+                (new.0.to_path_buf(), new.1)
+            } else if exchanged == Some(binding.file) {
+                (old.0.to_path_buf(), old.1)
+            } else if binding.file.dev != file.dev {
+                continue;
+            } else if let Some(rest) = below(&binding.path, old) {
+                (new.0.join(rest), new.1)
+            } else if exchanged.is_some()
+                && let Some(rest) = below(&binding.path, new)
+            {
+                (old.0.join(rest), old.1)
+            } else {
+                continue;
+            };
+            binding.path = path;
+            binding.truncated = truncated;
+        }
+    }
+
+    /// Reports pending writes to `file` as of `now`.
+    fn flush_file(&mut self, file: FileId, now: u64, totals: &mut impl Totals) -> io::Result<()> {
         if file.ino == 0 {
             return Ok(());
         }
@@ -707,7 +842,6 @@ impl<S: Sink> Engine<S> {
             .filter(|(_, b)| b.file == file)
             .map(|(key, _)| *key)
             .collect();
-        let now = clock::boot_now_ns();
         for key in keys {
             self.refresh(key, now, totals)?;
         }
@@ -720,29 +854,28 @@ impl<S: Sink> Engine<S> {
         let Some(mut binding) = self.bindings.remove(&key) else {
             return Ok(());
         };
-        let gone = match totals.get(&write_key(key)) {
-            Some(v) if v.first_ns == binding.first_ns => {
-                if v.calls != binding.seen.1 {
-                    binding.seen = (v.bytes, v.calls);
-                    binding.last_ns = v.last_ns;
+        if binding.superseded.is_none() {
+            match totals.get(&write_key(key)) {
+                Some(v) if v.first_ns == binding.first_ns => {
+                    if v.calls != binding.seen.1 {
+                        binding.seen = (v.bytes, v.calls);
+                        binding.last_ns = v.last_ns;
+                    }
+                    let idle = now.saturating_sub(binding.last_ns) >= IDLE_NS;
+                    binding.next_poll_ns = now + if idle { IDLE_POLL_NS } else { POLL_NS };
                 }
-                false
+                // Replaced by a newer binding for a reused struct file. The record of that
+                // one, still in the ring, hands this one's final totals over: wait for it.
+                Some(v) => binding.superseded = Some(v.first_ns),
+                // Evicted from the LRU: the writes since the last poll are lost.
+                None => {
+                    self.counts.evicted += 1;
+                    return self.credit(&mut binding, now);
+                }
             }
-            // Superseded by a newer binding for a reused struct file (its record follows):
-            // what was seen of this one stays in its window.
-            Some(_) => true,
-            // Evicted from the LRU: the writes since the last poll are lost.
-            None => {
-                self.counts.evicted += 1;
-                true
-            }
-        };
-        self.credit(&mut binding, now)?;
-        if !gone {
-            let idle = now.saturating_sub(binding.last_ns) >= IDLE_NS;
-            binding.next_poll_ns = now + if idle { IDLE_POLL_NS } else { POLL_NS };
-            self.bindings.insert(key, binding);
         }
+        self.credit(&mut binding, now)?;
+        self.bindings.insert(key, binding);
         Ok(())
     }
 

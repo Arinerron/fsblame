@@ -150,7 +150,7 @@ impl Check for FentryProbe {
         for hook in FS_HOOKS.iter().filter(|hook| hook.function != CANONICAL) {
             if let Err(why) = probe_fentry(&mut ebpf, &kernel.btf, hook.function) {
                 failed.push(format!("{} ({why})", hook.function));
-                if let Role::Supplements(lost) = hook.role {
+                if let Some(lost) = hook.role.lost() {
                     impact.push_str("; ");
                     impact.push_str(lost);
                 }
@@ -171,7 +171,7 @@ impl Check for FentryProbe {
         )
         .with_impact(impact)
         .with_fix(Fix::new(
-            "grep -wE 'security_[a-z_]+|rw_verify_area|vfs_rename' /sys/kernel/tracing/available_filter_functions",
+            "grep -wE 'security_[a-z_]+|rw_verify_area|vfs_[a-z]+|notify_change' /sys/kernel/tracing/available_filter_functions",
             "a hook missing here is inlined or not traceable on this kernel",
         ))
         .with_explain(explain)
@@ -419,7 +419,9 @@ fn ops_diagnostic(
         format!("{} operations will not be reported", disabled.join(", "))
     };
     // What a failed supplementing hook loses is in its `describe` line.
-    if failed.iter().any(|(o, _)| o.hook.ops.contains(&Op::Rename)) {
+    let on_rename =
+        |o: &HookOutcome| o.hook.role == Role::Reports && o.hook.ops.contains(&Op::Rename);
+    if failed.iter().any(|(o, _)| on_rename(o)) {
         impact.push_str(
             "; directory renames no longer refresh the scope cache, so files moved into or out of \
              a watch root may be misjudged",
@@ -435,9 +437,9 @@ fn ops_diagnostic(
             .filter(|o| o.status == "available")
             .map(|o| o.name)
             .collect();
-        let rename = failed.iter().any(|(o, e)| {
-            o.hook.ops.contains(&Op::Rename) && matches!(e.cause(), Cause::TooComplex { .. })
-        });
+        let rename = failed
+            .iter()
+            .any(|(o, e)| on_rename(o) && matches!(e.cause(), Cause::TooComplex { .. }));
         let note = if rename {
             "known limitation on this kernel, there is no reduced-complexity mode beyond this: \
              without rename in --op, on_rename loads reduced to scope-cache upkeep, which fits, \
@@ -465,7 +467,7 @@ fn ops_diagnostic(
     }
     if has(|c| c == Cause::Missing) {
         d = d.with_fix(Fix::new(
-            "grep -wE 'security_[a-z_]+|rw_verify_area|vfs_rename' /sys/kernel/tracing/available_filter_functions",
+            "grep -wE 'security_[a-z_]+|rw_verify_area|vfs_[a-z]+|notify_change' /sys/kernel/tracing/available_filter_functions",
             "a hook missing here is inlined or not traceable on this kernel; no workaround",
         ));
         explain.push(
@@ -806,7 +808,7 @@ pub fn failure(report: &Report, message: &str) -> Failure {
 }
 
 fn color(stream: &impl IsTerminal) -> bool {
-    stream.is_terminal() && std::env::var_os("NO_COLOR").is_none()
+    stream.is_terminal() && std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty())
 }
 
 /// Prints the checks relevant to a failed load or attach to stderr.

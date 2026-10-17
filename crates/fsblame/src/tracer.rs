@@ -1,16 +1,21 @@
 //! Loading the BPF object, filling the roots map and attaching programs.
 
-use std::{fmt, sync::OnceLock};
+use std::{
+    fmt,
+    os::fd::{AsFd as _, AsRawFd as _, BorrowedFd},
+    ptr,
+    sync::OnceLock,
+};
 
 use aya::{
     Btf, BtfError, Ebpf, VerifierLogLevel,
     maps::{Array, HashMap, MapData, MapError, PerCpuArray},
-    programs::{BtfTracePoint, Program, ProgramError, links::FdLink},
+    programs::{BtfTracePoint, Program, ProgramError, ProgramFd, links::FdLink},
 };
-use fsblame_abi::{self as abi, DevFilter, RootKey, RootVal, WriteKey, WriteVal};
+use fsblame_abi::{self as abi, DevFilter, ExitShape, RootKey, RootVal, WriteKey, WriteVal};
 
 use crate::{
-    btf::{self, KernelBtf},
+    btf::{self, KernelBtf, Ret},
     fail::errno_of,
     ops::{EXEC_CWD_HOOK, FS_HOOKS, Hook, Op, OpSet, Role, SCHED_HOOKS},
     ring::Ring,
@@ -22,6 +27,72 @@ const ENOTSUPP: i32 = 524;
 
 /// The map of the tracer's `armed` flag (its own data section).
 const ARMED: &str = ".data.armed";
+
+/// The `bpf(2)` command that reads an object's info (`enum bpf_cmd`).
+const BPF_OBJ_GET_INFO_BY_FD: libc::c_int = 15;
+
+/// The head of the kernel's `struct bpf_prog_info`, up to `recursion_misses` (Linux 5.12), the
+/// one field fsblame reads. The kernel only ever appends fields, copies at most as many bytes
+/// as it is given, and first reads them as the sizes and addresses of arrays to fill: the
+/// head goes in zeroed, so it fills none.
+#[repr(C, align(8))]
+struct ProgInfo {
+    /// `type` to `run_cnt`.
+    _head: [u8; 208],
+    /// Runs the kernel skipped because the program was already running on that CPU.
+    recursion_misses: u64,
+}
+
+impl ProgInfo {
+    /// `recursion_misses`, if the `len` bytes the kernel filled include it.
+    fn recursion_misses(&self, len: u32) -> Option<u64> {
+        let end = std::mem::offset_of!(Self, recursion_misses) + size_of::<u64>();
+        (usize::try_from(len).ok()? >= end).then_some(self.recursion_misses)
+    }
+}
+
+/// The `info` member of `union bpf_attr`, for [`BPF_OBJ_GET_INFO_BY_FD`].
+#[repr(C)]
+struct InfoByFd {
+    bpf_fd: u32,
+    /// Bytes at `info`; the kernel sets it to the bytes it filled.
+    info_len: u32,
+    info: u64,
+}
+
+/// Runs of the program `fd` the kernel skipped because the program was already running on
+/// that CPU; `None` if the call fails or the kernel does not count them (before Linux 5.12).
+fn recursion_misses(fd: BorrowedFd<'_>) -> Option<u64> {
+    let mut info = ProgInfo {
+        _head: [0; 208],
+        recursion_misses: 0,
+    };
+    let mut attr = InfoByFd {
+        bpf_fd: u32::try_from(fd.as_raw_fd()).ok()?,
+        info_len: u32::try_from(size_of::<ProgInfo>()).ok()?,
+        info: ptr::from_mut(&mut info).expose_provenance() as u64,
+    };
+    // SAFETY: `attr` is the `info` member of `union bpf_attr` and spans the size passed (the
+    // kernel zero-fills the rest of the union); it points to `info_len` writable bytes of
+    // `info`, which outlives the call.
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_bpf,
+            BPF_OBJ_GET_INFO_BY_FD,
+            ptr::from_mut(&mut attr),
+            size_of::<InfoByFd>(),
+        )
+    };
+    if ret != 0 {
+        log::debug!(
+            "reading the info of BPF program fd {}: {}",
+            attr.bpf_fd,
+            std::io::Error::last_os_error()
+        );
+        return None;
+    }
+    info.recursion_misses(attr.info_len)
+}
 
 /// How a load failure should be reported.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -234,9 +305,9 @@ impl LoadError {
             ),
             Cause::Other => format!("{}: {:#}", self.what, self.source),
         };
-        match hook.role {
-            Role::Reports => why,
-            Role::Supplements(lost) => format!("{why}; {lost}"),
+        match hook.role.lost() {
+            None => why,
+            Some(lost) => format!("{why}; {lost}"),
         }
     }
 }
@@ -292,9 +363,10 @@ pub enum Processes {
 
 /// The loaded, attached tracer.
 pub struct Tracer {
-    /// Keep the programs attached, and through them their maps; the rest of the BPF object
-    /// is dropped once loaded.
-    _links: Vec<FdLink>,
+    /// The link of each attached program, which keeps it attached and through it its maps
+    /// (the rest of the BPF object is dropped once loaded), with the program if
+    /// [`skipped`](Self::skipped) counts its skipped runs.
+    programs: Vec<(FdLink, Option<ProgramFd>)>,
     /// Event records.
     pub ring: Ring,
     /// Write coalescing totals.
@@ -337,6 +409,22 @@ fn log_level() -> VerifierLogLevel {
     }
 }
 
+/// Where `function`'s prototype in the running kernel has the dentry its fexit matches a held
+/// record by, and how it returns success; `None` when it is not in BTF, or has no dentry or no
+/// int or pointer to return.
+fn exit_shape(kernel: &KernelBtf, function: &str) -> Option<ExitShape> {
+    let proto = kernel.prototype(function)?;
+    let ret_ptr = match proto.ret {
+        Ret::Int => 0,
+        Ret::Pointer => 1,
+        Ret::Void | Ret::Other => return None,
+    };
+    Some(ExitShape {
+        arg: u32::try_from(proto.dentry?).ok()?,
+        ret_ptr,
+    })
+}
+
 /// The tracer object for `ops`, with its maps created (the `events` ring buffer of
 /// `ring_bytes`) and no program loaded yet, and the kernel BTF to load its programs against,
 /// read into `btf` unless it is there. `scope` is the `SCOPE_*` of the roots; the `tracked`
@@ -357,15 +445,25 @@ fn open<'b>(
         btf::loader(btf).map_err(|e| LoadError::new("reading kernel BTF", e))?;
     // security_inode_setattr gained a leading idmap in 6.0 and distributions backport it, so
     // its arity comes from the prototype, not the kernel version.
-    let setattr_idmap = u32::from(kernel.setattr_params != Some(2));
-    let ebpf = loader
+    let setattr_idmap = u32::from(kernel.prototype(btf::SETATTR).map(|p| p.params) != Some(2));
+    // The VFS functions the success of ops is read from moved their dentry and changed their
+    // return type across kernels; a hook whose shape is unknown here is not attached.
+    let shapes: Vec<(&str, ExitShape)> = FS_HOOKS
+        .iter()
+        .filter_map(|hook| Some((hook.shape()?, exit_shape(kernel, hook.function)?)))
+        .collect();
+    loader
         .verifier_log_level(log_level())
         .override_global("self_tgid", &self_tgid, true)
         .override_global("op_mask", &op_mask, true)
         .override_global("dev_filter", dev_filter, true)
         .override_global("scope", &scope, true)
         .override_global("track", &track, true)
-        .override_global("setattr_idmap", &setattr_idmap, true)
+        .override_global("setattr_idmap", &setattr_idmap, true);
+    for (global, shape) in &shapes {
+        loader.override_global(global, shape, true);
+    }
+    let ebpf = loader
         .map_max_entries("roots", root_slots)
         .map_max_entries("tracked", if track == 0 { 1 } else { TRACKED_MAX })
         .map_max_entries("events", ring_bytes)
@@ -378,8 +476,26 @@ fn open<'b>(
 struct Attached {
     /// Instructions the verifier processed.
     insns: Option<u32>,
+    /// The program, to read its run statistics with once the BPF object is dropped.
+    prog: ProgramFd,
     /// Detaches the program when dropped.
     link: FdLink,
+}
+
+/// A copy of the loaded program's `fd`, which the BPF object owns; `what` names the step.
+fn dup_fd(fd: Result<&ProgramFd, ProgramError>, what: String) -> Result<ProgramFd, LoadError> {
+    match fd {
+        Ok(fd) => fd.try_clone().map_err(|e| LoadError::new(what, e)),
+        Err(e) => Err(LoadError::new(what, e)),
+    }
+}
+
+impl Attached {
+    /// The link that keeps the program attached, with the program if `counted`: if a skipped
+    /// run of it can lose a change.
+    fn keep(self, counted: bool) -> (FdLink, Option<ProgramFd>) {
+        (self.link, counted.then_some(self.prog))
+    }
 }
 
 /// Logs how many instructions the verifier processed for `program` on `target`.
@@ -390,9 +506,19 @@ fn log_insns(program: &str, target: &str, insns: Option<u32>) {
     );
 }
 
-/// Loads and attaches the fentry or fexit program of `hook`.
-fn attach_hook(ebpf: &mut Ebpf, btf: &Btf, hook: &Hook) -> Result<Attached, LoadError> {
+/// Loads and attaches the fentry or fexit program of `hook` against `kernel`.
+fn attach_hook(ebpf: &mut Ebpf, kernel: &KernelBtf, hook: &Hook) -> Result<Attached, LoadError> {
     let what = |step: &str| format!("{step} {} on {}", hook.program, hook.function);
+    // Without its shape the program would look for its dentry in the wrong argument.
+    if hook.shape().is_some() && exit_shape(kernel, hook.function).is_none() {
+        return Err(LoadError::new(
+            what("reading the prototype for"),
+            BtfError::UnknownBtfTypeName {
+                type_name: hook.function.to_owned(),
+            },
+        ));
+    }
+    let btf = &kernel.btf;
     // FEntry and FExit share no trait; their load, info and attach are the same calls.
     macro_rules! load_and_attach {
         ($prog:expr) => {{
@@ -403,12 +529,14 @@ fn attach_hook(ebpf: &mut Ebpf, btf: &Btf, hook: &Hook) -> Result<Attached, Load
                 .info()
                 .ok()
                 .and_then(|info| info.verified_instruction_count());
+            let prog_fd = dup_fd(prog.fd(), what("duplicating the fd of"))?;
             let link = prog
                 .attach()
                 .and_then(|id| prog.take_link(id))
                 .map_err(|e| LoadError::new(what("attaching"), e))?;
             Attached {
                 insns,
+                prog: prog_fd,
                 link: link.into(),
             }
         }};
@@ -444,6 +572,7 @@ fn attach_tp(
         .info()
         .ok()
         .and_then(|info| info.verified_instruction_count());
+    let prog_fd = dup_fd(prog.fd(), what("duplicating the fd of"))?;
     let link = prog
         .attach()
         .and_then(|id| prog.take_link(id))
@@ -451,6 +580,7 @@ fn attach_tp(
     log_insns(name, tracepoint, insns);
     Ok(Attached {
         insns,
+        prog: prog_fd,
         link: link.into(),
     })
 }
@@ -476,7 +606,7 @@ pub fn probe_hooks(
         .iter()
         .map(|hook| HookOutcome {
             hook: *hook,
-            result: attach_hook(&mut ebpf, &kernel.btf, hook).map(|attached| attached.insns),
+            result: attach_hook(&mut ebpf, kernel, hook).map(|attached| attached.insns),
         })
         .collect();
     outcomes.push(HookOutcome {
@@ -515,6 +645,25 @@ fn fill_roots(ebpf: &mut Ebpf, roots: &Roots) -> Result<(), LoadError> {
     Ok(())
 }
 
+/// Sets `armed` in `ebpf`: the file hooks report from now on, and the checks of the ops whose
+/// confirming fexit is in `attached` hold their records for it.
+fn arm(ebpf: &mut Ebpf, attached: &[Hook]) -> Result<(), LoadError> {
+    let confirmed = attached
+        .iter()
+        .filter(|h| matches!(h.role, Role::Confirms { .. }))
+        .flat_map(|h| h.ops)
+        .fold(0, |bits, op| bits | 1 << op.code());
+    let armed = ebpf.map_mut(ARMED).ok_or_else(|| {
+        LoadError::new(
+            format!("finding map {ARMED}"),
+            std::io::Error::other("not in the BPF object"),
+        )
+    })?;
+    Array::<_, u32>::try_from(armed)
+        .and_then(|mut armed| armed.set(0, abi::ARMED_ON | confirmed, 0))
+        .map_err(|e| LoadError::new("arming the file hooks", e))
+}
+
 impl Tracer {
     /// Loads the tracer for `roots`, reporting `ops` of `processes` through a ring buffer of
     /// `ring_bytes` (a power of two and a multiple of the page size). The sched tracepoints
@@ -547,7 +696,7 @@ impl Tracer {
 
         // on_exec reads what on_exec_cwd leaves on its CPU, and programs on one tracepoint run
         // in attach order: the cwd capture goes first.
-        let mut links = Vec::new();
+        let mut programs = Vec::new();
         let mut missing = Vec::new();
         match attach_tp(
             &mut ebpf,
@@ -555,7 +704,7 @@ impl Tracer {
             EXEC_CWD_HOOK.program,
             EXEC_CWD_HOOK.function,
         ) {
-            Ok(cwd) => links.push(cwd.link),
+            Ok(cwd) => programs.push(cwd.keep(EXEC_CWD_HOOK.role.skip_loses_changes())),
             Err(error) if error.class() == Class::Unsupported => missing.push(Missing {
                 hook: EXEC_CWD_HOOK,
                 error,
@@ -565,14 +714,15 @@ impl Tracer {
         // Process tracking before file hooks, so lineage is complete before the first file
         // event.
         for (name, tracepoint) in SCHED_HOOKS {
-            links.push(attach_tp(&mut ebpf, &kernel.btf, name, tracepoint)?.link);
+            let sched = attach_tp(&mut ebpf, &kernel.btf, name, tracepoint)?;
+            programs.push(sched.keep(true));
         }
 
         let mut attached = Vec::new();
         for hook in FS_HOOKS.iter().filter(|hook| hook.wanted(ops)) {
-            match attach_hook(&mut ebpf, &kernel.btf, hook) {
+            match attach_hook(&mut ebpf, kernel, hook) {
                 Ok(program) => {
-                    links.push(program.link);
+                    programs.push(program.keep(hook.role.skip_loses_changes()));
                     attached.push(*hook);
                 }
                 Err(error) if error.class() == Class::Unsupported => {
@@ -601,15 +751,7 @@ impl Tracer {
         }
 
         // Every hook is attached: report file events from now on, for all of them at once.
-        let armed = ebpf.map_mut(ARMED).ok_or_else(|| {
-            LoadError::new(
-                format!("finding map {ARMED}"),
-                std::io::Error::other("not in the BPF object"),
-            )
-        })?;
-        Array::<_, u32>::try_from(armed)
-            .and_then(|mut armed| armed.set(0, 1, 0))
-            .map_err(|e| LoadError::new("arming the file hooks", e))?;
+        arm(&mut ebpf, &attached)?;
 
         let mut take = |name: &str| {
             ebpf.take_map(name).ok_or_else(|| {
@@ -628,7 +770,7 @@ impl Tracer {
         let stats = PerCpuArray::try_from(take("stats")?)
             .map_err(|e| LoadError::new("opening map stats", e))?;
         Ok(Self {
-            _links: links,
+            programs,
             ring,
             writes,
             tracked,
@@ -661,5 +803,40 @@ impl Tracer {
     /// processes were tracked; their changes are not reported.
     pub fn track_full(&self) -> u64 {
         self.stat(abi::STAT_TRACK_FULL)
+    }
+
+    /// Runs the kernel skipped of the programs whose skipped run can lose or misreport a change
+    /// ([`Role::skip_loses_changes`]) and of the sched tracepoints. It runs a BPF program at
+    /// most once per CPU at a time: a run due while the same program is preempted or
+    /// interrupted on that CPU only counts in the program's `recursion_misses`. A skipped
+    /// check or mapping hook loses a change; a skipped fexit or `on_file_post_open`, the
+    /// confirmation of a held change, whose record stays in the kernel's `pending` table until
+    /// newer held records evict it; a skipped tracepoint, a process event (lineage, and under
+    /// tracking a new process and its changes). The supplementing programs are left out: a
+    /// skipped run of theirs loses only detail (a byte count, the open instance of a struct
+    /// file, a cwd). Each skipped run counts, also one that would have reported nothing.
+    pub fn skipped(&self) -> u64 {
+        self.programs
+            .iter()
+            .filter_map(|(_, prog)| recursion_misses(prog.as_ref()?.as_fd()))
+            .sum()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recursion_misses_count_only_when_the_kernel_filled_them() {
+        let info = ProgInfo {
+            _head: [0; 208],
+            recursion_misses: 7,
+        };
+        // What `bpf(2)` hands back is the bytes it filled: Linux 5.12 and later fill the field.
+        assert_eq!(info.recursion_misses(216), Some(7));
+        // Linux 5.11's struct ends at `run_cnt`, just before it.
+        assert_eq!(info.recursion_misses(208), None);
+        assert_eq!(info.recursion_misses(0), None);
     }
 }

@@ -35,27 +35,79 @@ pub fn clock_ticks_per_sec() -> NonZeroU64 {
     NonZeroU64::new(hz).unwrap_or(DEFAULT_USER_HZ)
 }
 
-/// Converts event timestamps to wall-clock time, using the offset between
-/// `CLOCK_REALTIME` and `CLOCK_BOOTTIME` sampled at start-up.
+/// Least change of the offset taken for a step of the wall clock rather than for the error of
+/// a sample. NTP clients step the clock only by 100 ms or more and slew smaller corrections,
+/// which change both clocks' rate alike and leave the offset as it is.
+const STEP_NS: i128 = 1_000_000;
+
+/// Converts event timestamps to wall-clock time with the offset between `CLOCK_REALTIME` and
+/// `CLOCK_BOOTTIME`. The offset changes only when the wall clock is set (NTP's first sync,
+/// `date -s`, a resumed virtual machine catching up); [`Clock::resample`] notices such a step.
+/// Events stamped up to the last sample before the step keep the previous offset, later ones
+/// get the new one. One step back is remembered. Times are not made monotonic: after the
+/// clock is set back, later events carry earlier times, as in the system's other logs.
 #[derive(Clone, Copy, Debug)]
 pub struct Clock {
     offset_ns: i128,
+    /// When `offset_ns` was last sampled (`CLOCK_BOOTTIME` ns).
+    sampled_ns: u64,
+    /// The offset before the latest step, and when it was last sampled.
+    before: Option<(i128, u64)>,
 }
 
 impl Clock {
     /// Samples the clock offset now.
     pub fn new() -> Self {
-        let boot = clock_ns(libc::CLOCK_BOOTTIME);
-        let real = clock_ns(libc::CLOCK_REALTIME);
+        let (boot_ns, offset_ns, _) = sample();
+        Self::at(boot_ns, offset_ns)
+    }
+
+    /// The clock whose offset was `offset_ns` at `boot_ns`.
+    pub const fn at(boot_ns: u64, offset_ns: i128) -> Self {
         Self {
-            offset_ns: real - boot,
+            offset_ns,
+            sampled_ns: boot_ns,
+            before: None,
         }
     }
 
-    /// Unix time in nanoseconds of an event timestamp.
-    pub fn unix_ns(self, boot_ns: u64) -> i128 {
-        i128::from(boot_ns) + self.offset_ns
+    /// Samples the offset again, as [`Clock::update`] takes it. Two `CLOCK_BOOTTIME` and one
+    /// `CLOCK_REALTIME` read, in the vDSO: cheap enough for every tick.
+    pub fn resample(&mut self) {
+        let (boot_ns, offset_ns, error_ns) = sample();
+        self.update(boot_ns, offset_ns, error_ns);
     }
+
+    /// Takes the offset `offset_ns` sampled at `boot_ns`, accurate to `error_ns`. One that
+    /// differs from the current offset by more than the error and [`STEP_NS`] is a step of the
+    /// wall clock: events after the previous sample get it.
+    pub fn update(&mut self, boot_ns: u64, offset_ns: i128, error_ns: i128) {
+        if (offset_ns - self.offset_ns).abs() > error_ns + STEP_NS {
+            self.before = Some((self.offset_ns, self.sampled_ns));
+            self.offset_ns = offset_ns;
+        }
+        self.sampled_ns = boot_ns;
+    }
+
+    /// Unix time in nanoseconds of an event timestamp, with the offset at that time.
+    pub fn unix_ns(self, boot_ns: u64) -> i128 {
+        let offset_ns = match self.before {
+            Some((offset_ns, until_ns)) if boot_ns <= until_ns => offset_ns,
+            _ => self.offset_ns,
+        };
+        i128::from(boot_ns) + offset_ns
+    }
+}
+
+/// The offset of `CLOCK_REALTIME` from `CLOCK_BOOTTIME` now, as `(boot_ns, offset_ns,
+/// error_ns)`: the wall clock is read between two reads of the event clock, and the offset
+/// taken at their midpoint is accurate to half the time between them.
+fn sample() -> (u64, i128, i128) {
+    let first = clock_ns(libc::CLOCK_BOOTTIME);
+    let real = clock_ns(libc::CLOCK_REALTIME);
+    let half = (clock_ns(libc::CLOCK_BOOTTIME) - first) / 2;
+    let boot_ns = first + half;
+    (u64::try_from(boot_ns).unwrap_or(0), real - boot_ns, half)
 }
 
 impl Default for Clock {
@@ -190,7 +242,47 @@ fn days_from_civil(year: i64, month: u32, day: u32) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Rfc3339, parse_rfc3339};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::{Clock, NANOS, Rfc3339, boot_now_ns, parse_rfc3339};
+
+    #[test]
+    fn a_wall_clock_step_moves_the_events_after_the_last_sample_before_it() {
+        const SEC: u64 = 1_000_000_000;
+        const OFFSET: i128 = 1_791_986_531 * NANOS;
+        const HOUR: i128 = 3_600 * NANOS;
+        let at = |boot_ns: u64, offset_ns: i128| i128::from(boot_ns) + offset_ns;
+        let mut clock = Clock::at(10 * SEC, OFFSET);
+        // Within the sample's error and a millisecond: the same offset.
+        clock.update(11 * SEC, OFFSET + 1_049_000, 50_000);
+        assert_eq!(clock.unix_ns(11 * SEC + 1), at(11 * SEC + 1, OFFSET));
+        // NTP's first sync sets the clock an hour ahead between the samples at 11 s and 12 s.
+        clock.update(12 * SEC, OFFSET + HOUR, 50);
+        assert_eq!(clock.unix_ns(11 * SEC), at(11 * SEC, OFFSET));
+        assert_eq!(clock.unix_ns(11 * SEC + 1), at(11 * SEC + 1, OFFSET + HOUR));
+        assert_eq!(clock.unix_ns(13 * SEC), at(13 * SEC, OFFSET + HOUR));
+        // Set back by ten seconds after 13 s.
+        clock.update(13 * SEC, OFFSET + HOUR, 50);
+        clock.update(14 * SEC, OFFSET + HOUR - 10 * NANOS, 50);
+        assert_eq!(clock.unix_ns(13 * SEC), at(13 * SEC, OFFSET + HOUR));
+        assert_eq!(
+            clock.unix_ns(14 * SEC),
+            at(14 * SEC, OFFSET + HOUR - 10 * NANOS)
+        );
+    }
+
+    #[test]
+    fn samples_convert_now_to_the_wall_clock() {
+        let mut clock = Clock::new();
+        clock.resample();
+        let converted = clock.unix_ns(boot_now_ns());
+        let wall = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+        let wall = i128::try_from(wall.as_nanos()).unwrap();
+        assert!(
+            (converted - wall).abs() < NANOS / 100,
+            "{converted} vs {wall}"
+        );
+    }
 
     #[test]
     fn rfc3339_matches_known_instants() {

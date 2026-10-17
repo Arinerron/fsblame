@@ -1,7 +1,8 @@
 name: release
 
 # A `v*` tag builds static x86_64 and aarch64 binaries and publishes them, with shell
-# completions, man pages and the systemd unit, as a GitHub release.
+# completions, man pages, the systemd unit and the third-party license notices, as a GitHub
+# release.
 on:
   push:
     tags: ["v*"]
@@ -44,10 +45,12 @@ jobs:
           "$host" completions elvish > dist/share/completions/fsblame.elv
           "$host" completions powershell > dist/share/completions/_fsblame.ps1
           cargo xtask man dist/share/man
+          cargo xtask licenses dist/share/THIRD_PARTY_LICENSES.md
           for arch in x86_64 aarch64; do
             name="fsblame-$TAG-$arch-linux-musl"
             mkdir -p "dist/$name"
-            cp "target/$arch-unknown-linux-musl/release/fsblame" LICENSE README.md "dist/$name/"
+            cp "target/$arch-unknown-linux-musl/release/fsblame" LICENSE README.md \
+              dist/share/THIRD_PARTY_LICENSES.md "dist/$name/"
             cp -r dist/share/completions dist/share/man contrib/systemd "dist/$name/"
             tar -C dist -czf "dist/$name.tar.gz" "$name"
             (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")

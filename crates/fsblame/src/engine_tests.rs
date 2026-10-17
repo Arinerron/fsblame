@@ -148,11 +148,36 @@ fn fs_item(rec: FsRec) -> Vec<u8> {
     fs_item_named(rec, &format!("f{}", rec.ino))
 }
 
-/// The ring item of `rec`, with its single path name `name` below root 0.
-fn fs_item_named(mut rec: FsRec, name: &str) -> Vec<u8> {
-    let name = format!("{name}\0");
-    rec.path_len = len(name.as_bytes());
-    [wire::as_bytes(&rec), name.as_bytes()].concat()
+/// The dentry names of `path`, relative to a root, as the kernel reports them: leaf first,
+/// each NUL-terminated.
+fn names(path: &str) -> String {
+    path.rsplit('/').flat_map(|name| [name, "\0"]).collect()
+}
+
+/// The ring item of `rec`, with the path `path` below root 0.
+fn fs_item_named(mut rec: FsRec, path: &str) -> Vec<u8> {
+    let names = names(path);
+    rec.path_len = len(names.as_bytes());
+    [wire::as_bytes(&rec), names.as_bytes()].concat()
+}
+
+/// The ring item of a rename by `p` of inode `ino` from `old` to `new` (paths below root 0)
+/// with `flags`, over or exchanged with inode `other` (0 for none).
+fn rename(
+    ts_ns: u64,
+    p: Proc,
+    ino: u64,
+    (old, new): (&str, &str),
+    flags: u32,
+    other: u64,
+) -> Vec<u8> {
+    let mut rec = fs_rec(abi::OP_RENAME, ts_ns, p, ino);
+    rec.root2 = 0;
+    (rec.aux, rec.aux2) = (u64::from(flags), other);
+    let (new, old) = (names(new), names(old));
+    rec.path_len = len(new.as_bytes());
+    rec.path2_len = len(old.as_bytes());
+    [wire::as_bytes(&rec), new.as_bytes(), old.as_bytes()].concat()
 }
 
 /// The first write of `bytes` through the `struct file` at `file`, which the kernel bound
@@ -504,6 +529,15 @@ fn only_bindings_the_lru_dropped_count_as_evicted() {
     h.kernel.set(SH, 3, T0 + 50 * MS, (5, 1), T0 + 50 * MS);
     h.poll(T0 + 100 * MS);
     assert_eq!(h.engine.counts().evicted, 1);
+    // That record hands file 3's final totals over: nothing is lost.
+    h.feed(&fs_item(replacing_write(
+        T0 + 50 * MS,
+        SH,
+        3,
+        3,
+        5,
+        (12, 2),
+    )));
     // A first write for a binding the engine holds, without F_REPLACED: the kernel had no
     // binding left to replace.
     h.feed(&fs_item(first_write(T0 + 150 * MS, SH, 1, 1, 4)));
@@ -517,8 +551,251 @@ fn only_bindings_the_lru_dropped_count_as_evicted() {
         [
             ("/w/f1".to_owned(), (14, 2)),
             ("/w/f2".to_owned(), (10, 1)),
-            ("/w/f3".to_owned(), (10, 1)),
+            ("/w/f3".to_owned(), (17, 3)),
         ]
+    );
+    assert_eq!(h.engine.counts().evicted, 2);
+}
+
+#[test]
+fn a_superseded_binding_waits_for_the_record_with_its_final_totals() {
+    let mut h = Harness::new();
+    h.feed(&fs_item(first_write(T0, SH, 0xf1, 7, 10)));
+    h.kernel.set(SH, 0xf1, T0, (35, 4), T0 + 50 * MS);
+    h.poll(T0 + 100 * MS);
+    // Two more writes, then the file is closed and its struct file reused for inode 9: the
+    // next poll finds the new binding before the record of it is read.
+    h.kernel.set(SH, 0xf1, T0 + 250 * MS, (7, 1), T0 + 250 * MS);
+    h.poll(T0 + 400 * MS);
+    assert_eq!(h.touches(), [], "f7's window waits for its final totals");
+    h.feed(&fs_item(replacing_write(
+        T0 + 250 * MS,
+        SH,
+        0xf1,
+        9,
+        7,
+        (55, 6),
+    )));
+    h.poll(T0 + 500 * MS);
+    assert_eq!(
+        windows_by_path(&h.touches()),
+        [("/w/f7".to_owned(), (55, 6)), ("/w/f9".to_owned(), (7, 1))]
+    );
+    assert_eq!(h.engine.counts().evicted, 0);
+}
+
+#[test]
+fn superseded_bindings_whose_record_was_lost_count_as_evicted() {
+    let mut h = Harness::new();
+    let cc = Proc {
+        tgid: 300,
+        start_ns: 30 * SEC,
+        comm: "cc",
+    };
+    for p in [SH, cc] {
+        h.feed(&fs_item(first_write(T0, p, 0xf1, 7, 10)));
+        h.kernel.set(p, 0xf1, T0, (35, 4), T0 + 50 * MS);
+    }
+    h.poll(T0 + 100 * MS);
+    // Each replaced its binding at 250 ms, and the records of that were dropped with the ring
+    // full.
+    for p in [SH, cc] {
+        h.kernel.set(p, 0xf1, T0 + 250 * MS, (7, 1), T0 + 250 * MS);
+    }
+    h.poll(T0 + 400 * MS);
+    assert_eq!(h.touches(), [], "the windows wait for their final totals");
+    // The records of a process's writes come before its exit.
+    h.feed(&exit(T0 + 500 * MS, cc));
+    assert_eq!(h.engine.counts().evicted, 1);
+    // The hold limit cuts the window of sh, whose record may still come...
+    h.poll(T0 + 1_000 * MS);
+    assert_eq!(h.engine.counts().evicted, 1);
+    // ...until the ring has been read a second past the replacement.
+    h.feed(&fs_item(fs_rec(abi::OP_UNLINK, T0 + 1_300 * MS, SH, 8)));
+    h.poll(T0 + 1_300 * MS);
+    assert_eq!(h.engine.counts().evicted, 2);
+    let windows: Vec<_> = h
+        .touches()
+        .iter()
+        .filter(|t| t.op == Op::Write)
+        .map(|t| (t.comm.to_string(), window(t)))
+        .collect();
+    assert_eq!(
+        windows,
+        [("cc".to_owned(), (35, 4)), ("sh".to_owned(), (35, 4))]
+    );
+}
+
+#[test]
+fn a_record_replacing_a_later_binding_does_not_close_a_superseded_one() {
+    let mut h = Harness::new();
+    h.feed(&fs_item(first_write(T0, SH, 0xf1, 7, 10)));
+    h.kernel.set(SH, 0xf1, T0, (35, 4), T0 + 50 * MS);
+    h.poll(T0 + 100 * MS);
+    // Replaced at 250 ms, a record that was dropped; the poll sees the replacement.
+    h.kernel
+        .set(SH, 0xf1, T0 + 250 * MS, (90, 9), T0 + 260 * MS);
+    h.poll(T0 + 400 * MS);
+    // Replaced again at 300 ms: this record hands over the totals of the unseen binding.
+    h.feed(&fs_item(replacing_write(
+        T0 + 300 * MS,
+        SH,
+        0xf1,
+        9,
+        2,
+        (90, 9),
+    )));
+    assert_eq!(h.engine.counts().evicted, 1);
+    h.kernel.set(SH, 0xf1, T0 + 300 * MS, (2, 1), T0 + 300 * MS);
+    h.poll(T0 + 600 * MS);
+    assert_eq!(
+        windows_by_path(&h.touches()),
+        [("/w/f7".to_owned(), (35, 4)), ("/w/f9".to_owned(), (2, 1))]
+    );
+}
+
+#[test]
+fn writes_through_a_descriptor_kept_across_a_rename_are_reported_at_the_new_name() {
+    let mut h = Harness::new();
+    let nginx = Proc {
+        tgid: 200,
+        start_ns: 20 * SEC,
+        comm: "nginx",
+    };
+    let logrotate = Proc {
+        tgid: 300,
+        start_ns: 30 * SEC,
+        comm: "logrotate",
+    };
+    h.feed(&fs_item_named(
+        first_write(T0, nginx, 0xf1, 7, 10),
+        "access.log",
+    ));
+    h.kernel.set(nginx, 0xf1, T0, (30, 3), T0 + 50 * MS);
+    // `mv access.log access.log.1` while nginx keeps its descriptor.
+    h.feed(&rename(
+        T0 + 100 * MS,
+        logrotate,
+        7,
+        ("access.log", "access.log.1"),
+        0,
+        0,
+    ));
+    let touches = h.touches();
+    let [written, renamed] = &touches[..] else {
+        panic!("the pending window, then the rename: {touches:?}");
+    };
+    assert_eq!(
+        (&*written.path, window(written)),
+        ("/w/access.log", (30, 3))
+    );
+    assert_eq!(
+        (renamed.op, &*renamed.path),
+        (Op::Rename, "/w/access.log.1")
+    );
+
+    h.kernel.set(nginx, 0xf1, T0, (50, 5), T0 + 150 * MS);
+    for ms in [200, 300, 400] {
+        h.poll(T0 + ms * MS);
+    }
+    let [touch] = &h.touches()[..] else {
+        panic!("one window");
+    };
+    assert_eq!((&*touch.path, window(touch)), ("/w/access.log.1", (20, 2)));
+}
+
+#[test]
+fn renamed_directories_and_exchanged_files_carry_their_open_files_along() {
+    let mut h = Harness::new();
+    let mv = Proc {
+        tgid: 300,
+        start_ns: 30 * SEC,
+        comm: "mv",
+    };
+    let files = [(0xa, 9, "logs/app.log"), (0xb, 7, "x"), (0xc, 8, "y")];
+    for (file, ino, path) in files {
+        h.feed(&fs_item_named(first_write(T0, SH, file, ino, 1), path));
+        h.kernel.set(SH, file, T0, (1, 1), T0);
+    }
+    // `mv logs logs.old` (inode 5), then `mv --exchange x y`.
+    h.feed(&rename(T0 + 10 * MS, mv, 5, ("logs", "logs.old"), 0, 0));
+    h.feed(&rename(T0 + 20 * MS, mv, 7, ("x", "y"), RENAME_EXCHANGE, 8));
+    for (file, _, _) in files {
+        h.kernel.set(SH, file, T0, (3, 2), T0 + 30 * MS);
+    }
+    h.finish();
+    let mut windows: Vec<_> = h
+        .touches()
+        .iter()
+        .filter(|t| t.op == Op::Write)
+        .map(|t| (t.path.to_string(), t.file.ino, window(t)))
+        .collect();
+    windows.sort();
+    let at = |path: &str, ino, window| (format!("/w/{path}"), ino, window);
+    assert_eq!(
+        windows,
+        [
+            at("logs.old/app.log", 9, (2, 1)),
+            at("logs/app.log", 9, (1, 1)),
+            at("x", 7, (1, 1)),
+            at("x", 8, (2, 1)),
+            at("y", 7, (2, 1)),
+            at("y", 8, (1, 1)),
+        ]
+    );
+}
+
+#[test]
+fn writes_after_an_exec_through_an_inherited_descriptor_are_the_new_programs() {
+    let mut h = Harness::filtered(FilterSpec {
+        comm: vec!["make".into()],
+        ..FilterSpec::default()
+    });
+    // `sh -c 'echo building; exec make' >> build.log`
+    h.feed(&exec(
+        T0,
+        SH,
+        0,
+        b"sh\0-c\0echo building; exec make\0",
+        None,
+    ));
+    h.feed(&fs_item_named(
+        first_write(T0 + MS, SH, 0xf1, 7, 9),
+        "build.log",
+    ));
+    h.kernel.set(SH, 0xf1, T0 + MS, (9, 1), T0 + MS);
+    let make = Proc { comm: "make", ..SH };
+    h.feed(&exec(T0 + 2 * MS, make, 0, b"make\0", None));
+    assert_eq!(h.touches(), [], "sh's write is not make's");
+    h.kernel.set(SH, 0xf1, T0 + MS, (29, 3), T0 + 3 * MS);
+    h.finish();
+    let [touch] = &h.touches()[..] else {
+        panic!("make's writes");
+    };
+    assert_eq!((&*touch.comm, window(touch)), ("make", (20, 2)));
+}
+
+#[test]
+fn lines_after_a_wall_clock_step_keep_the_offset_of_their_events_time() {
+    const HOUR: i128 = 3_600 * 1_000_000_000;
+    let mut h = Harness::new();
+    h.feed(&fs_item(first_write(T0, SH, 0xf1, 7, 10)));
+    h.kernel.set(SH, 0xf1, T0, (10, 1), T0);
+    // Sampled at 100 ms; by 200 ms NTP's first sync has set the clock an hour ahead.
+    let offset = h.clock.unix_ns(T0) - i128::from(T0);
+    let mut clock = Clock::at(T0 + 100 * MS, offset);
+    clock.update(T0 + 200 * MS, offset + HOUR, 0);
+    h.engine.set_clock(clock);
+    h.feed(&fs_item(fs_rec(abi::OP_UNLINK, T0 + 250 * MS, SH, 7)));
+    let touches = h.touches();
+    let [written, unlinked] = &touches[..] else {
+        panic!("the pending window, then the unlink: {touches:?}");
+    };
+    assert_eq!(written.ts, h.ts(T0), "written before the step");
+    assert_eq!(
+        unlinked.ts.unix_ns() - written.ts.unix_ns(),
+        HOUR + i128::from(250 * MS),
+        "unlinked after it"
     );
 }
 

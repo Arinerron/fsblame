@@ -531,9 +531,10 @@ impl<'r, 'a> TouchLineage<'r, 'a> {
 pub struct FileReport {
     /// Device of the filesystem.
     pub dev: Dev,
-    /// Inode number; 0 for a name being created.
+    /// Inode number; for a created name, the inode it got once the creation was confirmed, or
+    /// 0 when it was reported at its check.
     pub ino: u64,
-    /// `i_mode`, or the requested mode for creations.
+    /// `i_mode`; for a creation reported at its check (not confirmed), the requested mode.
     pub mode: FileMode,
 }
 
@@ -774,6 +775,11 @@ pub enum LossReason {
     /// fsblame stopped reading it (a backlog it could not read in time, or another stop
     /// signal): changes or process events are missing.
     Unread,
+    /// The kernel skipped runs of fsblame's hooks because the same hook was already running
+    /// on that CPU (preempted or interrupted mid-run; the kernel runs a BPF program at most
+    /// once per CPU at a time): changes, the confirmation of held changes, or process events
+    /// may be missing. Every skipped run counts, also one that would have reported nothing.
+    Skipped,
     /// A reason a later fsblame wrote that this one does not know; what `count` counts is
     /// unknown too. Never produced live; written back as `other`.
     #[serde(other)]
@@ -790,8 +796,9 @@ pub struct LostReport {
     /// What was lost.
     pub reason: LossReason,
     /// Records ([`LossReason::RingFull`], [`LossReason::Unread`]), write bindings
-    /// ([`LossReason::WriteEvicted`]), processes ([`LossReason::TrackFull`]), or units
-    /// this version does not know ([`LossReason::Other`]).
+    /// ([`LossReason::WriteEvicted`]), processes ([`LossReason::TrackFull`]), hook runs
+    /// ([`LossReason::Skipped`]), or units this version does not know
+    /// ([`LossReason::Other`]).
     pub count: u64,
 }
 
@@ -808,12 +815,30 @@ pub struct LossTotals {
     /// Records left in the ring buffer when fsblame stopped reading it.
     #[serde(default)]
     pub unread: u64,
+    /// Runs of fsblame's hooks the kernel skipped because they were already running on
+    /// that CPU.
+    #[serde(default)]
+    pub skipped: u64,
 }
 
 impl LossTotals {
+    /// How many reasons the totals are kept for.
+    pub const REASONS: usize = 5;
+
     /// Whether nothing was lost.
     pub fn is_empty(&self) -> bool {
-        self.ring_full == 0 && self.write_evicted == 0 && self.track_full == 0 && self.unread == 0
+        *self == Self::default()
+    }
+
+    /// Each total with the reason of its `lost` lines.
+    pub const fn by_reason(&self) -> [(LossReason, u64); Self::REASONS] {
+        [
+            (LossReason::RingFull, self.ring_full),
+            (LossReason::WriteEvicted, self.write_evicted),
+            (LossReason::TrackFull, self.track_full),
+            (LossReason::Unread, self.unread),
+            (LossReason::Skipped, self.skipped),
+        ]
     }
 }
 
@@ -1020,7 +1045,7 @@ impl Tally {
 }
 
 /// Accumulates the changes of a run for its [`SummaryReport`], in bounded memory: at most
-/// [`SUMMARY_GROUPS`] groups (then [`Group::Other`]) of at most [`SUMMARY_PATHS`] remembered
+/// `SUMMARY_GROUPS` groups (then [`Group::Other`]) of at most `SUMMARY_PATHS` remembered
 /// paths each.
 #[derive(Debug, Default)]
 pub struct Summary {
@@ -1209,6 +1234,12 @@ pub(crate) mod tests {
                 reason: LossReason::Unread,
                 count: 4,
             }),
+            Line::Lost(LostReport {
+                v: Version,
+                ts: Timestamp(1_791_986_539_500_000_000),
+                reason: LossReason::Skipped,
+                count: 3,
+            }),
             Line::Summary(summary.report(
                 Timestamp(1_791_986_540_000_000_000),
                 LossTotals {
@@ -1216,6 +1247,7 @@ pub(crate) mod tests {
                     write_evicted: 1,
                     track_full: 2,
                     unread: 4,
+                    skipped: 3,
                 },
             )),
         ];
@@ -1268,8 +1300,12 @@ pub(crate) mod tests {
         assert_eq!(lost.reason, LossReason::Other);
         assert_eq!(lost.count, 5);
         // Known reasons keep their names.
-        let json = serde_json::to_value(LossReason::WriteEvicted).unwrap();
-        assert_eq!(json, "write-evicted");
+        for (reason, name) in [
+            (LossReason::WriteEvicted, "write-evicted"),
+            (LossReason::Skipped, "skipped"),
+        ] {
+            assert_eq!(serde_json::to_value(reason).unwrap(), name);
+        }
         // Replayed, an unknown one is written back as `other`.
         let json = serde_json::to_value(LossReason::Other).unwrap();
         assert_eq!(json, "other");
@@ -1289,6 +1325,28 @@ pub(crate) mod tests {
                 ..LossTotals::default()
             }
         );
+    }
+
+    #[test]
+    fn each_loss_total_is_under_the_summary_key_of_its_reason() {
+        let totals = LossTotals {
+            ring_full: 1,
+            write_evicted: 2,
+            track_full: 3,
+            unread: 4,
+            skipped: 5,
+        };
+        let json = serde_json::to_value(totals).unwrap();
+        assert_eq!(
+            json.as_object().unwrap().len(),
+            LossTotals::REASONS,
+            "{json}"
+        );
+        for (reason, total) in totals.by_reason() {
+            let name = serde_json::to_value(reason).unwrap();
+            let key = name.as_str().unwrap().replace('-', "_");
+            assert_eq!(json[&key], total, "{reason:?} in {json}");
+        }
     }
 
     #[test]

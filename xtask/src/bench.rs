@@ -287,7 +287,7 @@ impl Bench {
         );
         println!();
         println!(
-            "{:<14} {:>7} {:>11} {:>11} {:>9} {:>7} {:>8} {:>7} {:>9} {:>7} {:>9}",
+            "{:<14} {:>7} {:>11} {:>11} {:>9} {:>7} {:>8} {:>7} {:>9} {:>7} {:>7} {:>9}",
             "workload",
             "ops",
             "without/s",
@@ -298,12 +298,13 @@ impl Bench {
             "touches",
             "ring lost",
             "evicted",
+            "skipped",
             "peak rss"
         );
         for outcome in outcomes {
             println!(
                 "{:<14} {:>7} {:>11.0} {:>11.0} {:>+8.1}% {:>6.2}s {:>6.1}us {:>7} {:>9} {:>7} \
-                 {:>5.1} MiB",
+                 {:>7} {:>5.1} MiB",
                 outcome.workload.name,
                 outcome.n,
                 rate(outcome.n, outcome.without()),
@@ -314,6 +315,7 @@ impl Bench {
                 outcome.touches(),
                 outcome.ring_full(),
                 outcome.write_evicted(),
+                outcome.skipped(),
                 f64::from(outcome.peak_rss_kib()) / 1024.0,
             );
         }
@@ -321,7 +323,8 @@ impl Bench {
         println!("overhead: extra time per operation with fsblame attached");
         println!("cpu:      fsblame's CPU time from attaching until it had reported the workload");
         println!(
-            "lost:     kernel records dropped with the ring buffer full; write counts evicted"
+            "lost:     kernel records dropped with the ring buffer full; write counts evicted; \
+             hook runs the kernel skipped"
         );
         println!("peak rss: fsblame's VmHWM");
     }
@@ -846,6 +849,9 @@ struct Tally {
     ring_full: u64,
     /// Write bindings evicted from the kernel's write table before their totals were read.
     write_evicted: u64,
+    /// Runs of fsblame's hooks the kernel skipped because they were already running on that
+    /// CPU.
+    skipped: u64,
     /// The first line that is neither a touch nor a loss, with why.
     malformed: Option<String>,
 }
@@ -861,6 +867,7 @@ impl Tally {
                 match line["reason"].as_str() {
                     Some("ring-full") => self.ring_full += count,
                     Some("write-evicted") => self.write_evicted += count,
+                    Some("skipped") => self.skipped += count,
                     other => bail!("unknown loss reason {other:?}"),
                 }
             }
@@ -1059,6 +1066,14 @@ impl Outcome<'_> {
             .unwrap_or(0)
     }
 
+    fn skipped(&self) -> u64 {
+        self.runs
+            .iter()
+            .map(|run| run.tally.skipped)
+            .max()
+            .unwrap_or(0)
+    }
+
     fn peak_rss_kib(&self) -> u32 {
         self.runs
             .iter()
@@ -1090,6 +1105,7 @@ impl Outcome<'_> {
                     "lost": {
                         "ring_full": run.tally.ring_full,
                         "write_evicted": run.tally.write_evicted,
+                        "skipped": run.tally.skipped,
                     },
                     "peak_rss_kib": run.peak_rss_kib,
                 })
@@ -1108,6 +1124,7 @@ impl Outcome<'_> {
             "lost": {
                 "ring_full": self.ring_full(),
                 "write_evicted": self.write_evicted(),
+                "skipped": self.skipped(),
             },
             "peak_rss_kib": self.peak_rss_kib(),
             "runs": runs,

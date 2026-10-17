@@ -31,7 +31,7 @@ use crate::{
     filter::{Filter, FilterSpec},
     ops::{Op, OpSet},
     render::{Human, Json, counted},
-    report::{Line, LossReason, LossTotals, LostReport, Sink, Summary, Timestamp, Version},
+    report::{Line, LossTotals, LostReport, Sink, Summary, Timestamp, Version},
     roots::Roots,
     tracer::{Class, Processes, Tracer},
 };
@@ -109,7 +109,9 @@ pub trait Follow {
     fn start(&mut self, tracer: &mut Tracer) -> Result<(), Failure>;
     /// A descriptor that becomes readable when the run is over, such as a command's pidfd.
     fn end(&self) -> Option<BorrowedFd<'_>>;
-    /// Handles SIGINT, SIGTERM or SIGHUP; returns whether it stops the run.
+    /// Handles SIGINT, SIGTERM or SIGHUP; returns whether it stops the run. Once the run is
+    /// stopping, a SIGINT that would stop it also cuts the final read of the ring short, as
+    /// SIGTERM and SIGHUP always do.
     fn signal(&mut self, signal: i32) -> bool;
     /// Whose changes are reported and what stops the run, for the start banner, such as
     /// `by process 42 and its descendants; Ctrl-C to stop`.
@@ -603,9 +605,8 @@ impl Sink for Output<'_> {
 
 /// Turns a growing loss counter into `lost` lines with the growth since the previous one,
 /// at most one per [`LOSS_EVERY`] so a sustained overflow does not flood the output.
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 struct LossMeter {
-    reason: LossReason,
     /// The counter as of the last line.
     reported: u64,
     /// When the last line was written.
@@ -613,14 +614,6 @@ struct LossMeter {
 }
 
 impl LossMeter {
-    const fn new(reason: LossReason) -> Self {
-        Self {
-            reason,
-            reported: 0,
-            last: None,
-        }
-    }
-
     /// The losses to report now that the counter is at `total`: none if it has not grown,
     /// or if the previous line is recent, unless `all` (the end of the run).
     fn due(&mut self, total: u64, now: Instant, all: bool) -> Option<u64> {
@@ -637,27 +630,22 @@ impl LossMeter {
     }
 }
 
-/// Writes the `lost` lines due for `totals`; `all` writes every unreported loss.
+/// Writes the `lost` lines due for `totals`, one meter per reason of
+/// [`LossTotals::by_reason`]; `all` writes every unreported loss.
 fn report_losses(
     engine: &mut Engine<Output<'_>>,
-    meters: &mut [LossMeter; 4],
+    meters: &mut [LossMeter; LossTotals::REASONS],
     totals: LossTotals,
     clock: Clock,
     all: bool,
 ) -> io::Result<()> {
     let now = Instant::now();
-    let totals = [
-        totals.ring_full,
-        totals.write_evicted,
-        totals.track_full,
-        totals.unread,
-    ];
-    for (meter, total) in meters.iter_mut().zip(totals) {
+    for (meter, (reason, total)) in meters.iter_mut().zip(totals.by_reason()) {
         if let Some(count) = meter.due(total, now, all) {
             engine.sink_mut().line(&Line::Lost(LostReport {
                 v: Version,
                 ts: Timestamp::from_boot(clock, clock::boot_now_ns()),
-                reason: meter.reason,
+                reason,
                 count,
             }))?;
         }
@@ -675,18 +663,21 @@ fn outcome(engine: &Engine<Output<'_>>, tracer: &Tracer, unread: u64) -> Outcome
             write_evicted: counts.evicted,
             track_full: tracer.track_full(),
             unread,
+            skipped: tracer.skipped(),
         },
         malformed: counts.malformed,
     }
 }
 
 /// Reads the records reserved until the stop, the run's last: changes made after it are not
-/// reported, like those made before the start. Gives up after [`STOP_DRAIN`] or at another
-/// stop signal. Returns how many records it left unread, or `None` once the output is closed.
+/// reported, like those made before the start. Gives up after [`STOP_DRAIN`] or when asked to
+/// stop again ([`stop_again`]). Returns how many records it left unread, or `None` once the
+/// output is closed.
 fn drain_to_stop(
     engine: &mut Engine<Output<'_>>,
     tracer: &mut Tracer,
     signals: &Signals,
+    mut follower: Option<&mut dyn Follow>,
 ) -> Result<Option<u64>, Failure> {
     let stop = tracer.ring.mark();
     let give_up = Instant::now() + STOP_DRAIN;
@@ -704,13 +695,26 @@ fn drain_to_stop(
         }
         let now = Instant::now();
         if now >= check {
-            if now >= give_up || signals.pop().is_some() {
+            if now >= give_up || stop_again(signals, follower.as_deref_mut()) {
                 break;
             }
             check = now + Duration::from_millis(TICK_MS);
         }
     }
     Ok(Some(tracer.ring.unread(stop)))
+}
+
+/// Whether the signals that came while stopping ask to stop at once: SIGTERM or SIGHUP, or
+/// SIGINT where it stops the run. Under `fsblame run` SIGINT is the command's, so a Ctrl-C
+/// after the command has exited does not cut the report of its last changes short.
+fn stop_again(signals: &Signals, mut follower: Option<&mut (dyn Follow + '_)>) -> bool {
+    let mut again = false;
+    while let Some(signal) = signals.pop() {
+        if signal != libc::SIGINT || follower.as_deref_mut().is_none_or(|f| f.signal(signal)) {
+            again = true;
+        }
+    }
+    again
 }
 
 // One linear loop: wait, drain, poll, report losses; then the final drain and the end-of-run
@@ -722,16 +726,11 @@ fn stream(
     signals: &Signals,
     mut follower: Option<&mut dyn Follow>,
     opts: &WatchOptions,
-    clock: Clock,
+    mut clock: Clock,
 ) -> Result<Outcome, Failure> {
     const SIGNALS: u64 = 1;
     const END: u64 = 2;
-    let mut meters = [
-        LossMeter::new(LossReason::RingFull),
-        LossMeter::new(LossReason::WriteEvicted),
-        LossMeter::new(LossReason::TrackFull),
-        LossMeter::new(LossReason::Unread),
-    ];
+    let mut meters = [LossMeter::default(); LossTotals::REASONS];
     let mut fds = vec![tracer.ring.as_raw_fd(), signals.fd.as_raw_fd()];
     fds.extend(
         follower
@@ -754,6 +753,10 @@ fn stream(
                 .unwrap_or(u64::MAX)
         });
         let ready = epoll.wait(i32::try_from(left.min(TICK_MS)).expect("at most TICK_MS"))?;
+        // Lines from now on convert times with the current offset of the wall clock, which
+        // NTP's first sync or a resumed virtual machine may have stepped.
+        clock.resample();
+        engine.set_clock(clock);
         let mut stop = ready.contains(END) || deadline.is_some_and(|d| Instant::now() >= d);
         if ready.contains(SIGNALS) {
             while let Some(signal) = signals.pop() {
@@ -799,13 +802,16 @@ fn stream(
             return Ok(outcome(&engine, tracer, 0));
         }
     }
-    let Some(unread) = drain_to_stop(&mut engine, tracer, signals)? else {
+    // Runs skipped from here on are of changes after the stop, which are not reported.
+    let skipped = tracer.skipped();
+    let Some(unread) = drain_to_stop(&mut engine, tracer, signals, follower)? else {
         return Ok(outcome(&engine, tracer, 0));
     };
     if !output_result(engine.finish(&mut tracer.writes))? {
         return Ok(outcome(&engine, tracer, unread));
     }
-    let result = outcome(&engine, tracer, unread);
+    let mut result = outcome(&engine, tracer, unread);
+    result.lost.skipped = skipped;
     let ended = report_losses(&mut engine, &mut meters, result.lost, clock, true).and_then(|()| {
         let output = engine.sink_mut();
         if let Some(summary) = output.summary.take() {
@@ -834,7 +840,7 @@ fn stream(
         let n = result.lost.write_evicted;
         eprintln!(
             "fsblame: warning: the latest byte counts of {} {} lost because the kernel write \
-             table was full",
+             table or the ring buffer was full",
             counted(n, "open file", "open files"),
             were(n)
         );
@@ -859,6 +865,15 @@ fn stream(
             STOP_DRAIN.as_secs()
         );
     }
+    if result.lost.skipped > 0 {
+        let n = result.lost.skipped;
+        eprintln!(
+            "fsblame: warning: {} {} skipped by the kernel because the hook was already \
+             running on that CPU; changes made then may be missing",
+            counted(n, "run of fsblame's hooks", "runs of fsblame's hooks"),
+            were(n)
+        );
+    }
     if result.malformed > 0 {
         let n = result.malformed;
         eprintln!(
@@ -874,4 +889,24 @@ fn stream(
         );
     }
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_loss_meter_reports_growth_at_most_once_a_second_and_the_rest_at_the_end() {
+        let mut meter = LossMeter::default();
+        let start = Instant::now();
+        assert_eq!(meter.due(0, start, false), None);
+        assert_eq!(meter.due(3, start, false), Some(3));
+        // Growth within LOSS_EVERY of the last line waits...
+        assert_eq!(meter.due(5, start + LOSS_EVERY / 2, false), None);
+        // ...and is reported, all of it, once that has passed.
+        assert_eq!(meter.due(5, start + LOSS_EVERY, false), Some(2));
+        // The end reports what is left however recent the last line, and nothing twice.
+        assert_eq!(meter.due(6, start + LOSS_EVERY, true), Some(1));
+        assert_eq!(meter.due(6, start + 3 * LOSS_EVERY, true), None);
+    }
 }

@@ -29,6 +29,16 @@ fn main() {
     )
     .expect("write abi_hash.rs");
 
+    // docs.rs only renders documentation and may lack clang with the BPF target: write empty
+    // objects so `include_bytes!` resolves. A binary built this way cannot load its programs.
+    println!("cargo:rerun-if-env-changed=DOCS_RS");
+    if env::var_os("DOCS_RS").is_some() {
+        for name in OBJECTS {
+            fs::write(out.join(format!("{name}.bpf.o")), b"").expect("write empty object");
+        }
+        return;
+    }
+
     // libbpf's bpf_tracing.h keys pt_regs access off __TARGET_ARCH_<arch>.
     let arch = match env::var("CARGO_CFG_TARGET_ARCH")
         .expect("target arch")

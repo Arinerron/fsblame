@@ -1,6 +1,8 @@
 //! Output sinks for [`Line`]s: the human tree view and NDJSON.
 
 use std::{
+    borrow::Cow,
+    fmt::Write as _,
     io::{self, Write},
     path::{Path, PathBuf},
 };
@@ -56,14 +58,89 @@ fn script_name(path: &str) -> &str {
     stem.strip_suffix("-cli").unwrap_or(stem)
 }
 
-/// Quotes an argument for display when a shell would need it.
-fn quote(arg: &str) -> String {
+/// Whether a terminal could act on `c` instead of showing it: C0 controls, DEL, C1
+/// controls, the Unicode bidirectional controls, and the line and paragraph separators.
+fn is_control(c: char) -> bool {
+    matches!(
+        c,
+        '\0'..='\x1f'
+            | '\x7f'..='\u{9f}'
+            | '\u{61c}'
+            | '\u{200e}'
+            | '\u{200f}'
+            | '\u{2028}'..='\u{202e}'
+            | '\u{2066}'..='\u{2069}'
+    )
+}
+
+/// Appends `c` to `out`, as an escape if it [`is_control`]: `\n`, `\r` and `\t` by name,
+/// other ASCII controls as `\x1b`, the rest as `\u{9b}`, or as `\u009b` in bash's ANSI-C
+/// form if `ansi_c`.
+fn push_escaped(out: &mut String, c: char, ansi_c: bool) {
+    match c {
+        '\n' => out.push_str(r"\n"),
+        '\r' => out.push_str(r"\r"),
+        '\t' => out.push_str(r"\t"),
+        // Writing to a `String` cannot fail.
+        '\0'..='\x1f' | '\x7f' => {
+            let _ = write!(out, r"\x{:02x}", u32::from(c));
+        }
+        c if is_control(c) && ansi_c => {
+            let _ = write!(out, r"\u{:04x}", u32::from(c));
+        }
+        c if is_control(c) => {
+            let _ = write!(out, r"\u{{{:x}}}", u32::from(c));
+        }
+        c => out.push(c),
+    }
+}
+
+/// `text` safe to print on a terminal: every character a terminal could act on
+/// ([`is_control`]) is shown as an escape instead ([`push_escaped`]). Borrows `text` when it
+/// has none. Backslashes are not escaped, so the escapes are for reading only; NDJSON
+/// keeps the exact text.
+fn escape(text: &str) -> Cow<'_, str> {
+    let Some(at) = text.find(is_control) else {
+        return Cow::Borrowed(text);
+    };
+    let mut out = String::with_capacity(text.len() + 8);
+    out.push_str(&text[..at]);
+    for c in text[at..].chars() {
+        push_escaped(&mut out, c, false);
+    }
+    Cow::Owned(out)
+}
+
+/// [`escape`] for owned text, keeping its allocation when nothing needs escaping.
+fn escape_owned(text: String) -> String {
+    match escape(&text) {
+        Cow::Owned(escaped) => escaped,
+        Cow::Borrowed(_) => text,
+    }
+}
+
+/// Quotes an argument for display when a shell would need it: as `'…'`, or, if it holds
+/// characters a terminal could act on ([`is_control`]), with bash's ANSI-C quoting
+/// `$'…'`, where they are `\n`, `\r`, `\t`, `\xHH` or `\uHHHH` escapes. Either way a shell
+/// reads the quoted text back as the same word.
+fn quote(arg: &str) -> Cow<'_, str> {
     let safe = |c: char| c.is_alphanumeric() || "-_./=:,+@%^~".contains(c);
     if !arg.is_empty() && arg.chars().all(safe) {
-        arg.to_owned()
-    } else {
-        format!("'{}'", arg.replace('\'', r"'\''"))
+        return Cow::Borrowed(arg);
     }
+    if !arg.contains(is_control) {
+        return Cow::Owned(format!("'{}'", arg.replace('\'', r"'\''")));
+    }
+    let mut out = String::with_capacity(arg.len() + 8);
+    out.push_str("$'");
+    for c in arg.chars() {
+        if matches!(c, '\\' | '\'') {
+            out.push('\\');
+        }
+        push_escaped(&mut out, c, true);
+    }
+    out.push('\'');
+    Cow::Owned(out)
 }
 
 fn ellipsize(mut text: String, max: usize) -> String {
@@ -87,10 +164,12 @@ fn tilde(path: &str, home: Option<&Path>) -> String {
 }
 
 /// A process as a short command line: the program's basename and its arguments, with
-/// `interpreter /abs/path/to/tool args` collapsed to `tool args`.
+/// `interpreter /abs/path/to/tool args` collapsed to `tool args`. Terminal controls in the
+/// program name show as escapes such as `\x1b`; arguments holding them are quoted as
+/// `$'…'`, so the line holds none.
 pub fn command_line<S: AsRef<str>>(argv: &[S], comm: &str, home: Option<&Path>) -> String {
     let Some(first) = argv.first() else {
-        return comm.to_owned();
+        return escape(comm).into_owned();
     };
     let program = basename(first.as_ref());
     let (head, rest) = match argv.get(1).map(AsRef::as_ref) {
@@ -99,7 +178,7 @@ pub fn command_line<S: AsRef<str>>(argv: &[S], comm: &str, home: Option<&Path>) 
         }
         _ => (program, &argv[1..]),
     };
-    let mut line = head.to_owned();
+    let mut line = escape(head).into_owned();
     for arg in rest {
         line.push(' ');
         line.push_str(&quote(&tilde(arg.as_ref(), home)));
@@ -155,7 +234,7 @@ fn kind_label(kind: &str) -> &str {
     }
 }
 
-/// `npm lifecycle: postinstall demo@1.0.0`.
+/// `npm lifecycle: postinstall demo@1.0.0`, with the phase, package and version escaped.
 fn origin_label(
     kind: &str,
     phase: Option<&str>,
@@ -163,18 +242,19 @@ fn origin_label(
     version: Option<&str>,
 ) -> String {
     let mut label = kind_label(kind).to_owned();
-    let mut what = Vec::new();
+    let mut separator = ": ";
     if let Some(phase) = phase {
-        what.push(phase.to_owned());
+        label.push_str(separator);
+        label.push_str(&escape(phase));
+        separator = " ";
     }
-    match (package, version) {
-        (Some(p), Some(v)) => what.push(format!("{p}@{v}")),
-        (Some(p), None) => what.push(p.to_owned()),
-        _ => {}
-    }
-    if !what.is_empty() {
-        label.push_str(": ");
-        label.push_str(&what.join(" "));
+    if let Some(package) = package {
+        label.push_str(separator);
+        label.push_str(&escape(package));
+        if let Some(version) = version {
+            label.push('@');
+            label.push_str(&escape(version));
+        }
     }
     label
 }
@@ -237,8 +317,9 @@ impl<W: Write> Human<W> {
         }
     }
 
+    /// `path` as shown: below `home` shortened, terminal controls escaped.
     fn path(&self, path: &str) -> String {
-        tilde(path, self.home.as_deref())
+        escape_owned(tilde(path, self.home.as_deref()))
     }
 
     fn detail(&self, c: &ChangeReport<'_>) -> Option<String> {
@@ -278,7 +359,7 @@ impl<W: Write> Human<W> {
         }
         match c.op {
             Op::Create | Op::Mkdir => Some(format!("({})", Perms(c.file.mode.0))),
-            Op::Symlink => Some(format!("(→ {})", c.target.as_deref()?)),
+            Op::Symlink => Some(format!("(→ {})", escape(c.target.as_deref()?))),
             Op::Link => Some(format!("(= {})", self.path(c.target.as_deref()?))),
             _ => None,
         }
@@ -353,13 +434,17 @@ impl<W: Write> Human<W> {
                     let ctx = &c.context;
                     let mut parts = Vec::new();
                     if let Some(tmux) = &ctx.tmux {
-                        parts.push(format!("tmux {tmux}"));
+                        parts.push(format!("tmux {}", escape(tmux)));
                     }
                     if let Some(unit) = &ctx.unit {
-                        parts.push(format!("unit {unit}"));
+                        parts.push(format!("unit {}", escape(unit)));
                     }
                     if let Some(container) = &ctx.container {
-                        parts.push(format!("{} {}", container.runtime, container.short_id()));
+                        parts.push(format!(
+                            "{} {}",
+                            escape(&container.runtime),
+                            escape(container.short_id())
+                        ));
                     }
                     if !parts.is_empty() {
                         notes.push(format!("[{}]", parts.join(" · ")));
@@ -372,7 +457,7 @@ impl<W: Write> Human<W> {
                         origin.package.as_deref(),
                         origin.version.as_deref(),
                     );
-                    notes.push(format!("[{label} · {}]", origin.confidence));
+                    notes.push(format!("[{label} · {}]", escape(&origin.confidence)));
                 }
                 rows.push((command, facts, notes));
             }
@@ -391,7 +476,7 @@ impl<W: Write> Human<W> {
                 .map(|n| format!(", ns pid {n}"))
                 .unwrap_or_default();
             rows.push((
-                c.proc.comm.to_string(),
+                escape(&c.proc.comm).into_owned(),
                 format!("(pid {}{ns}, not tracked)", c.proc.pid),
                 Vec::new(),
             ));
@@ -447,7 +532,7 @@ impl<W: Write> Human<W> {
                 counted(lost.count, "kernel record", "kernel records")
             ),
             LossReason::WriteEvicted => format!(
-                "latest byte counts of {} lost (kernel write table full)",
+                "latest byte counts of {} lost (kernel write table or ring buffer full)",
                 counted(lost.count, "open file", "open files")
             ),
             LossReason::TrackFull => format!(
@@ -457,6 +542,11 @@ impl<W: Write> Human<W> {
             LossReason::Unread => format!(
                 "{} lost (still unread when fsblame stopped)",
                 counted(lost.count, "kernel record", "kernel records")
+            ),
+            LossReason::Skipped => format!(
+                "{} of fsblame's hooks skipped by the kernel (the hook was already running on \
+                 that CPU; changes may be missing)",
+                counted(lost.count, "run", "runs")
             ),
             LossReason::Other => format!(
                 "{} lost (a reason this version of fsblame does not know)",
@@ -479,7 +569,7 @@ impl<W: Write> Human<W> {
                 k.package.as_deref(),
                 k.version.as_deref(),
             ),
-            Group::Comm(comm) => comm.to_string(),
+            Group::Comm(comm) => escape(comm).into_owned(),
             Group::Other => "(other)".to_owned(),
         };
         let paths = if g.paths_untracked > 0 {
@@ -555,7 +645,7 @@ impl<W: Write> Human<W> {
             }
             if s.lost.write_evicted > 0 {
                 parts.push(format!(
-                    "latest byte counts of {} (kernel write table full)",
+                    "latest byte counts of {} (kernel write table or ring buffer full)",
                     counted(s.lost.write_evicted, "open file", "open files")
                 ));
             }
@@ -569,6 +659,12 @@ impl<W: Write> Human<W> {
                 parts.push(format!(
                     "{} (unread at the stop)",
                     counted(s.lost.unread, "kernel record", "kernel records")
+                ));
+            }
+            if s.lost.skipped > 0 {
+                parts.push(format!(
+                    "{} (skipped by the kernel: already running on that CPU)",
+                    counted(s.lost.skipped, "hook run", "hook runs")
                 ));
             }
             writeln!(self.out, "  lost: {}", parts.join(", "))?;
@@ -831,5 +927,134 @@ mod tests {
         );
         assert!(lines[4].starts_with("  vim "), "{text}");
         assert_eq!(lines[5], "  lost: 3 kernel records (ring buffer full)");
+    }
+
+    /// Asserts that `text` is `lines` lines holding no character a terminal acts on.
+    fn assert_inert(text: &str, lines: usize) {
+        assert_eq!(text.matches('\n').count(), lines, "{text:?}");
+        assert!(text.ends_with('\n'), "{text:?}");
+        assert!(
+            !text.chars().any(|c| c != '\n' && is_control(c)),
+            "{text:?}"
+        );
+    }
+
+    #[test]
+    fn escape_shows_terminal_controls_and_borrows_plain_text() {
+        let plain = "/home/u/naïve file's.txt";
+        assert!(matches!(escape(plain), Cow::Borrowed(p) if p.as_ptr() == plain.as_ptr()));
+        let owned = plain.to_owned();
+        let at = owned.as_ptr();
+        let kept = escape_owned(owned);
+        assert_eq!(kept.as_ptr(), at);
+        assert_eq!(
+            escape("a\nb\x1b[2K\r\t\x7f\u{9b}\u{202e}\u{2066}\u{200f}c\\n"),
+            r"a\nb\x1b[2K\r\t\x7f\u{9b}\u{202e}\u{2066}\u{200f}c\n"
+        );
+    }
+
+    #[test]
+    fn arguments_with_terminal_controls_use_ansi_c_quoting() {
+        assert_eq!(quote("\x1b[31mred"), r"$'\x1b[31mred'");
+        assert_eq!(quote("it's\\\n"), r"$'it\'s\\\n'");
+        assert_eq!(quote("\u{202e}gpj.sh"), r"$'\u202egpj.sh'");
+        assert_eq!(quote("a b"), "'a b'");
+        assert_eq!(
+            command_line(&["\x1bsh", "-c", "\r"], "sh", None),
+            r"\x1bsh -c $'\r'"
+        );
+        assert_eq!(command_line::<&str>(&[], "kw\x1b", None), r"kw\x1b");
+    }
+
+    #[test]
+    fn hostile_names_render_on_their_own_lines() {
+        let mut c = chmod();
+        c.op = Op::Rename;
+        c.change = None;
+        c.path = Cow::Borrowed("/home/u/a\nb\x1b[2K");
+        c.old_path = Some(Cow::Borrowed("/home/u/\u{202e}hs.txt"));
+        c.proc.argv = ["chmod", "+x", "\x1b[31mrun.sh"].map(Cow::Borrowed).into();
+        c.proc.cwd = Some(Cow::Borrowed("/home/u/\rproj"));
+        c.context.unit = Some(Cow::Borrowed("evil\n.scope"));
+        c.context.tmux = Some(Cow::Borrowed("%3\x07"));
+        c.origin.as_mut().unwrap().package = Some(Cow::Borrowed("demo\u{9b}2K"));
+        let line = Line::Touch(c);
+        let text = human(&line, false);
+        assert_inert(&text, 3);
+        let mut lines = text.lines();
+        let header = lines.next().unwrap();
+        assert!(
+            header.starts_with(r"~/\u{202e}hs.txt → ~/a\nb\x1b[2K  renamed  "),
+            "{header}"
+        );
+        let actor = lines.next().unwrap();
+        assert!(
+            actor.starts_with(r"  └─ chmod +x $'\x1b[31mrun.sh'  "),
+            "{actor}"
+        );
+        assert!(actor.contains(r", cwd ~/\rproj)"), "{actor}");
+        assert!(
+            actor.contains(r"[tmux %3\x07 · unit evil\n.scope · docker "),
+            "{actor}"
+        );
+        let parent = lines.next().unwrap();
+        assert!(
+            parent.ends_with(r"[npm lifecycle: postinstall demo\u{9b}2K@1.0.0 · high]"),
+            "{parent}"
+        );
+        // The left column is padded to the escaped command's width.
+        let facts_at = |l: &str| l.chars().position(|c| c == '(').unwrap();
+        assert_eq!(facts_at(actor), facts_at(parent), "{text}");
+        let colored = human(&line, true);
+        assert_eq!(plain(&colored), text);
+
+        let mut symlink = chmod();
+        symlink.op = Op::Symlink;
+        symlink.change = None;
+        symlink.target = Some(Cow::Borrowed("../x\ny"));
+        let text = human(&Line::Touch(symlink), false);
+        assert_inert(&text, 3);
+        assert!(
+            text.lines().next().unwrap().ends_with(r"  (→ ../x\ny)"),
+            "{text}"
+        );
+
+        let mut untracked = chmod();
+        untracked.proc.exited = None;
+        untracked.proc.comm = Cow::Borrowed("vim\r");
+        untracked.ancestry.clear();
+        let text = human(&Line::Touch(untracked), false);
+        assert_inert(&text, 2);
+        assert!(
+            text.lines()
+                .nth(1)
+                .unwrap()
+                .starts_with(r"  └─ vim\r  (pid 4242"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn summary_aligns_escaped_groups() {
+        let mut summary = crate::report::Summary::new();
+        let mut vim = chmod();
+        vim.origin = None;
+        vim.proc.comm = Cow::Borrowed("vim\r\x1b[2K");
+        vim.path = Cow::Borrowed("/home/u/a\nb");
+        summary.add(&vim);
+        let report = summary.report(
+            crate::report::Timestamp::from_unix_ns(0),
+            crate::report::LossTotals::default(),
+        );
+        let text = human(&Line::Summary(report), false);
+        assert_inert(&text, 4);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines[2..],
+            [
+                "  GROUP         CHANGES  PATHS  OPS      FIRST PATHS",
+                r"  vim\r\x1b[2K        1      1  chmod 1  ~/a\nb",
+            ]
+        );
     }
 }

@@ -249,6 +249,15 @@ fn loss_note(lost: &LostReport) -> String {
             "{} left unread when recording stopped around {when}; the history may be incomplete",
             counted(lost.count, "kernel record", "kernel records")
         ),
+        LossReason::Skipped => format!(
+            "{} skipped by the kernel around {when} because the hook was already running on \
+             that CPU; the history may be incomplete",
+            counted(
+                lost.count,
+                "run of fsblame's hooks",
+                "runs of fsblame's hooks"
+            )
+        ),
         LossReason::Other => format!(
             "{} lost around {when}, for a reason this version of fsblame does not know; the \
              history may be incomplete",

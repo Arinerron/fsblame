@@ -36,6 +36,9 @@ jobs:
           path: fsblame
           submodules: true
       - uses: ./fsblame/.github/actions/setup
+        with:
+          # For checking the glibc builds `cargo install` makes on aarch64 hosts.
+          targets: aarch64-unknown-linux-gnu
       - name: Build (static, x86_64 musl)
         working-directory: fsblame
         run: |
@@ -52,7 +55,12 @@ jobs:
           done
           cargo xtask man target/man
           test -s target/man/fsblame.1
-          test -s target/man/fsblame-watch.1
+          # Every page must render without a single groff warning (-ww: all of them).
+          command -v groff > /dev/null || sudo apt-get install -yq --no-install-recommends groff-base
+          for page in target/man/*.1; do
+            warnings=$(groff -man -Tutf8 -ww -z "$page" 2>&1)
+            if [ -n "$warnings" ]; then echo "$page: $warnings"; exit 1; fi
+          done
       - name: Bundle the e2e binaries
         working-directory: fsblame
         # tar keeps the executable bits that upload-artifact drops.
@@ -62,6 +70,24 @@ jobs:
           name: e2e-bins
           path: fsblame/e2e-bins.tar
           retention-days: 3
+      - name: Third-party license notices
+        working-directory: fsblame
+        # Fails if a dependency of the binary ships no license text.
+        run: cargo xtask licenses target/THIRD_PARTY_LICENSES.md
+      - name: Check the glibc targets (cargo install builds for the host target)
+        working-directory: fsblame
+        run: |
+          cargo check --locked -p fsblame --target x86_64-unknown-linux-gnu
+          cargo check --locked -p fsblame --target aarch64-unknown-linux-gnu
+      - name: Package the crates.io crates and build them from the tarballs
+        working-directory: fsblame
+        # Verifies against a temporary local registry holding the workspace's own crates.
+        # Not --workspace: that also packages the publish = false xtask, whose #[path]
+        # includes of the fsblame sources do not resolve from its tarball. The unpacked
+        # packages are dropped so rust-cache does not save them.
+        run: |
+          cargo package --locked -p fsblame-abi -p fsblame-bpf -p fsblame --target x86_64-unknown-linux-gnu
+          rm -rf target/package
 
   aarch64:
     name: aarch64 check, build and qemu smoke

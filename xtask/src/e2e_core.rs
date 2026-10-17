@@ -14,7 +14,7 @@ use std::{
 use anyhow::{Context as _, Result, anyhow, ensure};
 use serde_json::Value;
 
-use super::{Ctx, Finished, MAX_RUN, Watcher, sh, summary, text, touch};
+use super::{Ctx, Finished, MAX_RUN, Watcher, sh, summary, text, touch, workload_loss};
 
 /// `sudo -n fsblame watch --json ARGS PATHS`, attached and ready.
 fn watch_with(ctx: &Ctx, args: &[&OsStr], paths: &[&Path]) -> Result<Watcher> {
@@ -599,7 +599,7 @@ pub fn ring_overflow(ctx: &Ctx) -> Result<String> {
     let lines = done.touches()?;
     touch(&lines, "write", &dir.join("after.txt"))?;
 
-    let lost: Vec<&Value> = lines.iter().filter(|l| l["type"] == "lost").collect();
+    let lost: Vec<&Value> = lines.iter().filter(|l| workload_loss(l)).collect();
     ensure!(
         !lost.is_empty(),
         "no lost line after {execs} execs with a 256K ring:\n{}",

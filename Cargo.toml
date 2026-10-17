@@ -6,19 +6,24 @@ default-members = ["crates/fsblame-abi", "crates/fsblame-bpf", "crates/fsblame"]
 exclude = ["tracekit", "fuzz"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.94"
 license = "MIT"
+repository = "https://github.com/Arinerron/fsblame"
+homepage = "https://github.com/Arinerron/fsblame"
 
 [workspace.dependencies]
-fsblame-abi = { path = "crates/fsblame-abi" }
-fsblame-bpf = { path = "crates/fsblame-bpf" }
+# The three published crates move in lockstep (the BPF objects and the loader must agree on
+# the ABI exactly): bump these `=` pins with `version` above.
+fsblame-abi = { version = "=0.1.1", path = "crates/fsblame-abi" }
+fsblame-bpf = { version = "=0.1.1", path = "crates/fsblame-bpf" }
 
-# tracekit v0.1.0, pinned as the `tracekit` git submodule (`git submodule update --init`).
-wire = { path = "tracekit/crates/wire", package = "tracekit-wire" }
-procctx = { path = "tracekit/crates/procctx" }
-bpfdoctor = { path = "tracekit/crates/bpfdoctor" }
+# tracekit v0.1.0, pinned as the `tracekit` git submodule (`git submodule update --init`); the
+# published crates resolve the same versions from crates.io.
+wire = { version = "0.1.0", path = "tracekit/crates/wire", package = "tracekit-wire" }
+procctx = { version = "0.1.0", path = "tracekit/crates/procctx" }
+bpfdoctor = { version = "0.1.0", path = "tracekit/crates/bpfdoctor" }
 
 aya = { version = "0.14.0", default-features = false }
 anyhow = "1"

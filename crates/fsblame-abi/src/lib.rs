@@ -90,8 +90,10 @@ wire::wire! {
         pub cwd_len: u16,
     }
 
-    /// A modifying file operation on a watched path. Followed by `path_len` bytes of the
-    /// primary path and `path2_len` bytes of the secondary path (see the crate docs).
+    /// A modifying file operation on a watched path: one that succeeded where the fexit on its
+    /// VFS function is attached (see [`ARMED_ON`]), else one that passed its check. Followed by
+    /// `path_len` bytes of the primary path and `path2_len` bytes of the secondary path (see the
+    /// crate docs).
     ///
     /// | op | path | path2 | aux | aux2 |
     /// |----|------|-------|-----|------|
@@ -199,6 +201,18 @@ wire::wire! {
         /// Kernel `dev_t`s.
         pub devs: [u32; MAX_DEVS as usize],
     }
+
+    /// `.rodata` `shape_<function>`: where a VFS function whose fexit confirms an op (see
+    /// [`ARMED_ON`]) has the dentry the op is matched by, and how it returns success. Set from
+    /// the running kernel's BTF prototype: both changed across the supported kernels.
+    pub struct ExitShape {
+        /// Index of the parameter that is the operation's `struct dentry *` (`vfs_link`: the new
+        /// name).
+        pub arg: u32,
+        /// 1 when the function returns a pointer (`ERR_PTR` on failure; `vfs_mkdir` from Linux
+        /// 6.15), 0 when it returns an int (0 on success).
+        pub ret_ptr: u32,
+    }
 }
 
 wire::wire_consts! {
@@ -248,7 +262,8 @@ wire::wire_consts! {
 
     /// `path` was cut at `PATH_CAP` bytes or `WALK_MAX` components; its upper part is missing.
     pub const F_PATH_TRUNC: u32 = 1;
-    /// `path2` was cut short.
+    /// `path2` was cut short: its upper part is missing, or for a symlink target (`ROOT_RAW`)
+    /// longer than `PATH_CAP - 1` bytes, its end.
     pub const F_PATH2_TRUNC: u32 = 2;
     /// `OP_WRITE`: this binding replaced one from an earlier open instance of its `struct file`
     /// (reused for another file, or another open of the same one); `aux`/`aux2` carry the old
@@ -274,6 +289,13 @@ wire::wire_consts! {
     pub const MAP_VIA_MMAP: u64 = 1;
     /// `F_MAPPED` `aux`: `mprotect` made a shared mapping of the file writable.
     pub const MAP_VIA_MPROTECT: u64 = 2;
+
+    /// `armed` (`.data.armed`): set by the loader once every program is attached; the file
+    /// hooks report nothing before. It is set together with bit `1 << OP_*` (op codes start at
+    /// 1) of each op whose success an attached fexit confirms: the check of such an op holds
+    /// its record until the VFS function that ran the check returns, and it is reported only if
+    /// that succeeded. The other ops are reported at their check.
+    pub const ARMED_ON: u32 = 1;
 
     /// The side of an operation that is outside every watch root: no path captured.
     pub const ROOT_NONE: u32 = 0xffff_ffff;
@@ -323,7 +345,7 @@ wire::wire_consts! {
 }
 
 #[cfg(feature = "user")]
-wire::impl_aya_pod!(RootKey, RootVal, WriteKey, WriteVal, DevFilter);
+wire::impl_aya_pod!(RootKey, RootVal, WriteKey, WriteVal, DevFilter, ExitShape);
 
 /// The C header for the BPF program, with every struct and constant above.
 #[cfg(feature = "std")]
@@ -340,6 +362,7 @@ pub fn header() -> wire::HeaderBuilder {
         .structs::<WriteKey>()
         .structs::<WriteVal>()
         .structs::<DevFilter>()
+        .structs::<ExitShape>()
         .consts(&ABI_CONSTS);
     header
 }
