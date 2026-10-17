@@ -2,7 +2,7 @@
 //!
 //! Everything the BPF program (`crates/fsblame-bpf/bpf/fsblame.bpf.c`) and the loader exchange
 //! is declared here once. The BPF build script renders it into `fsblame_wire.h` with
-//! [`header`] (feature `std`); the header static-asserts every size and offset, so drift is a
+//! `header()` (feature `std`); the header static-asserts every size and offset, so drift is a
 //! clang error.
 //!
 //! # Records

@@ -79,7 +79,7 @@ impl Clock {
     }
 
     /// Takes the offset `offset_ns` sampled at `boot_ns`, accurate to `error_ns`. One that
-    /// differs from the current offset by more than the error and [`STEP_NS`] is a step of the
+    /// differs from the current offset by more than the error and `STEP_NS` is a step of the
     /// wall clock: events after the previous sample get it.
     pub fn update(&mut self, boot_ns: u64, offset_ns: i128, error_ns: i128) {
         if (offset_ns - self.offset_ns).abs() > error_ns + STEP_NS {
