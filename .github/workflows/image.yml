@@ -1,0 +1,80 @@
+name: image
+
+# Publishes the container image ghcr.io/arinerron/fsblame for a release from its published
+# tarballs (packaging/Containerfile, no rebuild of fsblame). release.yml calls it after
+# publishing a tag; to backfill a release: `gh workflow run image.yml -f tag=vX.Y.Z`.
+# Tags: X.Y.Z always; X.Y and latest only for the newest non-prerelease of that line and
+# overall, so backfilling an older release never moves them.
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: Release tag, e.g. v0.1.1
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag, e.g. v0.1.1
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Tags
+        id: tags
+        env:
+          TAG: ${{ inputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [[ ! $TAG =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::not a release tag: $TAG"
+            exit 1
+          fi
+          image=ghcr.io/arinerron/fsblame
+          tags=$image:${TAG#v}
+          if [[ -z ${BASH_REMATCH[4]} ]]; then
+            minor=${BASH_REMATCH[1]}.${BASH_REMATCH[2]}
+            releases=$(gh release list -R "$GITHUB_REPOSITORY" --exclude-drafts \
+              --exclude-pre-releases --limit 1000 --json tagName -q '.[].tagName' \
+              | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V || true)
+            newest_minor=$(grep -E "^v${minor//./\\.}\." <<<"$releases" | tail -n1 || true)
+            if [[ $newest_minor == "$TAG" ]]; then tags+=",$image:$minor"; fi
+            if [[ $(tail -n1 <<<"$releases") == "$TAG" ]]; then tags+=",$image:latest"; fi
+          fi
+          echo "tags=$tags" >> "$GITHUB_OUTPUT"
+          echo "$tags"
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # The final stage only copies files, so arm64 builds without QEMU.
+      - uses: docker/build-push-action@v7
+        with:
+          context: packaging
+          file: packaging/Containerfile
+          platforms: linux/amd64,linux/arm64
+          build-args: TAG=${{ inputs.tag }}
+          tags: ${{ steps.tags.outputs.tags }}
+          # GHCR shows the index's annotations for a multi-platform image.
+          annotations: |
+            index:org.opencontainers.image.source=https://github.com/Arinerron/fsblame
+            index:org.opencontainers.image.description=Which command changed this file? Live eBPF attribution of file changes to the full process lineage: argv, cwd, ancestors, systemd unit, container and build step
+            index:org.opencontainers.image.licenses=MIT
+          push: true

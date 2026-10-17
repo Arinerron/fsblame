@@ -1,0 +1,54 @@
+# syntax=docker/dockerfile:1
+# Image ghcr.io/arinerron/fsblame, built by .github/workflows/image.yml from the release
+# tarball of TAG (no rebuild): the static binary on alpine:3 (the newest 3.x at build
+# time), whose busybox shell and tools give `fsblame run` something to run.
+#
+#   docker buildx build -f packaging/Containerfile --build-arg TAG=v0.1.1 \
+#     --platform linux/amd64,linux/arm64 packaging
+#
+# The fetch stage runs on the build host and the final stage has no RUN, so a
+# multi-platform build needs no emulation. RELEASES is for testing only: a local server
+# laid out like the GitHub release downloads (RELEASES/TAG/NAME.tar.gz and .sha256), used
+# with `--network host`.
+#
+# Run (no --privileged needed), with each directory to watch bind-mounted at its host path:
+#   docker run --rm --pid=host --cgroupns=host --cap-add BPF --cap-add PERFMON \
+#     --cap-add SYS_PTRACE -v /etc:/etc:ro ghcr.io/arinerron/fsblame watch /etc
+# (or: doctor; or record, adding -v /var/lib/fsblame:/var/lib/fsblame for the journal,
+# which blame then reads with no flags but that volume).
+# --pid=host is required: fsblame runs in the initial pid namespace and reads the actors'
+# /proc entries. --cgroupns=host shows it the host's cgroup tree, from which systemd units
+# and containers are named. BPF and PERFMON load and attach the programs; SYS_PTRACE reads
+# other users' /proc entries (an ancestor's cwd and environment). Paths are the ones this
+# container's mount namespace sees, so a directory bind-mounted at its host path is reported
+# at host paths; a /proc/PID/root path into another mount namespace is refused.
+
+FROM --platform=$BUILDPLATFORM alpine:3 AS fetch
+ARG TAG
+ARG TARGETARCH
+ARG RELEASES=https://github.com/Arinerron/fsblame/releases/download
+WORKDIR /fetch
+RUN set -eu; \
+    test -n "$TAG"; \
+    case "$TARGETARCH" in \
+      amd64) arch=x86_64 ;; \
+      arm64) arch=aarch64 ;; \
+      *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
+    esac; \
+    name="fsblame-$TAG-$arch-linux-musl"; \
+    url="$RELEASES/$TAG/$name.tar.gz"; \
+    wget -q "$url" "$url.sha256"; \
+    sha256sum -c "$name.tar.gz.sha256"; \
+    tar -xozf "$name.tar.gz"; \
+    mv "$name" /out
+
+FROM alpine:3
+ARG TAG
+LABEL org.opencontainers.image.title="fsblame" \
+      org.opencontainers.image.description="Which command changed this file? Live eBPF attribution of file changes to the full process lineage: argv, cwd, ancestors, systemd unit, container and build step" \
+      org.opencontainers.image.source="https://github.com/Arinerron/fsblame" \
+      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.version="${TAG#v}"
+COPY --from=fetch /out/fsblame /usr/bin/fsblame
+COPY --from=fetch /out/LICENSE /out/THIRD_PARTY_LICENSES.md /usr/share/licenses/fsblame/
+ENTRYPOINT ["fsblame"]
