@@ -12,7 +12,7 @@ env:
 
 jobs:
   lint:
-    name: rustfmt and clippy
+    name: rustfmt, clippy and rustdoc
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
@@ -26,6 +26,13 @@ jobs:
       - name: clippy
         working-directory: fsblame
         run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: rustdoc (as docs.rs builds it)
+        working-directory: fsblame
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: |
+          cargo doc --no-deps -p fsblame -p fsblame-bpf
+          cargo doc --no-deps -p fsblame-abi --all-features
 
   build-test:
     name: x86_64 build and unit tests
