@@ -223,7 +223,7 @@ checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
 name = "fsblame"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "aya",
@@ -243,7 +243,7 @@ dependencies = [
 
 [[package]]
 name = "fsblame-abi"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aya",
  "tracekit-wire",
@@ -251,7 +251,7 @@ dependencies = [
 
 [[package]]
 name = "fsblame-bpf"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "fsblame-abi",
 ]
@@ -326,9 +326,9 @@ dependencies = [
 
 [[package]]
 name = "libc"
-version = "0.2.190"
+version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ce5d3ddc6d3fa000eb1536d85e147bfe31aacaba692ed6a876f95cb7c855be78"
+checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
 name = "libfuzzer-sys"
